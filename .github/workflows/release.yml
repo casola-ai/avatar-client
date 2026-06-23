@@ -1,0 +1,38 @@
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'client-v*'
+
+permissions:
+  contents: read
+  id-token: write  # required for npm OIDC provenance
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - run: npm install
+
+      - run: npm run build
+
+      - name: Publish (latest)
+        run: npm publish --access public --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Tag beta
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          npm dist-tag add "@casola/avatar-client@${VERSION}" beta
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
