@@ -1,0 +1,7 @@
+{
+  "version": 3,
+  "sources": ["../../src/worklet/mic-worklet.ts"],
+  "sourcesContent": ["/**\n * mic-worklet.ts \u2014 AudioWorkletProcessor `mic-fwd`.\n *\n * Runs on the audio render thread. It does the minimum: forward each raw mono\n * float frame (one render quantum, typically 128 samples at the context rate) to\n * the main thread, which resamples 48k\u219216k and batches into 1600-sample PCM16\n * frames for /mic_stream. Bundled to its own /mic-worklet.js and loaded via\n * `audioWorklet.addModule()`.\n */\nclass MicForwardProcessor extends AudioWorkletProcessor {\n  process(inputs: Float32Array[][]): boolean {\n    const channel = inputs[0]?.[0];\n    if (channel?.length) {\n      const copy = channel.slice();\n      this.port.postMessage(copy, [copy.buffer]);\n    }\n    return true; // keep the processor alive\n  }\n}\n\nregisterProcessor('mic-fwd', MicForwardProcessor);\n"],
+  "mappings": ";;;AASA,MAAM,sBAAN,cAAkC,sBAAsB;AAAA,IACtD,QAAQ,QAAmC;AACzC,YAAM,UAAU,OAAO,CAAC,IAAI,CAAC;AAC7B,UAAI,SAAS,QAAQ;AACnB,cAAM,OAAO,QAAQ,MAAM;AAC3B,aAAK,KAAK,YAAY,MAAM,CAAC,KAAK,MAAM,CAAC;AAAA,MAC3C;AACA,aAAO;AAAA,IACT;AAAA,EACF;AAEA,oBAAkB,WAAW,mBAAmB;",
+  "names": []
+}
