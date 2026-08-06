@@ -6,7 +6,7 @@
       const channel = inputs[0]?.[0];
       if (channel?.length) {
         const copy = channel.slice();
-        this.port.postMessage(copy, [copy.buffer]);
+        this.port.postMessage({ data: copy, contextTime: currentTime }, [copy.buffer]);
       }
       return true;
     }

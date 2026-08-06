@@ -25,6 +25,8 @@ const session = new AvatarSession({
     onPartial(text)     { console.log('partial:', text); },
     onTurn(t)           { console.log('turn:', t.text); },
     onFirstFrame()      { hideSpinner(); },
+    onMicReady()        { showReadyToSpeak(); },
+    onAudioBlocked()    { showTapForSound(); }, // iOS refused unmuted playback — video runs muted
     onClose(reason)     { console.log('ended:', reason); },
     onError(err)        { console.error(err); },
   },
@@ -32,6 +34,10 @@ const session = new AvatarSession({
 
 await AvatarSession.ensureMicPermission();
 await session.start();
+
+// Typed turns use the assigned edge's in-band transport when available.
+const turn = await session.sendText('Tell me about your priorities.');
+console.log(turn.reply);
 
 // End the session
 session.leave();
@@ -62,12 +68,15 @@ new AvatarSession(opts: AvatarSessionOpts)
 | Member | Description |
 |--------|-------------|
 | `.start()` | Begin the session: connect to the edge and start streaming. |
+| `.sendText(text)` | Send a typed turn and resolve with `{text, reply}` plus optional speech metadata. Workers fallback edges use their in-band socket; other edges use `textTransport`. |
 | `.leave()` | End the session and fire `onClose('generic')`. |
 | `.destroy()` | Tear down without callbacks (use in component cleanup). |
 | `.setMuted(muted)` | Mute or unmute the mic mid-session. |
+| `.unmuteAudio()` | Unmute avatar audio after `onAudioBlocked`; call from a tap/click handler. |
 | `.state` | Current `WidgetState`. |
 | `.sessionCapSeconds` | Server-set cap, populated once the edge target is known (`ready` state). |
 | `AvatarSession.ensureMicPermission()` | Request mic permission before `start()`. |
+| `AvatarSession.primeVideoElement(video)` | Call synchronously in the call-button tap handler, before any `await`: clears WebKit's per-element gesture restrictions so iOS Safari honors the SDK's unmute (otherwise the first call in a fresh browsing context plays muted, and pre-fix rendered as a slideshow). |
 | `AvatarSession.mediaSupported()` | `false` on browsers without MSE. |
 
 ### Key types
@@ -89,11 +98,18 @@ new AvatarSession(opts: AvatarSessionOpts)
   connect: ConnectStrategy;
   lang?: string;           // BCP 47, default 'en'
   workletUrl?: string;     // default '/mic-worklet.js'
+  mic?: boolean;           // default true; false skips getUserMedia
+  textTransport?: (text: string) => Promise<string>;
   prewarm?: () => Promise<void> | void;
   dev?: boolean;           // log unexpected state transitions
   callbacks?: { ... };
 }
 ```
+
+`textTransport` lets an application adapt an existing HTTP chat relay for GPU edges. It is not
+used when the assigned edge advertises the SDK's in-band text transport. With `mic: false`, the SDK
+also opens that in-band socket only after the edge advertises support, so receive-only GPU sessions
+keep their existing connection shape.
 
 ## License
 

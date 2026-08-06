@@ -6,13 +6,18 @@
  * the main thread, which resamples 48k→16k and batches into 1600-sample PCM16
  * frames for /mic_stream. Bundled to its own /mic-worklet.js and loaded via
  * `audioWorklet.addModule()`.
+ *
+ * Posts `contextTime` (the AudioContext time of this quantum's first sample) alongside the raw
+ * samples — the render thread is the only place this is known precisely; the main thread can't
+ * recover it later since audio delivery there is jittery relative to the audio clock (see
+ * specs/av-sync-timestamps-notes.md section 2).
  */
 class MicForwardProcessor extends AudioWorkletProcessor {
   process(inputs: Float32Array[][]): boolean {
     const channel = inputs[0]?.[0];
     if (channel?.length) {
       const copy = channel.slice();
-      this.port.postMessage(copy, [copy.buffer]);
+      this.port.postMessage({ data: copy, contextTime: currentTime }, [copy.buffer]);
     }
     return true; // keep the processor alive
   }

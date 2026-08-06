@@ -2,6 +2,9 @@ export type WidgetState =
   | 'idle'
   | 'selecting'
   | 'verifying'
+  // Transient pre-connect state: waiting for the connect strategy to hand back an edge target.
+  // NOT a capacity queue (there is none) — connectViaToken resolves it in the same tick, and a
+  // full fleet is rejected at mint (503) before the SDK is ever constructed.
   | 'waiting'
   | 'ready'
   | 'connecting'

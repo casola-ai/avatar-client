@@ -25,6 +25,138 @@ function connectViaToken(o) {
   };
 }
 
+// src/clock-map.ts
+var ClockMap = class {
+  constructor(cap = 64) {
+    this.cap = cap;
+    __publicField(this, "samples", []);
+  }
+  record(x, y) {
+    this.samples.push({ x, y });
+    if (this.samples.length > this.cap) this.samples.shift();
+  }
+  at(x) {
+    const samples = this.samples;
+    if (samples.length === 0) return null;
+    const first = samples[0];
+    if (samples.length === 1 || x <= first.x) return first.y;
+    const last = samples[samples.length - 1];
+    if (x >= last.x) return last.y;
+    for (let i = 1; i < samples.length; i++) {
+      const b = samples[i];
+      if (x > b.x) continue;
+      const a = samples[i - 1];
+      const span = b.x - a.x;
+      if (span <= 0) return a.y;
+      const t = (x - a.x) / span;
+      return a.y + t * (b.y - a.y);
+    }
+    return last.y;
+  }
+  clear() {
+    this.samples.length = 0;
+  }
+};
+
+// src/mic-frame-header.ts
+var MIC_FRAME_HEADER_VERSION = 1;
+var MIC_FRAME_HEADER_BYTES = 20;
+var MIC_FRAME_MAGIC = 51792;
+var VIDEO_MEDIA_TIME_UNKNOWN = 4294967295;
+function encodeMicFrameHeader(header) {
+  const bytes = new Uint8Array(MIC_FRAME_HEADER_BYTES);
+  const view = new DataView(bytes.buffer);
+  view.setUint16(0, MIC_FRAME_MAGIC, true);
+  view.setUint8(2, header.version);
+  view.setUint8(3, 0);
+  view.setUint32(4, header.micSeq, true);
+  view.setUint32(8, header.videoMediaTimeMs, true);
+  view.setFloat64(12, header.captureEpochMs, true);
+  return bytes;
+}
+
+// src/pcm-downlink.ts
+var PCM_DOWNLINK_MAGIC = 51793;
+var PCM_DOWNLINK_VERSION = 1;
+var PCM_DOWNLINK_HEADER_BYTES = 12;
+function decodePcmDownlinkFrame(data) {
+  const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  if (bytes.byteLength < PCM_DOWNLINK_HEADER_BYTES || (bytes.byteLength - PCM_DOWNLINK_HEADER_BYTES) % 2 !== 0) {
+    return null;
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (view.getUint16(0, true) !== PCM_DOWNLINK_MAGIC || view.getUint8(2) !== PCM_DOWNLINK_VERSION || view.getUint8(3) !== 0) {
+    return null;
+  }
+  const payload = bytes.slice(PCM_DOWNLINK_HEADER_BYTES);
+  return {
+    sequence: view.getUint32(4, true),
+    sampleRate: view.getUint32(8, true),
+    pcm: new Int16Array(payload.buffer, payload.byteOffset, payload.byteLength / 2)
+  };
+}
+
+// src/pcm-player.ts
+var PcmPlayer = class {
+  constructor(onBlocked) {
+    this.onBlocked = onBlocked;
+    __publicField(this, "ctx", null);
+    __publicField(this, "nextStart", 0);
+    __publicField(this, "sources", /* @__PURE__ */ new Set());
+    __publicField(this, "blocked", false);
+  }
+  enqueue(frame) {
+    if (frame.pcm.length === 0 || frame.sampleRate <= 0) return;
+    const ctx = this.ensureContext();
+    const audio = ctx.createBuffer(1, frame.pcm.length, frame.sampleRate);
+    const channel = audio.getChannelData(0);
+    for (let i = 0; i < frame.pcm.length; i++) channel[i] = (frame.pcm[i] ?? 0) / 32768;
+    const source = ctx.createBufferSource();
+    source.buffer = audio;
+    source.connect(ctx.destination);
+    source.addEventListener("ended", () => this.sources.delete(source));
+    this.sources.add(source);
+    const startAt = Math.max(ctx.currentTime + 0.04, this.nextStart);
+    source.start(startAt);
+    this.nextStart = startAt + audio.duration;
+    if (ctx.state === "suspended") {
+      void ctx.resume().catch(() => {
+        if (!this.blocked) {
+          this.blocked = true;
+          this.onBlocked?.();
+        }
+      });
+    }
+  }
+  flush() {
+    for (const source of this.sources) {
+      try {
+        source.stop();
+      } catch {
+      }
+    }
+    this.sources.clear();
+    this.nextStart = this.ctx?.currentTime ?? 0;
+  }
+  unmute() {
+    this.blocked = false;
+    if (!this.ctx) return true;
+    void this.ctx.resume().catch(() => {
+    });
+    return this.ctx.state !== "suspended";
+  }
+  stop() {
+    this.flush();
+    void this.ctx?.close().catch(() => {
+    });
+    this.ctx = null;
+  }
+  ensureContext() {
+    if (!this.ctx) this.ctx = new AudioContext();
+    return this.ctx;
+  }
+};
+
 // src/mic-capture.ts
 var TARGET_RATE = 16e3;
 var FRAME_SAMPLES = 1600;
@@ -33,6 +165,15 @@ function clamp16(x) {
   const v = Math.round(x * 32767);
   return v > 32767 ? 32767 : v < -32768 ? -32768 : v;
 }
+function computeFrameTimestamp(frameStartContextTime, inputLatencySeconds, audioClockMap, getVideoMediaTimeMs, timeOrigin) {
+  const performanceTimeMs = audioClockMap.at(frameStartContextTime - inputLatencySeconds);
+  if (performanceTimeMs === null) return null;
+  const rawVideoMediaTimeMs = getVideoMediaTimeMs?.(performanceTimeMs) ?? null;
+  return {
+    videoMediaTimeMs: rawVideoMediaTimeMs === null ? VIDEO_MEDIA_TIME_UNKNOWN : Math.round(rawVideoMediaTimeMs),
+    captureEpochMs: timeOrigin + performanceTimeMs
+  };
+}
 var MicCapture = class {
   constructor() {
     __publicField(this, "ctx", null);
@@ -40,6 +181,12 @@ var MicCapture = class {
     __publicField(this, "node", null);
     __publicField(this, "sink", null);
     __publicField(this, "ws", null);
+    __publicField(this, "player", null);
+    __publicField(this, "wsReady", null);
+    __publicField(this, "resolveWsReady", null);
+    __publicField(this, "rejectWsReady", null);
+    __publicField(this, "textSequence", 0);
+    __publicField(this, "textWaiters", /* @__PURE__ */ new Map());
     __publicField(this, "handlers", {});
     __publicField(this, "inRate", 48e3);
     __publicField(this, "resTail", new Float32Array(0));
@@ -49,9 +196,21 @@ var MicCapture = class {
     __publicField(this, "closed", false);
     __publicField(this, "muted", false);
     __publicField(this, "pcmCallCount", 0);
+    // Section-2 calibration state — see computeFrameTimestamp().
+    __publicField(this, "audioClockMap", new ClockMap());
+    __publicField(this, "inputLatencySeconds", 0);
+    __publicField(this, "frameStartContextTime", 0);
+    // Named micSeq (not seq/frameSeq) — the server-side tracer already uses frame_seq for an
+    // unrelated concept (the video-timeline index); this is just a monotonic per-connection
+    // counter over outgoing /mic_stream frames.
+    __publicField(this, "micSeq", 0);
+    __publicField(this, "getVideoMediaTimeMs");
     // ASR language pin (box language NAMES, e.g. ['English'] or ['Chinese','English']).
     // [] = the box default (auto-detect across its configured set). Mutable mid-session.
     __publicField(this, "langs", []);
+    // Preferred REPLY language (BCP-47). undefined = never sent (the box keeps its session
+    // default, e.g. the JWT claim); '' = explicit clear. Mutable mid-session.
+    __publicField(this, "responseLanguage");
   }
   // Returns the live MediaStream so the caller can pass it to start(), avoiding
   // a second getUserMedia call (which causes a second permission prompt on Firefox).
@@ -66,9 +225,11 @@ var MicCapture = class {
       video: false
     });
   }
-  async start(wsUrl, lang, handlers = {}, workletUrl = "/mic-worklet.js", stream, dev = false, langs = []) {
+  async start(wsUrl, lang, handlers = {}, workletUrl = "/mic-worklet.js", stream, dev = false, langs = [], responseLanguage, getVideoMediaTimeMs) {
     this.handlers = handlers;
     this.langs = langs;
+    this.responseLanguage = responseLanguage;
+    this.getVideoMediaTimeMs = getVideoMediaTimeMs;
     if (stream) {
       this.stream = stream;
     } else {
@@ -78,7 +239,9 @@ var MicCapture = class {
       });
     }
     const track = this.stream.getAudioTracks()[0];
-    const nativeRate = track?.getSettings().sampleRate;
+    const settings = track?.getSettings();
+    const nativeRate = settings?.sampleRate;
+    this.inputLatencySeconds = settings?.latency ?? 0;
     const ctx = new AudioContext(nativeRate ? { sampleRate: nativeRate } : {});
     this.ctx = ctx;
     if (dev) {
@@ -90,7 +253,7 @@ var MicCapture = class {
         "trackRate=",
         nativeRate,
         "settings=",
-        track?.getSettings()
+        settings
       );
     }
     if (ctx.state === "suspended") {
@@ -105,33 +268,85 @@ var MicCapture = class {
     const source = ctx.createMediaStreamSource(this.stream);
     const node = new AudioWorkletNode(ctx, "mic-fwd");
     this.node = node;
-    node.port.onmessage = (e) => this.onPcm(e.data, dev);
+    node.port.onmessage = (e) => {
+      const { data, contextTime } = e.data;
+      this.onPcm(data, contextTime, dev);
+    };
     const sink = ctx.createGain();
     sink.gain.value = 0;
     this.sink = sink;
     source.connect(node).connect(sink).connect(ctx.destination);
-    this.openWs(wsUrl, lang, dev);
+    this.openWs(wsUrl, lang, dev, true);
   }
-  openWs(wsUrl, lang, dev) {
+  /** Open only the fallback's in-band control/audio socket. This is created after `/mse`
+   * advertises poster-pcm, so receive-only GPU sessions retain their legacy no-mic behavior. */
+  startReceiveOnly(wsUrl, lang, handlers = {}, dev = false, langs = [], responseLanguage) {
+    this.handlers = handlers;
+    this.langs = langs;
+    this.responseLanguage = responseLanguage;
+    this.openWs(wsUrl, lang, dev, false);
+  }
+  openWs(wsUrl, lang, dev, sendPreroll) {
     const ws = new WebSocket(wsUrl);
     ws.binaryType = "arraybuffer";
     this.ws = ws;
+    this.wsReady = new Promise((resolve, reject) => {
+      this.resolveWsReady = resolve;
+      this.rejectWsReady = reject;
+    });
+    void this.wsReady.catch(() => {
+    });
     ws.addEventListener("open", () => {
-      ws.send(JSON.stringify({ op: "hello", lang, langs: this.langs, engine: "default" }));
+      ws.send(
+        JSON.stringify({
+          op: "hello",
+          lang,
+          langs: this.langs,
+          engine: "default",
+          ...this.responseLanguage !== void 0 ? { response_language: this.responseLanguage } : {},
+          accept_audio: ["pcm16"]
+        })
+      );
+      this.resolveWsReady?.();
+      this.resolveWsReady = null;
+      this.rejectWsReady = null;
+      if (!sendPreroll) return;
       const silence = new Int16Array(FRAME_SAMPLES);
-      for (let i = 0; i < PREROLL_FRAMES; i++) ws.send(silence.slice());
+      for (let i = 0; i < PREROLL_FRAMES; i++) {
+        this.micSeq += 1;
+        this.sendFrame(silence, {
+          version: MIC_FRAME_HEADER_VERSION,
+          micSeq: this.micSeq,
+          videoMediaTimeMs: VIDEO_MEDIA_TIME_UNKNOWN,
+          captureEpochMs: performance.timeOrigin + performance.now()
+        });
+      }
+      this.handlers.onReady?.();
     });
     ws.addEventListener("message", (ev) => this.onServerMessage(ev));
     ws.addEventListener("error", () => {
-      this.handlers.onError?.(new Error("mic socket error"));
+      const error = new Error("mic socket error");
+      this.rejectWsReady?.(error);
+      this.rejectTextWaiters(error);
+      this.handlers.onError?.(error);
     });
     ws.addEventListener("close", (ev) => {
+      const error = new Error(`mic socket closed (${ev.code})`);
+      this.rejectWsReady?.(error);
+      this.rejectTextWaiters(error);
       if (ev.code !== 1e3) console.warn("[mic] WebSocket closed", ev.code, ev.reason);
       if (dev) console.log("[mic] WebSocket close code=", ev.code, "reason=", ev.reason);
     });
   }
   onServerMessage(ev) {
-    if (typeof ev.data !== "string") return;
+    if (typeof ev.data !== "string") {
+      if (!(ev.data instanceof ArrayBuffer)) return;
+      const frame = decodePcmDownlinkFrame(ev.data);
+      if (!frame) return;
+      this.player ?? (this.player = new PcmPlayer(this.handlers.onAudioBlocked));
+      this.player.enqueue(frame);
+      return;
+    }
     let m;
     try {
       m = JSON.parse(ev.data);
@@ -141,17 +356,35 @@ var MicCapture = class {
     if (m.type === "partial" && typeof m.text === "string") {
       this.handlers.onPartial?.(m.text);
     } else if (m.type === "turn" && typeof m.text === "string") {
-      this.handlers.onTurn?.({
+      const turn = {
         text: m.text,
         reply: m.reply ?? "",
         language: m.language,
         speechId: m.speech_id
-      });
+      };
+      const waiter = m.request_id ? this.textWaiters.get(m.request_id) : void 0;
+      if (waiter && m.request_id) {
+        clearTimeout(waiter.timer);
+        this.textWaiters.delete(m.request_id);
+        waiter.resolve(turn);
+      } else {
+        this.handlers.onTurn?.(turn);
+      }
+    } else if (m.type === "audio_reset") {
+      this.player?.flush();
     } else if (m.type === "error") {
-      this.handlers.onError?.(new Error(m.error ?? "mic stream error"));
+      const error = new Error(m.error ?? "mic stream error");
+      const waiter = m.request_id ? this.textWaiters.get(m.request_id) : void 0;
+      if (waiter && m.request_id) {
+        clearTimeout(waiter.timer);
+        this.textWaiters.delete(m.request_id);
+        waiter.reject(error);
+      } else {
+        this.handlers.onError?.(error);
+      }
     }
   }
-  onPcm(chunk, dev) {
+  onPcm(chunk, contextTime, dev) {
     if (this.closed) return;
     if (dev) {
       this.pcmCallCount++;
@@ -172,6 +405,7 @@ var MicCapture = class {
       }
     }
     const ratio = this.inRate / TARGET_RATE;
+    const bufContextTime = contextTime - this.resTail.length / this.inRate;
     const buf = new Float32Array(this.resTail.length + chunk.length);
     buf.set(this.resTail, 0);
     buf.set(chunk, this.resTail.length);
@@ -181,6 +415,7 @@ var MicCapture = class {
       if (i + 1 >= buf.length) break;
       const f = pos - i;
       const sample = (buf[i] ?? 0) * (1 - f) + (buf[i + 1] ?? 0) * f;
+      if (this.frameLen === 0) this.frameStartContextTime = bufContextTime + pos / this.inRate;
       this.frame[this.frameLen++] = clamp16(sample);
       if (this.frameLen === FRAME_SAMPLES) this.flushFrame(dev);
       pos += ratio;
@@ -192,6 +427,30 @@ var MicCapture = class {
   setMuted(m) {
     this.muted = m;
   }
+  unmuteAudio() {
+    return this.player?.unmute() ?? true;
+  }
+  async sendText(text) {
+    const value = text.trim();
+    if (!value) throw new Error("text is required");
+    if (value.length > 2e3) throw new Error("text is too long");
+    if (!this.wsReady) throw new Error("text transport is unavailable");
+    await this.wsReady;
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error("text transport is unavailable");
+    }
+    this.textSequence += 1;
+    const id = `text-${this.textSequence}`;
+    const result = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.textWaiters.delete(id);
+        reject(new Error("text response timed out"));
+      }, 3e4);
+      this.textWaiters.set(id, { resolve, reject, timer });
+    });
+    this.ws.send(JSON.stringify({ op: "text", id, text: value }));
+    return result;
+  }
   /** Re-pin the ASR recognition language(s) mid-session. Sends a {op:'set_langs'} text frame the
    *  edge applies on the next turn; also stored so a socket reconnect carries the latest pick. */
   setLangs(langs) {
@@ -200,13 +459,42 @@ var MicCapture = class {
       this.ws.send(JSON.stringify({ op: "set_langs", langs }));
     }
   }
-  flushFrame(dev) {
+  /** Change the preferred REPLY language mid-session (BCP-47; '' clears). Sends a
+   *  {op:'set_response_language'} text frame the edge applies on the next turn; also stored so
+   *  a socket reconnect's hello carries the latest pick. */
+  setResponseLanguage(lang) {
+    this.responseLanguage = lang;
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      const payload = this.muted ? new Int16Array(FRAME_SAMPLES) : this.frame.slice();
+      this.ws.send(JSON.stringify({ op: "set_response_language", language: lang }));
+    }
+  }
+  flushFrame(dev) {
+    let header = null;
+    if (this.ctx) {
+      const ts = this.ctx.getOutputTimestamp();
+      this.audioClockMap.record(
+        ts.contextTime ?? this.ctx.currentTime,
+        ts.performanceTime ?? performance.now()
+      );
+      const result = computeFrameTimestamp(
+        this.frameStartContextTime,
+        this.inputLatencySeconds,
+        this.audioClockMap,
+        this.getVideoMediaTimeMs,
+        performance.timeOrigin
+      );
+      if (result) {
+        this.micSeq += 1;
+        header = { version: MIC_FRAME_HEADER_VERSION, micSeq: this.micSeq, ...result };
+        this.handlers.onFrameTimestamp?.(header);
+      }
+    }
+    if (header && this.ws && this.ws.readyState === WebSocket.OPEN) {
+      const pcm = this.muted ? new Int16Array(FRAME_SAMPLES) : this.frame.slice();
       if (dev) {
         let allZero = true;
-        for (let i = 0; i < payload.length; i++) {
-          if (payload[i] !== 0) {
+        for (let i = 0; i < pcm.length; i++) {
+          if (pcm[i] !== 0) {
             allZero = false;
             break;
           }
@@ -217,17 +505,30 @@ var MicCapture = class {
           );
         }
       }
-      this.ws.send(payload);
+      this.sendFrame(pcm, header);
     }
     this.frameLen = 0;
   }
+  /** Prepends the wire header (section 4) to a 1600-sample PCM frame and sends it as one binary
+   *  WS message. Used by both flushFrame() and the preroll send in openWs(). */
+  sendFrame(pcm, header) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    const pcmBytes = new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+    const wireFrame = new Uint8Array(MIC_FRAME_HEADER_BYTES + pcmBytes.byteLength);
+    wireFrame.set(encodeMicFrameHeader(header), 0);
+    wireFrame.set(pcmBytes, MIC_FRAME_HEADER_BYTES);
+    this.ws.send(wireFrame);
+  }
   stop() {
     this.closed = true;
+    this.rejectTextWaiters(new Error("mic transport stopped"));
     try {
       this.ws?.close();
     } catch {
     }
     this.ws = null;
+    this.player?.stop();
+    this.player = null;
     try {
       this.node?.disconnect();
       this.sink?.disconnect();
@@ -240,6 +541,13 @@ var MicCapture = class {
     void this.ctx?.close().catch(() => {
     });
     this.ctx = null;
+  }
+  rejectTextWaiters(error) {
+    for (const waiter of this.textWaiters.values()) {
+      clearTimeout(waiter.timer);
+      waiter.reject(error);
+    }
+    this.textWaiters.clear();
   }
 };
 
@@ -255,6 +563,7 @@ var MsePlayer = class {
     __publicField(this, "ms", null);
     __publicField(this, "sb", null);
     __publicField(this, "ws", null);
+    __publicField(this, "pcmPlayer", null);
     __publicField(this, "mime", null);
     __publicField(this, "pending", []);
     __publicField(this, "sourceOpen", false);
@@ -265,9 +574,19 @@ var MsePlayer = class {
     __publicField(this, "handlers", {});
     __publicField(this, "startSeeked", false);
     __publicField(this, "lastSeekAt", 0);
+    __publicField(this, "audioBlocked", false);
+    __publicField(this, "resumeAttempts", 0);
+    __publicField(this, "watchdogListeners", []);
+    __publicField(this, "mediaTimeMap", new ClockMap());
+    __publicField(this, "rvfcHandle", null);
   }
   static supported() {
     return getMediaSourceCtor() !== null;
+  }
+  fireFirstFrame() {
+    if (this.firstFrameFired) return;
+    this.firstFrameFired = true;
+    this.handlers.onFirstFrame?.();
   }
   connect(wsUrl, handlers = {}) {
     this.handlers = handlers;
@@ -295,23 +614,73 @@ var MsePlayer = class {
     } else {
       this.video.src = URL.createObjectURL(ms);
     }
-    const fireFirst = () => {
-      if (this.firstFrameFired) return;
-      this.firstFrameFired = true;
-      this.handlers.onFirstFrame?.();
+    const v = this.video;
+    const onPause = () => {
+      if (this.closed || !this.started || !v.paused) return;
+      if (this.resumeAttempts >= 5) return;
+      this.resumeAttempts += 1;
+      void v.play().catch(() => {
+        if (this.closed) return;
+        v.muted = true;
+        void v.play().catch(() => {
+        });
+        this.setAudioBlocked();
+      });
     };
+    v.addEventListener("pause", onPause);
+    const onPlaying = () => {
+      this.resumeAttempts = 0;
+    };
+    v.addEventListener("playing", onPlaying);
+    this.watchdogListeners.push(["pause", onPause], ["playing", onPlaying]);
+    const fireFirst = () => this.fireFirstFrame();
     const fireFirstIfPlaying = () => {
       if (this.firstFrameFired) return;
       if (!this.video.paused && this.video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-        this.firstFrameFired = true;
-        this.handlers.onFirstFrame?.();
+        this.fireFirstFrame();
       }
     };
     this.video.addEventListener("playing", fireFirst);
     this.video.addEventListener("timeupdate", fireFirstIfPlaying);
     this.video.addEventListener("loadeddata", fireFirstIfPlaying);
     this.video.addEventListener("canplay", fireFirstIfPlaying);
+    this.scheduleFrameCallback();
     this.openWs(wsUrl);
+  }
+  /** Re-arms itself each callback (rVFC only fires once per registration) to keep sampling the
+   *  mediaTime <-> performanceTime relationship for the life of playback. No-op where unsupported
+   *  (e.g. older Firefox) — mediaTimeAt() then always returns null, same as before any frame has
+   *  displayed. */
+  scheduleFrameCallback() {
+    if (typeof this.video.requestVideoFrameCallback !== "function") return;
+    this.rvfcHandle = this.video.requestVideoFrameCallback((_now, metadata) => {
+      if (this.closed) return;
+      this.mediaTimeMap.record(metadata.expectedDisplayTime, metadata.mediaTime * 1e3);
+      this.scheduleFrameCallback();
+    });
+  }
+  /** Interpolated avatar-video media-timeline position (ms) at a given performance.now()-domain
+   *  instant, from the rVFC-sampled calibration above (see ClockMap for the seek/playbackRate-
+   *  change handling). Returns null before the first displayed frame. */
+  mediaTimeAt(performanceTimeMs) {
+    return this.mediaTimeMap.at(performanceTimeMs);
+  }
+  setAudioBlocked() {
+    if (this.audioBlocked) return;
+    this.audioBlocked = true;
+    this.handlers.onAudioBlocked?.();
+  }
+  /** Unmute from a user-gesture context (e.g. a tap-for-sound button). Also resumes playback
+   *  if the element is paused. Returns whether audio is now unblocked. */
+  unmuteAudio() {
+    const v = this.video;
+    v.muted = false;
+    if (v.paused) void v.play().catch(() => {
+    });
+    this.audioBlocked = false;
+    this.resumeAttempts = 0;
+    const pcm = this.pcmPlayer?.unmute() ?? true;
+    return !v.muted && pcm;
   }
   openWs(wsUrl) {
     const ws = new WebSocket(wsUrl);
@@ -327,12 +696,32 @@ var MsePlayer = class {
     if (typeof ev.data === "string") {
       try {
         const m = JSON.parse(ev.data);
+        if (m.type === "session_ended") {
+          this.handlers.onEnded?.(m.reason ?? "generic");
+          return;
+        }
+        if (m.mode === "poster-pcm") {
+          if (m.poster_url) this.video.poster = m.poster_url;
+          this.handlers.onMode?.(m.mode);
+          this.fireFirstFrame();
+          return;
+        }
+        if (m.type === "audio_reset") {
+          this.pcmPlayer?.flush();
+          return;
+        }
         if (m.mime) {
           this.mime = m.mime;
           this.trySetup();
         }
       } catch {
       }
+      return;
+    }
+    const pcm = decodePcmDownlinkFrame(ev.data);
+    if (pcm) {
+      this.pcmPlayer ?? (this.pcmPlayer = new PcmPlayer(() => this.setAudioBlocked()));
+      this.pcmPlayer.enqueue(pcm);
       return;
     }
     this.pending.push(new Uint8Array(ev.data));
@@ -377,6 +766,13 @@ var MsePlayer = class {
               this.video.readyState
             );
           this.video.muted = false;
+          if (this.video.paused) {
+            if (this.dev) console.warn("[mse] unmute paused playback \u2014 resuming muted");
+            this.video.muted = true;
+            void this.video.play().catch(() => {
+            });
+            this.setAudioBlocked();
+          }
         }).catch((err) => {
           console.warn(
             "[mse] play() rejected",
@@ -415,16 +811,18 @@ var MsePlayer = class {
       }
       this.startSeeked = true;
     }
-    const ahead = end - v.currentTime;
-    const now = performance.now() / 1e3;
-    if (ahead > 2.5 && now - this.lastSeekAt > 3) {
-      try {
-        v.currentTime = end - 0.4;
-      } catch {
+    if (!v.paused) {
+      const ahead = end - v.currentTime;
+      const now = performance.now() / 1e3;
+      if (ahead > 2.5 && now - this.lastSeekAt > 3) {
+        try {
+          v.currentTime = end - 0.4;
+        } catch {
+        }
+        this.lastSeekAt = now;
+      } else {
+        v.playbackRate = ahead > 1.2 ? 1.06 : 1;
       }
-      this.lastSeekAt = now;
-    } else {
-      v.playbackRate = ahead > 1.2 ? 1.06 : 1;
     }
     if (force || v.currentTime - start > 4) {
       const to = Math.max(start + 0.05, v.currentTime - 2);
@@ -438,11 +836,18 @@ var MsePlayer = class {
   }
   stop() {
     this.closed = true;
+    if (this.rvfcHandle !== null && typeof this.video.cancelVideoFrameCallback === "function") {
+      this.video.cancelVideoFrameCallback(this.rvfcHandle);
+    }
+    this.rvfcHandle = null;
+    this.mediaTimeMap.clear();
     try {
       this.ws?.close();
     } catch {
     }
     this.ws = null;
+    this.pcmPlayer?.stop();
+    this.pcmPlayer = null;
     try {
       if (this.ms && this.ms.readyState === "open") this.ms.endOfStream();
     } catch {
@@ -450,6 +855,10 @@ var MsePlayer = class {
     this.pending.length = 0;
     this.sb = null;
     this.ms = null;
+    for (const [ev, fn] of this.watchdogListeners) {
+      this.video.removeEventListener(ev, fn);
+    }
+    this.watchdogListeners = [];
     try {
       this.video.removeAttribute("src");
       this.video.srcObject = null;
@@ -506,12 +915,15 @@ var AvatarSession = class {
     __publicField(this, "_sessionCapSeconds");
     __publicField(this, "permittedStream");
     __publicField(this, "langs");
+    __publicField(this, "_responseLanguage");
+    __publicField(this, "fallbackInBandText", false);
     this.sm = new StateMachine(opts.dev ?? false);
     this.sm.onChange((next, prev) => {
       opts.callbacks?.onStateChange?.(next, prev);
     });
     this.permittedStream = opts.permittedStream ?? null;
     this.langs = opts.langs ?? [];
+    this._responseLanguage = opts.responseLanguage;
   }
   get state() {
     return this.sm.state;
@@ -560,6 +972,13 @@ var AvatarSession = class {
     const dev = this.opts.dev ?? false;
     this.mse = new MsePlayer(this.opts.videoEl, dev);
     this.mse.connect(target.mseWsUrl, {
+      onMode: (mode) => {
+        if (mode !== "poster-pcm") return;
+        this.fallbackInBandText = true;
+        if (this.opts.mic === false && !this.mic) {
+          this.openReceiveOnlyTransport(target, dev);
+        }
+      },
       onFirstFrame: () => {
         if (this.done) return;
         const s = this.sm.state;
@@ -568,41 +987,87 @@ var AvatarSession = class {
           this.opts.callbacks?.onFirstFrame?.();
         }
       },
+      onAudioBlocked: () => {
+        if (!this.done) this.opts.callbacks?.onAudioBlocked?.();
+      },
       onClose: () => {
         if (this.done) return;
         const s = this.sm.state;
         if (s === "live" || s === "connecting") this.internalEnd("edge_disconnect");
       },
+      onEnded: (reason) => {
+        this.internalEnd(reason);
+      },
       onError: (err) => {
         if (dev) console.warn("[mse] error", err);
       }
     });
-    const streamForMic = this.permittedStream;
-    this.permittedStream = null;
-    this.mic = new MicCapture();
-    try {
-      await this.mic.start(
-        target.micWsUrl,
-        this.opts.lang ?? "en",
-        {
-          onPartial: (text) => {
-            if (!this.done) this.opts.callbacks?.onPartial?.(text);
+    if (this.opts.mic !== false) {
+      const streamForMic = this.permittedStream;
+      this.permittedStream = null;
+      this.mic = new MicCapture();
+      try {
+        await this.mic.start(
+          target.micWsUrl,
+          this.opts.lang ?? "en",
+          {
+            onReady: () => {
+              if (!this.done) this.opts.callbacks?.onMicReady?.();
+            },
+            onPartial: (text) => {
+              if (!this.done) this.opts.callbacks?.onPartial?.(text);
+            },
+            onTurn: (turn) => {
+              if (!this.done) this.opts.callbacks?.onTurn?.(turn);
+            },
+            onFrameTimestamp: (info) => {
+              if (!this.done) this.opts.callbacks?.onAudioFrameSent?.(info);
+            },
+            onError: (err) => {
+              if (dev) console.warn("[mic] error", err);
+              if (!this.done) this.opts.callbacks?.onError?.(err);
+            },
+            onAudioBlocked: () => {
+              if (!this.done) this.opts.callbacks?.onAudioBlocked?.();
+            }
           },
-          onTurn: (turn) => {
-            if (!this.done) this.opts.callbacks?.onTurn?.(turn);
-          },
-          onError: (err) => {
-            if (dev) console.warn("[mic] error", err);
-          }
-        },
-        this.opts.workletUrl ?? "/mic-worklet.js",
-        streamForMic ?? void 0,
-        dev,
-        this.langs
-      );
-    } catch (err) {
-      this.internalFail(err);
+          this.opts.workletUrl ?? "/mic-worklet.js",
+          streamForMic ?? void 0,
+          dev,
+          this.langs,
+          this._responseLanguage,
+          (t) => this.mse?.mediaTimeAt(t) ?? null
+        );
+      } catch (err) {
+        this.internalFail(err);
+      }
     }
+  }
+  openReceiveOnlyTransport(target, dev) {
+    if (this.done || this.mic) return;
+    this.mic = new MicCapture();
+    this.mic.startReceiveOnly(
+      target.micWsUrl,
+      this.opts.lang ?? "en",
+      {
+        onPartial: (text) => {
+          if (!this.done) this.opts.callbacks?.onPartial?.(text);
+        },
+        onTurn: (turn) => {
+          if (!this.done) this.opts.callbacks?.onTurn?.(turn);
+        },
+        onError: (err) => {
+          if (dev) console.warn("[mic] receive-only error", err);
+          if (!this.done) this.opts.callbacks?.onError?.(err);
+        },
+        onAudioBlocked: () => {
+          if (!this.done) this.opts.callbacks?.onAudioBlocked?.();
+        }
+      },
+      dev,
+      this.langs,
+      this._responseLanguage
+    );
   }
   leave() {
     if (this.done) return;
@@ -614,6 +1079,39 @@ var AvatarSession = class {
   setMuted(muted) {
     this.mic?.setMuted(muted);
   }
+  /** Send a typed user turn through the active session. Workers fallback sessions use their
+   *  in-band WebSocket; GPU sessions use the optional application-supplied textTransport. */
+  async sendText(text) {
+    const value = text.trim();
+    if (!value) throw new Error("text is required");
+    if (this.fallbackInBandText) {
+      if (!this.mic) throw new Error("fallback text transport is not ready");
+      return this.mic.sendText(value);
+    }
+    if (!this.opts.textTransport) throw new Error("text transport is unavailable");
+    const reply = await this.opts.textTransport(value);
+    return { text: value, reply };
+  }
+  /** Unmute avatar audio from a user-gesture context (tap-for-sound button). Returns whether
+   *  audio is now unblocked. Pair with callbacks.onAudioBlocked. */
+  unmuteAudio() {
+    const mse = this.mse?.unmuteAudio() ?? true;
+    const pcm = this.mic?.unmuteAudio() ?? true;
+    return mse && pcm;
+  }
+  /** Call synchronously inside the click/tap handler that starts a call, BEFORE any await:
+   *  a user-gestured play()/load() clears WebKit's per-element gesture restrictions so the
+   *  SDK's scripted unmute isn't answered with a pause on iOS Safari (which otherwise turns
+   *  the first call in a fresh browsing context into a muted ~2fps slideshow). */
+  static primeVideoElement(video) {
+    try {
+      video.muted = true;
+      void video.play().catch(() => {
+      });
+      video.load();
+    } catch {
+    }
+  }
   /** Change the ASR recognition language(s) — applies live mid-session and persists for the
    *  session (and any socket reconnect). [] = auto-detect across the box's configured set. */
   setLangs(langs) {
@@ -622,6 +1120,16 @@ var AvatarSession = class {
   }
   get asrLangs() {
     return this.langs;
+  }
+  /** Change the avatar's preferred REPLY language mid-session (BCP-47; '' = back to the LLM's
+   *  own choice). Applies from the next turn and persists for the session (and any socket
+   *  reconnect). Distinct from setLangs (ASR recognition pin). */
+  setResponseLanguage(lang) {
+    this._responseLanguage = lang;
+    this.mic?.setResponseLanguage(lang);
+  }
+  get responseLanguage() {
+    return this._responseLanguage;
   }
   destroy() {
     this.done = true;
