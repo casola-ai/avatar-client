@@ -79,6 +79,10 @@ export declare class MicCapture {
      *  {op:'set_response_language'} text frame the edge applies on the next turn; also stored so
      *  a socket reconnect's hello carries the latest pick. */
     setResponseLanguage(lang: string): void;
+    /** Replace the hidden runtime instruction appended to the avatar's system prompt. The edge
+     *  applies it from the next genuine user turn without speaking or emitting a transcript turn.
+     *  An empty string clears the instruction. */
+    setRuntimeInstruction(instruction: string): void;
     private flushFrame;
     /** Prepends the wire header (section 4) to a 1600-sample PCM frame and sends it as one binary
      *  WS message. Used by both flushFrame() and the preroll send in openWs(). */

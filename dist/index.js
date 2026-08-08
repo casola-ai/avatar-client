@@ -468,6 +468,16 @@ var MicCapture = class {
       this.ws.send(JSON.stringify({ op: "set_response_language", language: lang }));
     }
   }
+  /** Replace the hidden runtime instruction appended to the avatar's system prompt. The edge
+   *  applies it from the next genuine user turn without speaking or emitting a transcript turn.
+   *  An empty string clears the instruction. */
+  setRuntimeInstruction(instruction) {
+    const value = instruction.trim();
+    if (value.length > 2e3) throw new Error("runtime instruction is too long");
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ op: "set_instruction", instruction: value }));
+    }
+  }
   flushFrame(dev) {
     let header = null;
     if (this.ctx) {
@@ -1127,6 +1137,11 @@ var AvatarSession = class {
   setResponseLanguage(lang) {
     this._responseLanguage = lang;
     this.mic?.setResponseLanguage(lang);
+  }
+  /** Replace hidden system-level guidance for subsequent turns. Unlike sendText(), this does not
+   *  create a user message, request an immediate response, or surface in transcript callbacks. */
+  setRuntimeInstruction(instruction) {
+    this.mic?.setRuntimeInstruction(instruction);
   }
   get responseLanguage() {
     return this._responseLanguage;

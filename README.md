@@ -72,6 +72,7 @@ new AvatarSession(opts: AvatarSessionOpts)
 | `.leave()` | End the session and fire `onClose('generic')`. |
 | `.destroy()` | Tear down without callbacks (use in component cleanup). |
 | `.setMuted(muted)` | Mute or unmute the mic mid-session. |
+| `.setRuntimeInstruction(text)` | Replace hidden system-level guidance for subsequent turns without generating a reply or transcript entry; an empty string clears it. |
 | `.unmuteAudio()` | Unmute avatar audio after `onAudioBlocked`; call from a tap/click handler. |
 | `.state` | Current `WidgetState`. |
 | `.sessionCapSeconds` | Server-set cap, populated once the edge target is known (`ready` state). |

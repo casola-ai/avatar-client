@@ -440,6 +440,17 @@ export class MicCapture {
     }
   }
 
+  /** Replace the hidden runtime instruction appended to the avatar's system prompt. The edge
+   *  applies it from the next genuine user turn without speaking or emitting a transcript turn.
+   *  An empty string clears the instruction. */
+  setRuntimeInstruction(instruction: string): void {
+    const value = instruction.trim();
+    if (value.length > 2000) throw new Error('runtime instruction is too long');
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ op: 'set_instruction', instruction: value }));
+    }
+  }
+
   private flushFrame(dev: boolean): void {
     let header: MicFrameHeader | null = null;
     if (this.ctx) {

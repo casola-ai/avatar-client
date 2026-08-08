@@ -6,6 +6,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- Added `setRuntimeInstruction()` for hidden, in-session guidance that applies to future turns without creating a user message or immediate reply.
+
 ### Docs
 - Corrected README and docs to reflect `connectViaToken` as the shipping connection strategy; removed references to the never-implemented `connectViaQueue`.
 

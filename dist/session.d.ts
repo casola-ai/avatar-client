@@ -121,6 +121,9 @@ export declare class AvatarSession {
      *  own choice). Applies from the next turn and persists for the session (and any socket
      *  reconnect). Distinct from setLangs (ASR recognition pin). */
     setResponseLanguage(lang: string): void;
+    /** Replace hidden system-level guidance for subsequent turns. Unlike sendText(), this does not
+     *  create a user message, request an immediate response, or surface in transcript callbacks. */
+    setRuntimeInstruction(instruction: string): void;
     get responseLanguage(): string | undefined;
     destroy(): void;
     private internalEnd;

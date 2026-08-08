@@ -346,6 +346,12 @@ export class AvatarSession {
     this.mic?.setResponseLanguage(lang);
   }
 
+  /** Replace hidden system-level guidance for subsequent turns. Unlike sendText(), this does not
+   *  create a user message, request an immediate response, or surface in transcript callbacks. */
+  setRuntimeInstruction(instruction: string): void {
+    this.mic?.setRuntimeInstruction(instruction);
+  }
+
   get responseLanguage(): string | undefined {
     return this._responseLanguage;
   }
