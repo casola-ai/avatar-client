@@ -25,6 +25,93 @@ function connectViaToken(o) {
   };
 }
 
+// src/disclosure.ts
+var attached = /* @__PURE__ */ new WeakMap();
+function clean(value) {
+  return value?.trim() ?? "";
+}
+function detailsFrom(value) {
+  return (typeof value === "string" ? [value] : value ?? []).map((part) => part.trim()).filter(Boolean);
+}
+function textSpan(document, className, text) {
+  const span = document.createElement("span");
+  span.className = className;
+  span.textContent = text;
+  return span;
+}
+function attachDisclosure(target, initial = {}) {
+  attached.get(target)?.destroy();
+  let options = {
+    name: initial.name,
+    recording: initial.recording ?? true,
+    details: initial.details,
+    visible: initial.visible ?? true
+  };
+  let destroyed = false;
+  const render = () => {
+    if (destroyed) return;
+    const document = target.ownerDocument;
+    const visualSegments = [];
+    const accessibleSegments = [];
+    if (options.recording) {
+      const recording = document.createElement("span");
+      recording.className = "casola-disclosure__recording-group";
+      const dot = document.createElement("span");
+      dot.className = "casola-disclosure__recording-dot";
+      dot.setAttribute("aria-hidden", "true");
+      recording.replaceChildren(dot, textSpan(document, "casola-disclosure__recording", "REC"));
+      visualSegments.push(recording);
+      accessibleSegments.push("Recording");
+    }
+    visualSegments.push(textSpan(document, "casola-disclosure__ai", "AI"));
+    accessibleSegments.push("AI");
+    const name = clean(options.name);
+    if (name) {
+      visualSegments.push(textSpan(document, "casola-disclosure__name", name));
+      accessibleSegments.push(name);
+    }
+    for (const detail of detailsFrom(options.details)) {
+      visualSegments.push(textSpan(document, "casola-disclosure__detail", detail));
+      accessibleSegments.push(detail);
+    }
+    const children = [];
+    for (const [index, segment] of visualSegments.entries()) {
+      if (index > 0) {
+        const separator = textSpan(document, "casola-disclosure__separator", "\xB7");
+        separator.setAttribute("aria-hidden", "true");
+        children.push(separator);
+      }
+      children.push(segment);
+    }
+    target.replaceChildren(...children);
+    target.classList.add("casola-disclosure");
+    target.removeAttribute("aria-hidden");
+    target.setAttribute("aria-label", accessibleSegments.join(" \xB7 "));
+    target.toggleAttribute("data-recording", options.recording);
+    target.hidden = !options.visible;
+  };
+  const controller = {
+    update(next) {
+      if (destroyed) return;
+      options = { ...options, ...next };
+      render();
+    },
+    destroy() {
+      if (destroyed) return;
+      destroyed = true;
+      if (attached.get(target) === controller) attached.delete(target);
+      target.replaceChildren();
+      target.classList.remove("casola-disclosure");
+      target.removeAttribute("aria-label");
+      target.removeAttribute("data-recording");
+      target.hidden = true;
+    }
+  };
+  attached.set(target, controller);
+  render();
+  return controller;
+}
+
 // src/clock-map.ts
 var ClockMap = class {
   constructor(cap = 64) {
@@ -1178,6 +1265,7 @@ var AvatarSession = class {
 };
 export {
   AvatarSession,
+  attachDisclosure,
   connectViaToken
 };
 //# sourceMappingURL=index.js.map

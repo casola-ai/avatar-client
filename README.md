@@ -12,6 +12,7 @@ npm i @casola/avatar-client
 
 ```typescript
 import { AvatarSession, connectViaToken } from '@casola/avatar-client';
+import { attachDisclosure } from '@casola/avatar-client';
 
 // Get a connect URL and session token from your server (POST /api/v1/sessions)
 const { connect_url, session_token } = await fetch('/my-backend/start-session').then(r => r.json());
@@ -32,6 +33,13 @@ const session = new AvatarSession({
   },
 });
 
+// Keep the AI and recording disclosure visible for the full live session.
+const disclosure = attachDisclosure(document.querySelector('#call-label'), {
+  name: 'Mia',
+  recording: true,
+  details: 'Customer support', // optional plain text, or an array of text segments
+});
+
 await AvatarSession.ensureMicPermission();
 await session.start();
 
@@ -41,6 +49,7 @@ console.log(turn.reply);
 
 // End the session
 session.leave();
+disclosure.destroy();
 ```
 
 The worklet file (`dist/worklet/mic-worklet.js`) must be served from the same origin as the page, or from a URL explicitly allowed by the browser's AudioWorklet loader.
@@ -79,6 +88,29 @@ new AvatarSession(opts: AvatarSessionOpts)
 | `AvatarSession.ensureMicPermission()` | Request mic permission before `start()`. |
 | `AvatarSession.primeVideoElement(video)` | Call synchronously in the call-button tap handler, before any `await`: clears WebKit's per-element gesture restrictions so iOS Safari honors the SDK's unmute (otherwise the first call in a fresh browsing context plays muted, and pre-fix rendered as a slideshow). |
 | `AvatarSession.mediaSupported()` | `false` on browsers without MSE. |
+
+### `attachDisclosure(target, options)`
+
+Populates an application-owned element with the canonical persistent `● REC · AI · name` label.
+The SDK owns the required wording, safe DOM construction, accessibility label, and update lifecycle;
+your application owns placement and styling through the `casola-disclosure` class. When recording is
+disabled, the REC segment is omitted. `details` accepts one string or an array of strings and always
+renders them as plain text after the avatar name.
+
+Style hooks are `casola-disclosure` on the target and
+`casola-disclosure__recording-group`, `__recording-dot`, `__recording`, `__ai`, `__name`,
+`__detail`, and `__separator` on its generated children.
+
+```typescript
+const disclosure = attachDisclosure(document.querySelector('#call-label'), {
+  name: 'Mia',
+  recording: true,
+  details: ['Customer support', 'English'],
+});
+
+disclosure.update({ recording: false, visible: true });
+disclosure.destroy();
+```
 
 ### Key types
 
