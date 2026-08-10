@@ -12,7 +12,7 @@ npm i @casola/avatar-client
 
 ```typescript
 import { AvatarSession, connectViaToken } from '@casola/avatar-client';
-import { attachDisclosure } from '@casola/avatar-client';
+import { attachDisclosure, attachSessionControls } from '@casola/avatar-client';
 
 // Get a connect URL and session token from your server (POST /api/v1/sessions)
 const { connect_url, session_token } = await fetch('/my-backend/start-session').then(r => r.json());
@@ -40,6 +40,11 @@ const disclosure = attachDisclosure(document.querySelector('#call-label'), {
   details: 'Customer support', // optional plain text, or an array of text segments
 });
 
+const controls = attachSessionControls(document.querySelector('#call-controls'), {
+  onMutedChange: (muted) => session.setMuted(muted),
+  onHangup: () => session.leave(),
+});
+
 await AvatarSession.ensureMicPermission();
 await session.start();
 
@@ -50,6 +55,7 @@ console.log(turn.reply);
 // End the session
 session.leave();
 disclosure.destroy();
+controls.destroy();
 ```
 
 The worklet file (`dist/worklet/mic-worklet.js`) must be served from the same origin as the page, or from a URL explicitly allowed by the browser's AudioWorklet loader.
@@ -110,6 +116,31 @@ const disclosure = attachDisclosure(document.querySelector('#call-label'), {
 
 disclosure.update({ recording: false, visible: true });
 disclosure.destroy();
+```
+
+### `attachSessionControls(target, options)`
+
+Populates an application-owned element with optional native mute and hang-up buttons. The SDK owns
+accessible state, button labels, pending hang-up protection, safe DOM construction, and the update
+lifecycle. The host owns the behavior through `onMutedChange` and `onHangup`, so product-specific
+cleanup, feedback, reporting, and navigation are not bypassed.
+
+Style hooks are `casola-session-controls` on the target and
+`casola-session-controls__mute`, `__mute-label`, `__hangup`, and `__hangup-label` on generated
+children. State hooks are `[data-muted]` and `[data-ending]` on the target.
+
+```typescript
+const controls = attachSessionControls(document.querySelector('#call-controls'), {
+  mute: true,
+  hangup: true,
+  muted: false,
+  labels: { hangup: 'End reading' },
+  onMutedChange: (muted) => session.setMuted(muted),
+  onHangup: async () => finishProductFlow(),
+});
+
+controls.update({ muted: true, muteDisabled: false });
+controls.destroy();
 ```
 
 ### Key types

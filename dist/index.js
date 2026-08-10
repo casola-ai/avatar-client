@@ -25,8 +25,130 @@ function connectViaToken(o) {
   };
 }
 
-// src/disclosure.ts
+// src/controls.ts
+var DEFAULT_LABELS = {
+  mute: "Mute microphone",
+  unmute: "Unmute microphone",
+  hangup: "End call",
+  ending: "Ending call\u2026"
+};
 var attached = /* @__PURE__ */ new WeakMap();
+function resolve(initial) {
+  return {
+    visible: initial.visible ?? true,
+    mute: initial.mute ?? true,
+    hangup: initial.hangup ?? true,
+    muted: initial.muted ?? false,
+    muteDisabled: initial.muteDisabled ?? false,
+    hangupDisabled: initial.hangupDisabled ?? false,
+    ending: initial.ending ?? false,
+    label: initial.label?.trim() || "Call controls",
+    labels: { ...DEFAULT_LABELS, ...initial.labels },
+    onMutedChange: initial.onMutedChange,
+    onHangup: initial.onHangup,
+    onError: initial.onError
+  };
+}
+function buttonLabel(document, className, text) {
+  const label = document.createElement("span");
+  label.className = className;
+  label.textContent = text;
+  return label;
+}
+function attachSessionControls(target, initial = {}) {
+  attached.get(target)?.destroy();
+  let options = resolve(initial);
+  let destroyed = false;
+  const render = () => {
+    if (destroyed) return;
+    const document = target.ownerDocument;
+    const children = [];
+    if (options.mute) {
+      const label = options.muted ? options.labels.unmute : options.labels.mute;
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "casola-session-controls__mute";
+      button.setAttribute("aria-label", label);
+      button.setAttribute("aria-pressed", String(options.muted));
+      button.disabled = options.ending || options.muteDisabled || !options.onMutedChange;
+      button.appendChild(buttonLabel(document, "casola-session-controls__mute-label", label));
+      button.addEventListener("click", () => {
+        if (destroyed || button.disabled) return;
+        const previous = options.muted;
+        options = { ...options, muted: !previous };
+        render();
+        try {
+          options.onMutedChange?.(!previous);
+        } catch (error) {
+          options = { ...options, muted: previous };
+          render();
+          options.onError?.(error);
+        }
+      });
+      children.push(button);
+    }
+    if (options.hangup) {
+      const label = options.ending ? options.labels.ending : options.labels.hangup;
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "casola-session-controls__hangup";
+      button.setAttribute("aria-label", label);
+      button.setAttribute("aria-busy", String(options.ending));
+      button.disabled = options.ending || options.hangupDisabled || !options.onHangup;
+      button.appendChild(buttonLabel(document, "casola-session-controls__hangup-label", label));
+      button.addEventListener("click", () => {
+        if (destroyed || button.disabled) return;
+        options = { ...options, ending: true };
+        render();
+        Promise.resolve().then(() => options.onHangup?.()).catch((error) => {
+          if (!destroyed) options.onError?.(error);
+        }).finally(() => {
+          if (destroyed) return;
+          options = { ...options, ending: false };
+          render();
+        });
+      });
+      children.push(button);
+    }
+    target.replaceChildren(...children);
+    target.classList.add("casola-session-controls");
+    target.setAttribute("role", "group");
+    target.setAttribute("aria-label", options.label);
+    target.toggleAttribute("data-muted", options.muted);
+    target.toggleAttribute("data-ending", options.ending);
+    target.hidden = !options.visible || children.length === 0;
+  };
+  const controller = {
+    update(next) {
+      if (destroyed) return;
+      options = {
+        ...options,
+        ...next,
+        label: next.label?.trim() || (next.label === void 0 ? options.label : "Call controls"),
+        labels: next.labels ? { ...options.labels, ...next.labels } : options.labels
+      };
+      render();
+    },
+    destroy() {
+      if (destroyed) return;
+      destroyed = true;
+      if (attached.get(target) === controller) attached.delete(target);
+      target.replaceChildren();
+      target.classList.remove("casola-session-controls");
+      target.removeAttribute("role");
+      target.removeAttribute("aria-label");
+      target.removeAttribute("data-muted");
+      target.removeAttribute("data-ending");
+      target.hidden = true;
+    }
+  };
+  attached.set(target, controller);
+  render();
+  return controller;
+}
+
+// src/disclosure.ts
+var attached2 = /* @__PURE__ */ new WeakMap();
 function clean(value) {
   return value?.trim() ?? "";
 }
@@ -40,7 +162,7 @@ function textSpan(document, className, text) {
   return span;
 }
 function attachDisclosure(target, initial = {}) {
-  attached.get(target)?.destroy();
+  attached2.get(target)?.destroy();
   let options = {
     name: initial.name,
     recording: initial.recording ?? true,
@@ -99,7 +221,7 @@ function attachDisclosure(target, initial = {}) {
     destroy() {
       if (destroyed) return;
       destroyed = true;
-      if (attached.get(target) === controller) attached.delete(target);
+      if (attached2.get(target) === controller) attached2.delete(target);
       target.replaceChildren();
       target.classList.remove("casola-disclosure");
       target.removeAttribute("aria-label");
@@ -107,7 +229,7 @@ function attachDisclosure(target, initial = {}) {
       target.hidden = true;
     }
   };
-  attached.set(target, controller);
+  attached2.set(target, controller);
   render();
   return controller;
 }
@@ -377,8 +499,8 @@ var MicCapture = class {
     const ws = new WebSocket(wsUrl);
     ws.binaryType = "arraybuffer";
     this.ws = ws;
-    this.wsReady = new Promise((resolve, reject) => {
-      this.resolveWsReady = resolve;
+    this.wsReady = new Promise((resolve2, reject) => {
+      this.resolveWsReady = resolve2;
       this.rejectWsReady = reject;
     });
     void this.wsReady.catch(() => {
@@ -528,12 +650,12 @@ var MicCapture = class {
     }
     this.textSequence += 1;
     const id = `text-${this.textSequence}`;
-    const result = new Promise((resolve, reject) => {
+    const result = new Promise((resolve2, reject) => {
       const timer = setTimeout(() => {
         this.textWaiters.delete(id);
         reject(new Error("text response timed out"));
       }, 3e4);
-      this.textWaiters.set(id, { resolve, reject, timer });
+      this.textWaiters.set(id, { resolve: resolve2, reject, timer });
     });
     this.ws.send(JSON.stringify({ op: "text", id, text: value }));
     return result;
@@ -1266,6 +1388,7 @@ var AvatarSession = class {
 export {
   AvatarSession,
   attachDisclosure,
+  attachSessionControls,
   connectViaToken
 };
 //# sourceMappingURL=index.js.map
