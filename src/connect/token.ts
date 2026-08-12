@@ -1,28 +1,23 @@
 import type { ConnectHandlers, ConnectStrategy } from '../session';
 
+/**
+ * The shipping connect strategy: turn a mint result (`connect_url` + `session_token`, minted by
+ * your backend with `protocol_versions: [2]`) into the box's `/v2/session` WebSocket target.
+ * The path is well-known per docs/avatar-protocol-v2-spec.md; the token rides `?token=`.
+ */
 export function connectViaToken(o: {
   connectUrl: string;
   sessionToken?: string;
-  edgePaths?: { mse?: string; micStream?: string };
   sessionCapSeconds?: number;
 }): ConnectStrategy {
-  const msePath = o.edgePaths?.mse ?? '/mse';
-  const micPath = o.edgePaths?.micStream ?? '/mic_stream';
-
-  function toWss(base: string, path: string): string {
-    const u = new URL(path, base);
-    u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
-    if (o.sessionToken) u.searchParams.set('token', o.sessionToken);
-    return u.toString();
-  }
+  const u = new URL('/v2/session', o.connectUrl);
+  u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
+  if (o.sessionToken) u.searchParams.set('token', o.sessionToken);
+  const sessionWsUrl = u.toString();
 
   return {
     connect(h: ConnectHandlers): void {
-      h.onReady({
-        mseWsUrl: toWss(o.connectUrl, msePath),
-        micWsUrl: toWss(o.connectUrl, micPath),
-        sessionCapSeconds: o.sessionCapSeconds,
-      });
+      h.onReady({ sessionWsUrl, sessionCapSeconds: o.sessionCapSeconds });
     },
     close(): void {
       /* no persistent connection to close */

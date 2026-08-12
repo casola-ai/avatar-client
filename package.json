@@ -1,7 +1,7 @@
 {
   "name": "@casola/avatar-client",
-  "version": "0.1.5",
-  "description": "Browser SDK for Casola live avatar sessions (MSE video + mic streaming).",
+  "version": "0.2.0",
+  "description": "Browser SDK for Casola live avatar sessions over avatar protocol v2 (one multiplexed WebSocket).",
   "license": "MIT",
   "type": "module",
   "sideEffects": false,
@@ -30,12 +30,14 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs && tsc -p tsconfig.build.json",
+    "sync-protocol": "node scripts/sync-protocol.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {
     "esbuild": "^0.24.0",
+    "jsdom": "^30.0.1",
     "typescript": "^5.3.3",
     "vitest": "^4.1.0"
   }

@@ -1,3 +1,13 @@
+/**
+ * controls.ts — optional SDK-rendered mute and hang-up buttons.
+ *
+ * The SDK owns native button semantics, accessible state, pending-state protection and safe text
+ * rendering. The HOST owns what the buttons actually do, through `onMutedChange` / `onHangup`:
+ * ending a product session can also release a seat, request feedback, generate a report, or
+ * finish another domain-specific flow, and none of that can live in a rendering helper.
+ *
+ * A control with no callback renders disabled rather than lying about what it will do.
+ */
 export interface SessionControlLabels {
     /** Accessible and visible label while the microphone is active. */
     mute: string;

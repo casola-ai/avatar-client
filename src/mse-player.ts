@@ -1,16 +1,8 @@
 import { ClockMap } from './clock-map';
-import { decodePcmDownlinkFrame } from './pcm-downlink';
-import { PcmPlayer } from './pcm-player';
-import type { EndReason } from './session';
 
 export interface MseHandlers {
   onFirstFrame?: () => void;
-  /** Edge transport negotiation. GPU boxes advertise `mime`; the Workers fallback advertises
-   *  `poster-pcm`, allowing AvatarSession to open its in-band text/audio control socket. */
-  onMode?: (mode: string) => void;
   onError?: (err: unknown) => void;
-  onClose?: () => void;
-  onEnded?: (reason: EndReason) => void;
   /** Playback continues muted because the browser refused unmuted playback (iOS Safari pauses
    *  an autoplaying video on a scripted unmute). Surface a tap-for-sound affordance and call
    *  unmuteAudio() from the tap's gesture context. */
@@ -20,6 +12,7 @@ export interface MseHandlers {
 type MediaSourceCtor = { new (): MediaSource };
 
 function getMediaSourceCtor(): MediaSourceCtor | null {
+  if (typeof window === 'undefined') return null;
   const w = window as unknown as {
     ManagedMediaSource?: MediaSourceCtor;
     MediaSource?: MediaSourceCtor;
@@ -27,6 +20,12 @@ function getMediaSourceCtor(): MediaSourceCtor | null {
   return w.ManagedMediaSource ?? w.MediaSource ?? null;
 }
 
+/**
+ * MSE playback for the v2 avatar-video channel. Owns no socket: the v2 driver feeds it the
+ * declared mime (from `accept.channels`) via setMime() and raw fMP4 payloads (MEDIA_INIT then
+ * MEDIA frames) via append(). Everything else — buffering, live-edge chasing, eviction, the
+ * pause watchdog, the rVFC media-time calibration — is unchanged from the v1 player.
+ */
 export class MsePlayer {
   static supported(): boolean {
     return getMediaSourceCtor() !== null;
@@ -34,8 +33,6 @@ export class MsePlayer {
 
   private ms: MediaSource | null = null;
   private sb: SourceBuffer | null = null;
-  private ws: WebSocket | null = null;
-  private pcmPlayer: PcmPlayer | null = null;
   private mime: string | null = null;
   private readonly pending: BufferSource[] = [];
   private sourceOpen = false;
@@ -63,7 +60,8 @@ export class MsePlayer {
     private readonly dev = false
   ) {}
 
-  connect(wsUrl: string, handlers: MseHandlers = {}): void {
+  /** Create the MediaSource and arm the element. Call once, then setMime() + append(). */
+  attach(handlers: MseHandlers = {}): void {
     this.handlers = handlers;
     const Ctor = getMediaSourceCtor();
     if (!Ctor) {
@@ -130,7 +128,21 @@ export class MsePlayer {
     this.video.addEventListener('canplay', fireFirstIfPlaying);
 
     this.scheduleFrameCallback();
-    this.openWs(wsUrl);
+  }
+
+  /** Declare the stream's MSE mime (from the accept's video channel descriptor). */
+  setMime(mime: string): void {
+    this.mime = mime;
+    this.trySetup();
+  }
+
+  /** Append one fMP4 payload (init segment or media segment, in wire order). */
+  append(bytes: Uint8Array): void {
+    if (this.closed) return;
+    // Copy: the payload is a subarray view into the transport's frame buffer, which the caller
+    // may reuse; SourceBuffer.appendBuffer needs stable bytes until updateend.
+    this.pending.push(bytes.slice());
+    this.drain();
   }
 
   /** Re-arms itself each callback (rVFC only fires once per registration) to keep sampling the
@@ -167,64 +179,7 @@ export class MsePlayer {
     if (v.paused) void v.play().catch(() => {});
     this.audioBlocked = false;
     this.resumeAttempts = 0;
-    const pcm = this.pcmPlayer?.unmute() ?? true;
-    return !v.muted && pcm;
-  }
-
-  private openWs(wsUrl: string): void {
-    const ws = new WebSocket(wsUrl);
-    ws.binaryType = 'arraybuffer';
-    this.ws = ws;
-    ws.addEventListener('message', (ev) => this.onMessage(ev));
-    ws.addEventListener('close', () => {
-      if (!this.closed) this.handlers.onClose?.();
-    });
-    ws.addEventListener('error', () => this.handlers.onError?.(new Error('mse socket error')));
-  }
-
-  private onMessage(ev: MessageEvent): void {
-    if (typeof ev.data === 'string') {
-      try {
-        const m = JSON.parse(ev.data) as {
-          mime?: string;
-          mode?: string;
-          poster_url?: string;
-          type?: string;
-          reason?: EndReason;
-        };
-        if (m.type === 'session_ended') {
-          this.handlers.onEnded?.(m.reason ?? 'generic');
-          return;
-        }
-        if (m.mode === 'poster-pcm') {
-          // The fallback supplies a poster and sends speech as framed PCM on a session socket.
-          // A caller-supplied poster remains the fallback for older/mock implementations.
-          if (m.poster_url) this.video.poster = m.poster_url;
-          this.handlers.onMode?.(m.mode);
-          this.fireFirstFrame();
-          return;
-        }
-        if (m.type === 'audio_reset') {
-          this.pcmPlayer?.flush();
-          return;
-        }
-        if (m.mime) {
-          this.mime = m.mime;
-          this.trySetup();
-        }
-      } catch {
-        /* ignore non-JSON text */
-      }
-      return;
-    }
-    const pcm = decodePcmDownlinkFrame(ev.data as ArrayBuffer);
-    if (pcm) {
-      this.pcmPlayer ??= new PcmPlayer(() => this.setAudioBlocked());
-      this.pcmPlayer.enqueue(pcm);
-      return;
-    }
-    this.pending.push(new Uint8Array(ev.data as ArrayBuffer));
-    this.drain();
+    return !v.muted;
   }
 
   private trySetup(): void {
@@ -360,14 +315,6 @@ export class MsePlayer {
     }
     this.rvfcHandle = null;
     this.mediaTimeMap.clear();
-    try {
-      this.ws?.close();
-    } catch {
-      /* */
-    }
-    this.ws = null;
-    this.pcmPlayer?.stop();
-    this.pcmPlayer = null;
     try {
       if (this.ms && this.ms.readyState === 'open') this.ms.endOfStream();
     } catch {

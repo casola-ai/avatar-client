@@ -1,6 +1,12 @@
 # @casola/avatar-client
 
-Browser SDK for Casola live-avatar sessions. Manages the edge connection, MSE video playback, and mic streaming.
+Browser SDK for Casola live-avatar sessions, speaking **avatar protocol v2**: one WebSocket per
+session carrying JSON control messages and binary media frames (mic uplink, avatar audio, fMP4
+video). Sessions render as MSE video when the box streams video, or as a poster image + PCM audio
+when it doesn't — the SDK handles both from the same API.
+
+> **v1 boxes:** this SDK speaks protocol v2 only. Against a fleet that still serves the legacy
+> two-socket wire (`/mse` + `/mic_stream`), stay on `@casola/avatar-client@0.1.x`.
 
 ## Install
 
@@ -12,67 +18,53 @@ npm i @casola/avatar-client
 
 ```typescript
 import { AvatarSession, connectViaToken } from '@casola/avatar-client';
-import { attachDisclosure, attachSessionControls } from '@casola/avatar-client';
 
-// Get a connect URL and session token from your server (POST /api/v1/sessions)
+// Your backend mints the session (POST /api/v1/sessions with protocol_versions: [2])
+// and hands the browser the box URL + short-lived session token.
 const { connect_url, session_token } = await fetch('/my-backend/start-session').then(r => r.json());
 
 const session = new AvatarSession({
   videoEl: document.querySelector('video#avatar'),
   connect: connectViaToken({ connectUrl: connect_url, sessionToken: session_token }),
-  workletUrl: '/mic-worklet.js', // serve dist/worklet/mic-worklet.js from your CDN
+  workletUrl: '/mic-worklet.js', // serve dist/worklet/mic-worklet.js from your origin
   callbacks: {
     onStateChange(next) { updateUI(next); },
     onPartial(text)     { console.log('partial:', text); },
     onTurn(t)           { console.log('turn:', t.text); },
     onFirstFrame()      { hideSpinner(); },
     onMicReady()        { showReadyToSpeak(); },
-    onAudioBlocked()    { showTapForSound(); }, // iOS refused unmuted playback — video runs muted
+    onAudioBlocked()    { showTapForSound(); }, // iOS refused unmuted playback — media runs muted
     onClose(reason)     { console.log('ended:', reason); },
     onError(err)        { console.error(err); },
   },
 });
 
-// Keep the AI and recording disclosure visible for the full live session.
-const disclosure = attachDisclosure(document.querySelector('#call-label'), {
-  name: 'Mia',
-  recording: true,
-  details: 'Customer support', // optional plain text, or an array of text segments
-});
-
-const controls = attachSessionControls(document.querySelector('#call-controls'), {
-  onMutedChange: (muted) => session.setMuted(muted),
-  onHangup: () => session.leave(),
-});
-
 await AvatarSession.ensureMicPermission();
 await session.start();
 
-// Typed turns use the assigned edge's in-band transport when available.
+// Typed turns ride the same session socket.
 const turn = await session.sendText('Tell me about your priorities.');
 console.log(turn.reply);
 
 // End the session
 session.leave();
-disclosure.destroy();
-controls.destroy();
 ```
 
-The worklet file (`dist/worklet/mic-worklet.js`) must be served from the same origin as the page, or from a URL explicitly allowed by the browser's AudioWorklet loader.
+The worklet file (`dist/worklet/mic-worklet.js`) must be served from the same origin as the page,
+or from a URL explicitly allowed by the browser's AudioWorklet loader.
 
 ## API
 
 ### `connectViaToken(opts)`
 
-Returns a `ConnectStrategy` for the token-based connection path: connects directly to the edge using a short-lived JWT minted by your server.
+Returns a `ConnectStrategy` that points the session at the box's well-known `/v2/session`
+endpoint using the short-lived JWT minted by your server.
 
 | Option | Type | Default |
 |--------|------|---------|
 | `connectUrl` | `string` | — |
 | `sessionToken` | `string` | — |
-| `edgePaths.mse` | `string` | `'/mse'` |
-| `edgePaths.micStream` | `string` | `'/mic_stream'` |
-| `sessionCapSeconds` | `number` | — |
+| `sessionCapSeconds` | `number` | — (superseded by the box's `cap_seconds` once connected) |
 
 ### `AvatarSession`
 
@@ -82,18 +74,21 @@ new AvatarSession(opts: AvatarSessionOpts)
 
 | Member | Description |
 |--------|-------------|
-| `.start()` | Begin the session: connect to the edge and start streaming. |
-| `.sendText(text)` | Send a typed turn and resolve with `{text, reply}` plus optional speech metadata. Workers fallback edges use their in-band socket; other edges use `textTransport`. |
+| `.start()` | Begin the session: open the session socket, handshake, start streaming. |
+| `.sendText(text)` | Send a typed turn over the session socket; resolves with `{text, reply}` plus optional speech metadata. |
 | `.leave()` | End the session and fire `onClose('generic')`. |
 | `.destroy()` | Tear down without callbacks (use in component cleanup). |
-| `.setMuted(muted)` | Mute or unmute the mic mid-session. |
+| `.setMuted(muted)` | Mute or unmute the mic mid-session (muted frames are sent as silence, keeping timing continuous). |
+| `.setLangs(langs)` | Re-pin the ASR recognition language(s) mid-session; `[]` = auto-detect. |
+| `.setResponseLanguage(lang)` | Preferred reply language (BCP-47; `''` returns the choice to the model). |
 | `.setRuntimeInstruction(text)` | Replace hidden system-level guidance for subsequent turns without generating a reply or transcript entry; an empty string clears it. |
 | `.unmuteAudio()` | Unmute avatar audio after `onAudioBlocked`; call from a tap/click handler. |
 | `.state` | Current `WidgetState`. |
-| `.sessionCapSeconds` | Server-set cap, populated once the edge target is known (`ready` state). |
+| `.sessionCapSeconds` | The session cap — the box's authoritative `cap_seconds` once connected. |
+| `.personaKey` | The avatar version the box bound, echoed in the handshake (the persona-pinning ack). |
 | `AvatarSession.ensureMicPermission()` | Request mic permission before `start()`. |
 | `AvatarSession.primeVideoElement(video)` | Call synchronously in the call-button tap handler, before any `await`: clears WebKit's per-element gesture restrictions so iOS Safari honors the SDK's unmute (otherwise the first call in a fresh browsing context plays muted, and pre-fix rendered as a slideshow). |
-| `AvatarSession.mediaSupported()` | `false` on browsers without MSE. |
+| `AvatarSession.mediaSupported()` | `false` on browsers without MSE. Poster-mode sessions (poster + audio) work regardless — the SDK simply doesn't offer video in the handshake. |
 
 ### `attachDisclosure(target, options)`
 
@@ -143,6 +138,8 @@ controls.update({ muted: true, muteDisabled: false });
 controls.destroy();
 ```
 
+Both helpers are protocol-agnostic DOM utilities — they behave identically to 0.1.4/0.1.5.
+
 ### Key types
 
 **`WidgetState`**
@@ -160,20 +157,31 @@ controls.destroy();
 {
   videoEl: HTMLVideoElement;
   connect: ConnectStrategy;
-  lang?: string;           // BCP 47, default 'en'
-  workletUrl?: string;     // default '/mic-worklet.js'
-  mic?: boolean;           // default true; false skips getUserMedia
-  textTransport?: (text: string) => Promise<string>;
+  langs?: string[];           // ASR language pin; [] / omitted = auto-detect
+  responseLanguage?: string;  // preferred reply language (BCP-47)
+  workletUrl?: string;        // default '/mic-worklet.js'
+  mic?: boolean;              // default true; false = receive-only (no getUserMedia, text via sendText)
+  permittedStream?: MediaStream; // from ensureMicPermission(), avoids a second prompt
   prewarm?: () => Promise<void> | void;
-  dev?: boolean;           // log unexpected state transitions
-  callbacks?: { ... };
+  dev?: boolean;              // log unexpected state transitions + protocol violations
+  callbacks?: { ... };        // see AvatarSessionOpts for the full set, incl.
+                              // onSpeechStart/onSpeechEnd (assistant utterance markers)
 }
 ```
 
-`textTransport` lets an application adapt an existing HTTP chat relay for GPU edges. It is not
-used when the assigned edge advertises the SDK's in-band text transport. With `mic: false`, the SDK
-also opens that in-band socket only after the edge advertises support, so receive-only GPU sessions
-keep their existing connection shape.
+## Migrating from 0.1.x
+
+0.2.0 replaces the two-socket v1 wire with the single v2 session socket. Breaking changes:
+
+- Your backend must mint with `protocol_versions: [2]` and the fleet must contain protocol-v2
+  boxes; the SDK no longer speaks `/mse` + `/mic_stream`.
+- `connectViaToken` lost `edgePaths` (the path is well-known) — pass `sessionCapSeconds` as before.
+- `AvatarSessionOpts` lost `textTransport` (typed turns are always in-band) and `lang`
+  (use `langs` / `responseLanguage`).
+- The deprecated `onQueueStatus` callback was removed as promised in its deprecation note.
+
+`attachDisclosure` and `attachSessionControls` are unchanged from 0.1.4/0.1.5 — they render DOM and
+never touch the wire.
 
 ## License
 

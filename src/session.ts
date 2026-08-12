@@ -1,21 +1,19 @@
-import type { Turn } from './mic-capture';
-import { MicCapture } from './mic-capture';
+import { MicPipeline } from './mic-pipeline';
 import { MsePlayer } from './mse-player';
 import type { WidgetState } from './state';
 import { StateMachine } from './state';
+import { type DriverSocket, type EndReason, type Turn, V2Driver } from './v2/driver';
 
-export type { Turn, WidgetState };
-
-export type EndReason = 'cap' | 'edge_disconnect' | 'kicked' | 'expired' | 'dropped' | 'generic';
+export type { EndReason, Turn, WidgetState };
 
 export interface EdgeTarget {
-  mseWsUrl: string;
-  micWsUrl: string;
+  /** The box's `/v2/session` WebSocket URL, session token included. */
+  sessionWsUrl: string;
+  /** Seconds until the mint's `expires_at` — superseded by the accept's `cap_seconds`. */
   sessionCapSeconds?: number;
 }
 
 export interface ConnectHandlers {
-  onStatus?(s: { phase: 'open' }): void;
   onReady(t: EdgeTarget): void;
   onEnded?(r: EndReason): void;
   onError?(e: unknown): void;
@@ -29,7 +27,6 @@ export interface ConnectStrategy {
 export interface AvatarSessionOpts {
   videoEl: HTMLVideoElement;
   connect: ConnectStrategy;
-  lang?: string;
   /** Initial ASR language pin (box language names, e.g. ['English']). [] / omitted = auto-detect. */
   langs?: string[];
   /** Preferred REPLY language (BCP-47, e.g. 'zh-CN'): the avatar is instructed to strongly prefer
@@ -39,64 +36,56 @@ export interface AvatarSessionOpts {
   workletUrl?: string;
   prewarm?: () => Promise<void> | void;
   dev?: boolean;
-  /** Mic uplink. Default true. Set false for a RECEIVE-ONLY session: MSE video+audio plays
-   *  down, but no microphone is opened (no getUserMedia prompt, no worklet needed). User input
-   *  then arrives through sendText(). A fallback edge opens a receive-only control/audio socket
-   *  after transport negotiation; GPU sessions use `textTransport`. */
+  /** Mic uplink. Default true. Set false for a RECEIVE-ONLY session: the hello omits `mic`, no
+   *  microphone is opened (no getUserMedia prompt, no worklet needed), and user input arrives
+   *  through sendText() over the same session socket. */
   mic?: boolean;
-  /** Legacy text transport used when the assigned GPU edge does not advertise in-band text.
-   *  First-party BFFs can provide their existing same-origin `/chat` relay here. */
-  textTransport?: (text: string) => Promise<string>;
   /** Pre-fetched MediaStream from ensureMicPermission() — avoids a second getUserMedia call. */
   permittedStream?: MediaStream;
+  /** Test seam for the session WebSocket — see V2Driver. */
+  createSocket?: (url: string, protocols: string[]) => DriverSocket;
   callbacks?: {
     onStateChange?(next: WidgetState, prev: WidgetState): void;
-    /**
-     * @deprecated Named for a capacity queue the platform no longer has (a full fleet 503s the
-     *  mint instead). Fires only if a ConnectStrategy calls `onStatus`, and `connectViaToken` —
-     *  the only shipping strategy — never does. Retained for API compatibility and will be removed
-     *  in the next major; don't build on it. If a real queue is reintroduced it will ship under a
-     *  new, purpose-named callback rather than reviving this one.
-     */
-    onQueueStatus?(s: { phase: 'open' }): void;
     onPartial?(text: string): void;
     onTurn?(t: Turn): void;
     onFirstFrame?(): void;
-    /** Fired when the microphone uplink is open and ready to receive the user's speech. */
+    /** Fired when the microphone pipeline is capturing and the session is ready for speech. */
     onMicReady?(): void;
-    /** Fired once per outgoing 100ms mic frame with the same correlation fields sent in its wire
-     *  header (specs/av-sync-timestamps-notes.md sections 2-4) — analytics/debugging hook, not
-     *  required for normal operation. `videoMediaTimeMs` is the wire's unknown sentinel
-     *  (0xFFFFFFFF) before the avatar video has displayed its first frame. */
+    /** The box marked the start of an assistant utterance (speech_id groups its turn/audio). */
+    onSpeechStart?(speechId: string): void;
+    onSpeechEnd?(speechId: string): void;
+    /** Fired once per outgoing 100ms mic frame with its capture calibration — analytics/debugging
+     *  hook, not required for normal operation. `videoMediaTimeMs` is the unknown sentinel
+     *  (0xFFFFFFFF) before the avatar video has displayed its first frame (always, in poster
+     *  mode); on the wire that is sent as `pts_us = 0`. */
     onAudioFrameSent?(info: {
       micSeq: number;
       videoMediaTimeMs: number;
       captureEpochMs: number;
     }): void;
-    /** Video continues muted because the browser refused unmuted playback (iOS Safari). Show a
+    /** Media continues muted because the browser refused unmuted playback (iOS Safari). Show a
      *  tap-for-sound affordance and call unmuteAudio() from the tap. */
     onAudioBlocked?(): void;
     onClose?(r: EndReason): void;
-    /** Fired on a terminal session failure (connect/media setup) AND on non-terminal mic-uplink
-     *  errors (mic socket error, server error frame) so a dead microphone is never silent. For
-     *  mic errors the video + session keep running; inspect the error and decide whether to warn
-     *  or leave(). getUserMedia denial and a failed worklet load surface here too (they reject
-     *  start() → terminal). Pre-flight the mic with AvatarSession.ensureMicPermission() to catch
-     *  permission problems before you spend a GPU seat. */
+    /** Fired on a terminal session failure (connect/handshake/mic setup) AND on non-terminal
+     *  in-band errors (server error message, media hiccup) so a degraded session is never
+     *  silent. For non-terminal errors the session keeps running; inspect the error and decide
+     *  whether to warn or leave(). getUserMedia denial and a failed worklet load are terminal.
+     *  Pre-flight the mic with AvatarSession.ensureMicPermission() to catch permission problems
+     *  before you spend a seat. */
     onError?(e: unknown): void;
   };
 }
 
 export class AvatarSession {
   private readonly sm: StateMachine;
-  private mse: MsePlayer | null = null;
-  private mic: MicCapture | null = null;
+  private driver: V2Driver | null = null;
   private done = false;
   private _sessionCapSeconds: number | undefined;
+  private _personaKey: string | undefined;
   private permittedStream: MediaStream | null;
   private langs: string[];
   private _responseLanguage: string | undefined;
-  private fallbackInBandText = false;
 
   constructor(private readonly opts: AvatarSessionOpts) {
     this.sm = new StateMachine(opts.dev ?? false);
@@ -116,12 +105,19 @@ export class AvatarSession {
     return this._sessionCapSeconds;
   }
 
+  /** The avatar_versions.id the box bound, echoed in the accept (the persona-pinning ack). */
+  get personaKey(): string | undefined {
+    return this._personaKey;
+  }
+
   // Returns the live stream so callers can pass it back via opts.permittedStream,
   // avoiding a second getUserMedia call (and second permission prompt on Firefox).
   static ensureMicPermission(): Promise<MediaStream> {
-    return MicCapture.ensurePermission();
+    return MicPipeline.ensurePermission();
   }
 
+  /** Whether this browser can play the fMP4 video channel. Poster-mode sessions (audio + still)
+   *  work regardless — the hello simply doesn't offer video. */
   static mediaSupported(): boolean {
     return MsePlayer.supported();
   }
@@ -130,14 +126,11 @@ export class AvatarSession {
     if (this.done || this.sm.state !== 'idle') return Promise.resolve();
     this.sm.set('waiting');
     this.opts.connect.connect({
-      onStatus: (s) => {
-        this.opts.callbacks?.onQueueStatus?.(s);
-      },
       onReady: (target) => {
         if (this.done) return;
         this._sessionCapSeconds = target.sessionCapSeconds;
         this.sm.set('ready');
-        void this.openMedia(target);
+        void this.openSession(target);
       },
       onEnded: (reason) => {
         this.internalEnd(reason);
@@ -149,7 +142,7 @@ export class AvatarSession {
     return Promise.resolve();
   }
 
-  private async openMedia(target: EdgeTarget): Promise<void> {
+  private async openSession(target: EdgeTarget): Promise<void> {
     if (this.done) return;
     this.sm.set('connecting');
 
@@ -158,125 +151,73 @@ export class AvatarSession {
     } catch {
       /* best-effort */
     }
-
     if (this.done) return;
 
     const dev = this.opts.dev ?? false;
+    // Transfer permittedStream ownership to the driver; clear here so teardown()
+    // doesn't double-stop after the mic pipeline takes it over.
+    const streamForMic = this.permittedStream;
+    this.permittedStream = null;
 
-    this.mse = new MsePlayer(this.opts.videoEl, dev);
-    this.mse.connect(target.mseWsUrl, {
-      onMode: (mode) => {
-        if (mode !== 'poster-pcm') return;
-        this.fallbackInBandText = true;
-        if (this.opts.mic === false && !this.mic) {
-          this.openReceiveOnlyTransport(target, dev);
-        }
-      },
-      onFirstFrame: () => {
-        if (this.done) return;
-        const s = this.sm.state;
-        if (s === 'connecting' || s === 'ready') {
-          this.sm.set('live');
-          this.opts.callbacks?.onFirstFrame?.();
-        }
-      },
-      onAudioBlocked: () => {
-        if (!this.done) this.opts.callbacks?.onAudioBlocked?.();
-      },
-      onClose: () => {
-        if (this.done) return;
-        const s = this.sm.state;
-        if (s === 'live' || s === 'connecting') this.internalEnd('edge_disconnect');
-      },
-      onEnded: (reason) => {
-        this.internalEnd(reason);
-      },
-      onError: (err) => {
-        if (dev) console.warn('[mse] error', err);
-      },
-    });
-
-    // Receive-only sessions (mic:false) skip microphone capture — no getUserMedia or worklet.
-    // GPU sessions keep their historical MSE-only shape. A Workers fallback is detected by the
-    // MSE control frame above and gets a receive-only /mic_stream socket for text + assistant PCM.
-    // Scoped as a block rather than an early return so anything added below openMedia's mic
-    // section still runs on a receive-only session. A caller-supplied permittedStream is left
-    // untransferred here, so teardown() stops it.
-    if (this.opts.mic !== false) {
-      // Transfer permittedStream ownership to MicCapture; clear here so teardown()
-      // doesn't double-stop if mic.start() succeeds.
-      const streamForMic = this.permittedStream;
-      this.permittedStream = null;
-
-      this.mic = new MicCapture();
-      try {
-        await this.mic.start(
-          target.micWsUrl,
-          this.opts.lang ?? 'en',
-          {
-            onReady: () => {
-              if (!this.done) this.opts.callbacks?.onMicReady?.();
-            },
-            onPartial: (text) => {
-              if (!this.done) this.opts.callbacks?.onPartial?.(text);
-            },
-            onTurn: (turn) => {
-              if (!this.done) this.opts.callbacks?.onTurn?.(turn);
-            },
-            onFrameTimestamp: (info) => {
-              if (!this.done) this.opts.callbacks?.onAudioFrameSent?.(info);
-            },
-            onError: (err) => {
-              if (dev) console.warn('[mic] error', err);
-              // Surface mic-uplink failures (socket error, server error frame) so a dead
-              // microphone is never silent — the top complaint in the quickstart demo debrief.
-              // Non-terminal: video + the session stay up and the app decides what to do
-              // (warn the user, end the call). Terminal failures still route through
-              // internalFail() → onError as before.
-              if (!this.done) this.opts.callbacks?.onError?.(err);
-            },
-            onAudioBlocked: () => {
-              if (!this.done) this.opts.callbacks?.onAudioBlocked?.();
-            },
-          },
-          this.opts.workletUrl ?? '/mic-worklet.js',
-          streamForMic ?? undefined,
-          dev,
-          this.langs,
-          this._responseLanguage,
-          (t) => this.mse?.mediaTimeAt(t) ?? null
-        );
-      } catch (err) {
-        this.internalFail(err);
-      }
-    }
-  }
-
-  private openReceiveOnlyTransport(target: EdgeTarget, dev: boolean): void {
-    if (this.done || this.mic) return;
-    this.mic = new MicCapture();
-    this.mic.startReceiveOnly(
-      target.micWsUrl,
-      this.opts.lang ?? 'en',
-      {
+    this.driver = new V2Driver({
+      videoEl: this.opts.videoEl,
+      sessionWsUrl: target.sessionWsUrl,
+      mic: this.opts.mic !== false,
+      langs: this.langs,
+      responseLanguage: this._responseLanguage,
+      workletUrl: this.opts.workletUrl ?? '/mic-worklet.js',
+      permittedStream: streamForMic ?? undefined,
+      dev,
+      createSocket: this.opts.createSocket,
+      handlers: {
+        onAccept: (info) => {
+          if (this.done) return;
+          this._sessionCapSeconds = info.capSeconds;
+          this._personaKey = info.personaKey;
+        },
+        onFirstFrame: () => {
+          if (this.done) return;
+          const s = this.sm.state;
+          if (s === 'connecting' || s === 'ready') {
+            this.sm.set('live');
+            this.opts.callbacks?.onFirstFrame?.();
+          }
+        },
+        onMicReady: () => {
+          if (!this.done) this.opts.callbacks?.onMicReady?.();
+        },
         onPartial: (text) => {
           if (!this.done) this.opts.callbacks?.onPartial?.(text);
         },
         onTurn: (turn) => {
           if (!this.done) this.opts.callbacks?.onTurn?.(turn);
         },
-        onError: (err) => {
-          if (dev) console.warn('[mic] receive-only error', err);
-          if (!this.done) this.opts.callbacks?.onError?.(err);
+        onSpeechStart: (id) => {
+          if (!this.done) this.opts.callbacks?.onSpeechStart?.(id);
+        },
+        onSpeechEnd: (id) => {
+          if (!this.done) this.opts.callbacks?.onSpeechEnd?.(id);
+        },
+        onAudioFrameSent: (info) => {
+          if (!this.done) this.opts.callbacks?.onAudioFrameSent?.(info);
         },
         onAudioBlocked: () => {
           if (!this.done) this.opts.callbacks?.onAudioBlocked?.();
         },
+        onEnded: (reason) => {
+          this.internalEnd(reason);
+        },
+        onError: (err, terminal) => {
+          if (terminal) {
+            this.internalFail(err);
+          } else {
+            if (dev) console.warn('[v2] session error', err);
+            if (!this.done) this.opts.callbacks?.onError?.(err);
+          }
+        },
       },
-      dev,
-      this.langs,
-      this._responseLanguage
-    );
+    });
+    this.driver.connect();
   }
 
   leave(): void {
@@ -288,29 +229,20 @@ export class AvatarSession {
   }
 
   setMuted(muted: boolean): void {
-    this.mic?.setMuted(muted);
+    this.driver?.setMuted(muted);
   }
 
-  /** Send a typed user turn through the active session. Workers fallback sessions use their
-   *  in-band WebSocket; GPU sessions use the optional application-supplied textTransport. */
-  async sendText(text: string): Promise<Turn> {
-    const value = text.trim();
-    if (!value) throw new Error('text is required');
-    if (this.fallbackInBandText) {
-      if (!this.mic) throw new Error('fallback text transport is not ready');
-      return this.mic.sendText(value);
-    }
-    if (!this.opts.textTransport) throw new Error('text transport is unavailable');
-    const reply = await this.opts.textTransport(value);
-    return { text: value, reply };
+  /** Send a typed user turn through the session socket. Resolves with the box's reply. */
+  sendText(text: string): Promise<Turn> {
+    const driver = this.driver;
+    if (!driver) return Promise.reject(new Error('text transport is unavailable'));
+    return driver.sendText(text);
   }
 
   /** Unmute avatar audio from a user-gesture context (tap-for-sound button). Returns whether
    *  audio is now unblocked. Pair with callbacks.onAudioBlocked. */
   unmuteAudio(): boolean {
-    const mse = this.mse?.unmuteAudio() ?? true;
-    const pcm = this.mic?.unmuteAudio() ?? true;
-    return mse && pcm;
+    return this.driver?.unmuteAudio() ?? true;
   }
 
   /** Call synchronously inside the click/tap handler that starts a call, BEFORE any await:
@@ -328,10 +260,10 @@ export class AvatarSession {
   }
 
   /** Change the ASR recognition language(s) — applies live mid-session and persists for the
-   *  session (and any socket reconnect). [] = auto-detect across the box's configured set. */
+   *  session. [] = auto-detect across the box's configured set. */
   setLangs(langs: string[]): void {
     this.langs = langs;
-    this.mic?.setLangs(langs);
+    this.driver?.setLangs(langs);
   }
 
   get asrLangs(): string[] {
@@ -339,17 +271,17 @@ export class AvatarSession {
   }
 
   /** Change the avatar's preferred REPLY language mid-session (BCP-47; '' = back to the LLM's
-   *  own choice). Applies from the next turn and persists for the session (and any socket
-   *  reconnect). Distinct from setLangs (ASR recognition pin). */
+   *  own choice). Applies from the next turn and persists for the session. Distinct from
+   *  setLangs (ASR recognition pin). */
   setResponseLanguage(lang: string): void {
     this._responseLanguage = lang;
-    this.mic?.setResponseLanguage(lang);
+    this.driver?.setResponseLanguage(lang);
   }
 
   /** Replace hidden system-level guidance for subsequent turns. Unlike sendText(), this does not
    *  create a user message, request an immediate response, or surface in transcript callbacks. */
   setRuntimeInstruction(instruction: string): void {
-    this.mic?.setRuntimeInstruction(instruction);
+    this.driver?.setRuntimeInstruction(instruction);
   }
 
   get responseLanguage(): string | undefined {
@@ -379,11 +311,9 @@ export class AvatarSession {
 
   private teardown(): void {
     this.opts.connect.close();
-    this.mse?.stop();
-    this.mse = null;
-    this.mic?.stop();
-    this.mic = null;
-    // Stop the retained stream if openMedia() never transferred it to MicCapture
+    this.driver?.stop();
+    this.driver = null;
+    // Stop the retained stream if openSession() never transferred it to the driver
     this.permittedStream?.getTracks().forEach((t) => {
       t.stop();
     });

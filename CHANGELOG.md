@@ -6,15 +6,42 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-11
+
+### Changed
+- **BREAKING:** the SDK now speaks avatar protocol v2 exclusively — one session WebSocket
+  (`/v2/session`) carrying JSON control messages and binary media frames, replacing the v1
+  `/mse` + `/mic_stream` pair. Your backend must mint sessions with `protocol_versions: [2]`
+  against a fleet containing protocol-v2 boxes; stay on 0.1.x for v1 fleets.
+- **BREAKING:** `connectViaToken` drops `edgePaths` (the session path is well-known) and its
+  target now carries `sessionWsUrl` instead of `mseWsUrl`/`micWsUrl`.
+- **BREAKING:** `AvatarSessionOpts` drops `textTransport` (typed turns are always in-band) and
+  `lang` (use `langs` / `responseLanguage`); the deprecated `onQueueStatus` callback is removed
+  as promised in its deprecation note.
+
+### Added
+- Poster-mode and fMP4-video sessions from one API: the box's handshake decides, the SDK renders
+  either without configuration.
+- `attachDisclosure` and `attachSessionControls` carried forward from 0.1.4/0.1.5, unchanged. They
+  are protocol-agnostic DOM helpers, so upgrading from 0.1.5 does not lose them.
+- `session.personaKey` — the avatar version the box bound, echoed in the handshake.
+- `onSpeechStart` / `onSpeechEnd` callbacks marking assistant utterances.
+- Interruption-aware audio: server-signalled interruptions drop exactly the unheard tail of
+  scheduled playback, and the SDK reports playout progress for echo-window alignment.
+
 ## [0.1.5] - 2026-08-10
 
 ### Added
-- Added `attachSessionControls()` for optional, accessible mute and hang-up buttons with host-owned callbacks and asynchronous ending-state protection.
+- `attachSessionControls(target, options)` — optional SDK-rendered mute and hang-up buttons. The
+  SDK owns button semantics, accessible state and pending-hang-up protection; the host owns the
+  behavior through `onMutedChange` / `onHangup`, so product-specific cleanup is not bypassed.
 
 ## [0.1.4] - 2026-08-10
 
 ### Added
-- Added `attachDisclosure()` for a canonical, safely rendered `REC · AI · name` session label with live updates and optional plain-text detail segments.
+- `attachDisclosure(target, options)` — the canonical persistent `● REC · AI · name` session
+  disclosure, with the required wording, safe DOM construction and accessible label owned by the
+  SDK and placement owned by the application.
 
 ## [0.1.3] - 2026-08-07
 

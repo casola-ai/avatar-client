@@ -4,21 +4,13 @@ var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "sy
 
 // src/connect/token.ts
 function connectViaToken(o) {
-  const msePath = o.edgePaths?.mse ?? "/mse";
-  const micPath = o.edgePaths?.micStream ?? "/mic_stream";
-  function toWss(base, path) {
-    const u = new URL(path, base);
-    u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
-    if (o.sessionToken) u.searchParams.set("token", o.sessionToken);
-    return u.toString();
-  }
+  const u = new URL("/v2/session", o.connectUrl);
+  u.protocol = u.protocol === "https:" ? "wss:" : "ws:";
+  if (o.sessionToken) u.searchParams.set("token", o.sessionToken);
+  const sessionWsUrl = u.toString();
   return {
     connect(h) {
-      h.onReady({
-        mseWsUrl: toWss(o.connectUrl, msePath),
-        micWsUrl: toWss(o.connectUrl, micPath),
-        sessionCapSeconds: o.sessionCapSeconds
-      });
+      h.onReady({ sessionWsUrl, sessionCapSeconds: o.sessionCapSeconds });
     },
     close() {
     }
@@ -32,6 +24,7 @@ var DEFAULT_LABELS = {
   hangup: "End call",
   ending: "Ending call\u2026"
 };
+var DEFAULT_GROUP_LABEL = "Call controls";
 var attached = /* @__PURE__ */ new WeakMap();
 function resolve(initial) {
   return {
@@ -42,7 +35,7 @@ function resolve(initial) {
     muteDisabled: initial.muteDisabled ?? false,
     hangupDisabled: initial.hangupDisabled ?? false,
     ending: initial.ending ?? false,
-    label: initial.label?.trim() || "Call controls",
+    label: initial.label?.trim() || DEFAULT_GROUP_LABEL,
     labels: { ...DEFAULT_LABELS, ...initial.labels },
     onMutedChange: initial.onMutedChange,
     onHangup: initial.onHangup,
@@ -124,7 +117,9 @@ function attachSessionControls(target, initial = {}) {
       options = {
         ...options,
         ...next,
-        label: next.label?.trim() || (next.label === void 0 ? options.label : "Call controls"),
+        // An omitted `label` keeps the current one; an explicitly blank one resets to the default,
+        // so the group is never left without an accessible name.
+        label: next.label?.trim() || (next.label === void 0 ? options.label : DEFAULT_GROUP_LABEL),
         labels: next.labels ? { ...options.labels, ...next.labels } : options.labels
       };
       render();
@@ -149,6 +144,7 @@ function attachSessionControls(target, initial = {}) {
 
 // src/disclosure.ts
 var attached2 = /* @__PURE__ */ new WeakMap();
+var SEPARATOR = "\xB7";
 function clean(value) {
   return value?.trim() ?? "";
 }
@@ -199,7 +195,7 @@ function attachDisclosure(target, initial = {}) {
     const children = [];
     for (const [index, segment] of visualSegments.entries()) {
       if (index > 0) {
-        const separator = textSpan(document, "casola-disclosure__separator", "\xB7");
+        const separator = textSpan(document, "casola-disclosure__separator", SEPARATOR);
         separator.setAttribute("aria-hidden", "true");
         children.push(separator);
       }
@@ -208,7 +204,7 @@ function attachDisclosure(target, initial = {}) {
     target.replaceChildren(...children);
     target.classList.add("casola-disclosure");
     target.removeAttribute("aria-hidden");
-    target.setAttribute("aria-label", accessibleSegments.join(" \xB7 "));
+    target.setAttribute("aria-label", accessibleSegments.join(` ${SEPARATOR} `));
     target.toggleAttribute("data-recording", options.recording);
     target.hidden = !options.visible;
   };
@@ -232,6 +228,329 @@ function attachDisclosure(target, initial = {}) {
   attached2.set(target, controller);
   render();
   return controller;
+}
+
+// src/protocol/codes.ts
+var SUBPROTOCOL = "casola.avatar.v2";
+var CloseCode = {
+  NORMAL: 1e3,
+  UNAUTHORIZED: 4001,
+  PROTOCOL_MISMATCH: 4002,
+  PERSONA_UNRESOLVABLE: 4003,
+  CAPACITY: 4004,
+  POLICY: 4008
+};
+
+// src/protocol/frames.ts
+var FRAME_HEADER_BYTES = 16;
+var FrameType = {
+  /** Codec initialization payload for the channel (e.g. fMP4 ftyp+moov). */
+  MEDIA_INIT: 1,
+  /** Media payload (fMP4 segment, PCM slice, data blob). */
+  MEDIA: 2
+};
+var MAX_SEQ = 4294967295;
+var MAX_PTS = BigInt(Number.MAX_SAFE_INTEGER);
+function checkRange(name, value, max) {
+  if (!Number.isInteger(value) || value < 0 || value > max) {
+    throw new RangeError(`frame ${name} out of range: ${value}`);
+  }
+}
+function encodeFrame(frame) {
+  checkRange("frame_type", frame.frameType, 255);
+  checkRange("channel_id", frame.channelId, 255);
+  checkRange("flags", frame.flags, 65535);
+  checkRange("seq", frame.seq, MAX_SEQ);
+  if (!Number.isSafeInteger(frame.ptsUs) || frame.ptsUs < 0) {
+    throw new RangeError(`frame pts_us out of range: ${frame.ptsUs}`);
+  }
+  const out = new Uint8Array(FRAME_HEADER_BYTES + frame.payload.byteLength);
+  const dv = new DataView(out.buffer);
+  dv.setUint8(0, frame.frameType);
+  dv.setUint8(1, frame.channelId);
+  dv.setUint16(2, frame.flags, true);
+  dv.setUint32(4, frame.seq, true);
+  dv.setBigUint64(8, BigInt(frame.ptsUs), true);
+  out.set(frame.payload, FRAME_HEADER_BYTES);
+  return out;
+}
+function decodeFrame(bytes) {
+  if (bytes.byteLength < FRAME_HEADER_BYTES) {
+    throw new RangeError(`frame shorter than header: ${bytes.byteLength} bytes`);
+  }
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const pts = dv.getBigUint64(8, true);
+  if (pts > MAX_PTS) {
+    throw new RangeError(`frame pts_us exceeds safe integer range: ${pts}`);
+  }
+  return {
+    frameType: dv.getUint8(0),
+    channelId: dv.getUint8(1),
+    flags: dv.getUint16(2, true),
+    seq: dv.getUint32(4, true),
+    ptsUs: Number(pts),
+    payload: bytes.subarray(FRAME_HEADER_BYTES)
+  };
+}
+
+// src/protocol/messages.ts
+var isStr = (v) => typeof v === "string";
+var isNum = (v) => typeof v === "number" && Number.isFinite(v);
+var SERVER_CHECKS = {
+  accept: (m) => isNum(m.seq) && m.proto === 2 && isStr(m.persona_key) && isNum(m.cap_seconds) && Array.isArray(m.channels),
+  partial: (m) => isNum(m.seq) && isStr(m.text),
+  turn: (m) => isNum(m.seq) && isStr(m.text) && (m.reply === null || isStr(m.reply)),
+  speech_start: (m) => isNum(m.seq) && isStr(m.speech_id),
+  speech_end: (m) => isNum(m.seq) && isStr(m.speech_id),
+  interruption: (m) => isNum(m.seq) && (m.cutoff_pts_us === null || isNum(m.cutoff_pts_us)),
+  instruction_set: (m) => isNum(m.seq),
+  error: (m) => isNum(m.seq) && isStr(m.code),
+  session_end: (m) => isNum(m.seq) && isStr(m.reason),
+  go_away: (m) => isNum(m.seq),
+  ping: (m) => isNum(m.t),
+  pong: (m) => isNum(m.t)
+};
+function parse(text, checks) {
+  let raw;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return { ok: false, error: "invalid_json" };
+  }
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    return { ok: false, error: "not_an_object" };
+  }
+  const m = raw;
+  if (!isStr(m.type)) return { ok: false, error: "missing_type" };
+  const check = checks[m.type];
+  if (!check) return { ok: "unknown", raw: m };
+  if (!check(m)) return { ok: false, error: `invalid_${m.type}` };
+  return { ok: true, msg: m };
+}
+function parseServerMessage(text) {
+  return parse(text, SERVER_CHECKS);
+}
+
+// src/protocol/state-machine.ts
+var HANDSHAKE_OK = {
+  server: /* @__PURE__ */ new Set(["hello", "ping", "pong", "bye"]),
+  client: /* @__PURE__ */ new Set(["accept", "error", "session_end", "go_away", "ping", "pong"])
+};
+var HANDSHAKE_ONLY = {
+  server: /* @__PURE__ */ new Set(["hello"]),
+  client: /* @__PURE__ */ new Set(["accept"])
+};
+var KNOWN = {
+  server: /* @__PURE__ */ new Set([
+    "hello",
+    "text",
+    "set_langs",
+    "set_response_language",
+    "set_instruction",
+    "playout_ack",
+    "ping",
+    "pong",
+    "bye"
+  ]),
+  client: /* @__PURE__ */ new Set([
+    "accept",
+    "partial",
+    "turn",
+    "speech_start",
+    "speech_end",
+    "interruption",
+    "instruction_set",
+    "error",
+    "session_end",
+    "go_away",
+    "ping",
+    "pong"
+  ])
+};
+function onReceive(role, state, type) {
+  if (!KNOWN[role].has(type)) return { next: state, verdict: "ignore" };
+  switch (state) {
+    case "handshaking": {
+      if (!HANDSHAKE_OK[role].has(type)) return { next: state, verdict: "violation" };
+      if (role === "server" && type === "hello") return { next: state, verdict: "deliver" };
+      if (role === "client" && type === "accept") return { next: "active", verdict: "deliver" };
+      if (type === "session_end" || type === "bye") return { next: "ending", verdict: "deliver" };
+      return { next: state, verdict: "deliver" };
+    }
+    case "active": {
+      if (HANDSHAKE_ONLY[role].has(type)) return { next: state, verdict: "violation" };
+      if (type === "session_end" || type === "bye") return { next: "ending", verdict: "deliver" };
+      return { next: state, verdict: "deliver" };
+    }
+    case "ending":
+      return { next: state, verdict: "ignore" };
+    case "closed":
+      return { next: state, verdict: "ignore" };
+  }
+}
+function onSend(role, state, type) {
+  if (role === "server" && type === "accept" && state === "handshaking") return "active";
+  if (role === "server" && type === "session_end") return "ending";
+  if (role === "client" && type === "bye") return "ending";
+  return state;
+}
+function frameVerdict(state) {
+  return state === "active" ? "deliver" : state === "closed" ? "ignore" : "violation";
+}
+
+// src/protocol/transport.ts
+var Listeners = class {
+  constructor() {
+    __publicField(this, "fns", /* @__PURE__ */ new Set());
+  }
+  add(fn) {
+    this.fns.add(fn);
+    return () => this.fns.delete(fn);
+  }
+  emit(v) {
+    for (const fn of [...this.fns]) fn(v);
+  }
+};
+
+// src/protocol/connection.ts
+function makeConnection(transport, role, parse2, stampSeq) {
+  let state = "handshaking";
+  let nextSeq = 1;
+  const messages = new Listeners();
+  const frames = new Listeners();
+  const violations = new Listeners();
+  transport.onText((text) => {
+    const parsed = parse2(text);
+    if (parsed.ok === "unknown") return;
+    if (parsed.ok === false) {
+      violations.emit({ kind: "illegal_message", detail: parsed.error, state });
+      return;
+    }
+    const { next, verdict } = onReceive(role, state, parsed.msg.type);
+    state = next;
+    if (verdict === "violation") {
+      violations.emit({ kind: "illegal_message", detail: `unexpected ${parsed.msg.type}`, state });
+      return;
+    }
+    if (verdict === "deliver") messages.emit(parsed.msg);
+  });
+  transport.onBinary((bytes) => {
+    const verdict = frameVerdict(state);
+    if (verdict === "ignore") return;
+    if (verdict === "violation") {
+      violations.emit({ kind: "illegal_frame", detail: `binary frame while ${state}`, state });
+      return;
+    }
+    let frame;
+    try {
+      frame = decodeFrame(bytes);
+    } catch (err) {
+      violations.emit({ kind: "bad_frame", detail: String(err), state });
+      return;
+    }
+    frames.emit(frame);
+  });
+  transport.onClose(() => {
+    state = "closed";
+  });
+  const base = {
+    get protocolState() {
+      return state;
+    },
+    sendFrame(frame) {
+      transport.sendBinary(encodeFrame(frame));
+    },
+    onFrame: (fn) => frames.add(fn),
+    onClose: (fn) => transport.onClose(fn),
+    onViolation: (fn) => violations.add(fn),
+    close(code, reason) {
+      state = "closed";
+      transport.close(code, reason);
+    }
+  };
+  return {
+    base,
+    send(msg) {
+      const out = stampSeq && msg.type !== "ping" && msg.type !== "pong" ? { ...msg, seq: nextSeq++ } : msg;
+      state = onSend(role, state, String(msg.type));
+      transport.sendText(JSON.stringify(out));
+    },
+    messages
+  };
+}
+function clientProtocolConnection(transport) {
+  const { base, send, messages } = makeConnection(transport, "client", parseServerMessage, false);
+  return {
+    get protocolState() {
+      return base.protocolState;
+    },
+    sendFrame: base.sendFrame,
+    onFrame: base.onFrame,
+    onClose: base.onClose,
+    onViolation: base.onViolation,
+    close: base.close,
+    send: (msg) => send(msg),
+    onMessage: (fn) => messages.add(fn)
+  };
+}
+
+// src/protocol/limits.ts
+var MAX_CONTROL_MESSAGE_BYTES = 64 * 1024;
+var MAX_TEXT_CHARS = 2e3;
+var MAX_INSTRUCTION_CHARS = 2e3;
+var MAX_FRAME_PAYLOAD_BYTES = 64 * 1024;
+var HANDSHAKE_TIMEOUT_MS = 5e3;
+
+// src/protocol/transports/websocket.ts
+var READY_STATE = {
+  0: "connecting",
+  1: "open",
+  2: "closing",
+  3: "closed"
+};
+function webSocketTransport(ws) {
+  try {
+    ws.binaryType = "arraybuffer";
+  } catch {
+  }
+  const open = new Listeners();
+  const text = new Listeners();
+  const binary = new Listeners();
+  const closed = new Listeners();
+  ws.addEventListener("open", () => open.emit());
+  ws.addEventListener("message", (ev) => {
+    const d = ev.data;
+    if (typeof d === "string") text.emit(d);
+    else if (d instanceof ArrayBuffer) binary.emit(new Uint8Array(d));
+    else if (ArrayBuffer.isView(d)) {
+      const v = d;
+      binary.emit(new Uint8Array(v.buffer, v.byteOffset, v.byteLength));
+    }
+  });
+  ws.addEventListener("close", (ev) => {
+    closed.emit({ code: ev.code ?? 1005, reason: ev.reason ?? "" });
+  });
+  ws.addEventListener("error", () => {
+  });
+  return {
+    get state() {
+      return READY_STATE[ws.readyState] ?? "closed";
+    },
+    sendText(data) {
+      ws.send(data);
+    },
+    sendBinary(data) {
+      const exact = data.byteOffset === 0 && data.byteLength === data.buffer.byteLength ? data.buffer : data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+      ws.send(exact);
+    },
+    close(code, reason) {
+      ws.close(code, reason);
+    },
+    onOpen: (fn) => open.add(fn),
+    onText: (fn) => text.add(fn),
+    onBinary: (fn) => binary.add(fn),
+    onClose: (fn) => closed.add(fn)
+  };
 }
 
 // src/clock-map.ts
@@ -267,109 +586,10 @@ var ClockMap = class {
   }
 };
 
-// src/mic-frame-header.ts
-var MIC_FRAME_HEADER_VERSION = 1;
-var MIC_FRAME_HEADER_BYTES = 20;
-var MIC_FRAME_MAGIC = 51792;
-var VIDEO_MEDIA_TIME_UNKNOWN = 4294967295;
-function encodeMicFrameHeader(header) {
-  const bytes = new Uint8Array(MIC_FRAME_HEADER_BYTES);
-  const view = new DataView(bytes.buffer);
-  view.setUint16(0, MIC_FRAME_MAGIC, true);
-  view.setUint8(2, header.version);
-  view.setUint8(3, 0);
-  view.setUint32(4, header.micSeq, true);
-  view.setUint32(8, header.videoMediaTimeMs, true);
-  view.setFloat64(12, header.captureEpochMs, true);
-  return bytes;
-}
-
-// src/pcm-downlink.ts
-var PCM_DOWNLINK_MAGIC = 51793;
-var PCM_DOWNLINK_VERSION = 1;
-var PCM_DOWNLINK_HEADER_BYTES = 12;
-function decodePcmDownlinkFrame(data) {
-  const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-  if (bytes.byteLength < PCM_DOWNLINK_HEADER_BYTES || (bytes.byteLength - PCM_DOWNLINK_HEADER_BYTES) % 2 !== 0) {
-    return null;
-  }
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  if (view.getUint16(0, true) !== PCM_DOWNLINK_MAGIC || view.getUint8(2) !== PCM_DOWNLINK_VERSION || view.getUint8(3) !== 0) {
-    return null;
-  }
-  const payload = bytes.slice(PCM_DOWNLINK_HEADER_BYTES);
-  return {
-    sequence: view.getUint32(4, true),
-    sampleRate: view.getUint32(8, true),
-    pcm: new Int16Array(payload.buffer, payload.byteOffset, payload.byteLength / 2)
-  };
-}
-
-// src/pcm-player.ts
-var PcmPlayer = class {
-  constructor(onBlocked) {
-    this.onBlocked = onBlocked;
-    __publicField(this, "ctx", null);
-    __publicField(this, "nextStart", 0);
-    __publicField(this, "sources", /* @__PURE__ */ new Set());
-    __publicField(this, "blocked", false);
-  }
-  enqueue(frame) {
-    if (frame.pcm.length === 0 || frame.sampleRate <= 0) return;
-    const ctx = this.ensureContext();
-    const audio = ctx.createBuffer(1, frame.pcm.length, frame.sampleRate);
-    const channel = audio.getChannelData(0);
-    for (let i = 0; i < frame.pcm.length; i++) channel[i] = (frame.pcm[i] ?? 0) / 32768;
-    const source = ctx.createBufferSource();
-    source.buffer = audio;
-    source.connect(ctx.destination);
-    source.addEventListener("ended", () => this.sources.delete(source));
-    this.sources.add(source);
-    const startAt = Math.max(ctx.currentTime + 0.04, this.nextStart);
-    source.start(startAt);
-    this.nextStart = startAt + audio.duration;
-    if (ctx.state === "suspended") {
-      void ctx.resume().catch(() => {
-        if (!this.blocked) {
-          this.blocked = true;
-          this.onBlocked?.();
-        }
-      });
-    }
-  }
-  flush() {
-    for (const source of this.sources) {
-      try {
-        source.stop();
-      } catch {
-      }
-    }
-    this.sources.clear();
-    this.nextStart = this.ctx?.currentTime ?? 0;
-  }
-  unmute() {
-    this.blocked = false;
-    if (!this.ctx) return true;
-    void this.ctx.resume().catch(() => {
-    });
-    return this.ctx.state !== "suspended";
-  }
-  stop() {
-    this.flush();
-    void this.ctx?.close().catch(() => {
-    });
-    this.ctx = null;
-  }
-  ensureContext() {
-    if (!this.ctx) this.ctx = new AudioContext();
-    return this.ctx;
-  }
-};
-
-// src/mic-capture.ts
+// src/mic-pipeline.ts
 var TARGET_RATE = 16e3;
-var FRAME_SAMPLES = 1600;
-var PREROLL_FRAMES = 20;
+var MIC_FRAME_SAMPLES = 1600;
+var VIDEO_MEDIA_TIME_UNKNOWN = 4294967295;
 function clamp16(x) {
   const v = Math.round(x * 32767);
   return v > 32767 ? 32767 : v < -32768 ? -32768 : v;
@@ -383,43 +603,25 @@ function computeFrameTimestamp(frameStartContextTime, inputLatencySeconds, audio
     captureEpochMs: timeOrigin + performanceTimeMs
   };
 }
-var MicCapture = class {
+var MicPipeline = class {
   constructor() {
     __publicField(this, "ctx", null);
     __publicField(this, "stream", null);
     __publicField(this, "node", null);
     __publicField(this, "sink", null);
-    __publicField(this, "ws", null);
-    __publicField(this, "player", null);
-    __publicField(this, "wsReady", null);
-    __publicField(this, "resolveWsReady", null);
-    __publicField(this, "rejectWsReady", null);
-    __publicField(this, "textSequence", 0);
-    __publicField(this, "textWaiters", /* @__PURE__ */ new Map());
-    __publicField(this, "handlers", {});
+    __publicField(this, "opts", null);
     __publicField(this, "inRate", 48e3);
     __publicField(this, "resTail", new Float32Array(0));
     __publicField(this, "resPos", 0);
-    __publicField(this, "frame", new Int16Array(FRAME_SAMPLES));
+    __publicField(this, "frame", new Int16Array(MIC_FRAME_SAMPLES));
     __publicField(this, "frameLen", 0);
     __publicField(this, "closed", false);
     __publicField(this, "muted", false);
     __publicField(this, "pcmCallCount", 0);
-    // Section-2 calibration state — see computeFrameTimestamp().
     __publicField(this, "audioClockMap", new ClockMap());
     __publicField(this, "inputLatencySeconds", 0);
     __publicField(this, "frameStartContextTime", 0);
-    // Named micSeq (not seq/frameSeq) — the server-side tracer already uses frame_seq for an
-    // unrelated concept (the video-timeline index); this is just a monotonic per-connection
-    // counter over outgoing /mic_stream frames.
     __publicField(this, "micSeq", 0);
-    __publicField(this, "getVideoMediaTimeMs");
-    // ASR language pin (box language NAMES, e.g. ['English'] or ['Chinese','English']).
-    // [] = the box default (auto-detect across its configured set). Mutable mid-session.
-    __publicField(this, "langs", []);
-    // Preferred REPLY language (BCP-47). undefined = never sent (the box keeps its session
-    // default, e.g. the JWT claim); '' = explicit clear. Mutable mid-session.
-    __publicField(this, "responseLanguage");
   }
   // Returns the live MediaStream so the caller can pass it to start(), avoiding
   // a second getUserMedia call (which causes a second permission prompt on Firefox).
@@ -434,13 +636,11 @@ var MicCapture = class {
       video: false
     });
   }
-  async start(wsUrl, lang, handlers = {}, workletUrl = "/mic-worklet.js", stream, dev = false, langs = [], responseLanguage, getVideoMediaTimeMs) {
-    this.handlers = handlers;
-    this.langs = langs;
-    this.responseLanguage = responseLanguage;
-    this.getVideoMediaTimeMs = getVideoMediaTimeMs;
-    if (stream) {
-      this.stream = stream;
+  async start(opts) {
+    this.opts = opts;
+    const dev = opts.dev ?? false;
+    if (opts.stream) {
+      this.stream = opts.stream;
     } else {
       this.stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false },
@@ -473,7 +673,7 @@ var MicCapture = class {
       if (dev) console.log("[mic] AudioContext state after resume=", ctx.state);
     }
     this.inRate = ctx.sampleRate;
-    await ctx.audioWorklet.addModule(workletUrl);
+    await ctx.audioWorklet.addModule(opts.workletUrl);
     const source = ctx.createMediaStreamSource(this.stream);
     const node = new AudioWorkletNode(ctx, "mic-fwd");
     this.node = node;
@@ -485,113 +685,6 @@ var MicCapture = class {
     sink.gain.value = 0;
     this.sink = sink;
     source.connect(node).connect(sink).connect(ctx.destination);
-    this.openWs(wsUrl, lang, dev, true);
-  }
-  /** Open only the fallback's in-band control/audio socket. This is created after `/mse`
-   * advertises poster-pcm, so receive-only GPU sessions retain their legacy no-mic behavior. */
-  startReceiveOnly(wsUrl, lang, handlers = {}, dev = false, langs = [], responseLanguage) {
-    this.handlers = handlers;
-    this.langs = langs;
-    this.responseLanguage = responseLanguage;
-    this.openWs(wsUrl, lang, dev, false);
-  }
-  openWs(wsUrl, lang, dev, sendPreroll) {
-    const ws = new WebSocket(wsUrl);
-    ws.binaryType = "arraybuffer";
-    this.ws = ws;
-    this.wsReady = new Promise((resolve2, reject) => {
-      this.resolveWsReady = resolve2;
-      this.rejectWsReady = reject;
-    });
-    void this.wsReady.catch(() => {
-    });
-    ws.addEventListener("open", () => {
-      ws.send(
-        JSON.stringify({
-          op: "hello",
-          lang,
-          langs: this.langs,
-          engine: "default",
-          ...this.responseLanguage !== void 0 ? { response_language: this.responseLanguage } : {},
-          accept_audio: ["pcm16"]
-        })
-      );
-      this.resolveWsReady?.();
-      this.resolveWsReady = null;
-      this.rejectWsReady = null;
-      if (!sendPreroll) return;
-      const silence = new Int16Array(FRAME_SAMPLES);
-      for (let i = 0; i < PREROLL_FRAMES; i++) {
-        this.micSeq += 1;
-        this.sendFrame(silence, {
-          version: MIC_FRAME_HEADER_VERSION,
-          micSeq: this.micSeq,
-          videoMediaTimeMs: VIDEO_MEDIA_TIME_UNKNOWN,
-          captureEpochMs: performance.timeOrigin + performance.now()
-        });
-      }
-      this.handlers.onReady?.();
-    });
-    ws.addEventListener("message", (ev) => this.onServerMessage(ev));
-    ws.addEventListener("error", () => {
-      const error = new Error("mic socket error");
-      this.rejectWsReady?.(error);
-      this.rejectTextWaiters(error);
-      this.handlers.onError?.(error);
-    });
-    ws.addEventListener("close", (ev) => {
-      const error = new Error(`mic socket closed (${ev.code})`);
-      this.rejectWsReady?.(error);
-      this.rejectTextWaiters(error);
-      if (ev.code !== 1e3) console.warn("[mic] WebSocket closed", ev.code, ev.reason);
-      if (dev) console.log("[mic] WebSocket close code=", ev.code, "reason=", ev.reason);
-    });
-  }
-  onServerMessage(ev) {
-    if (typeof ev.data !== "string") {
-      if (!(ev.data instanceof ArrayBuffer)) return;
-      const frame = decodePcmDownlinkFrame(ev.data);
-      if (!frame) return;
-      this.player ?? (this.player = new PcmPlayer(this.handlers.onAudioBlocked));
-      this.player.enqueue(frame);
-      return;
-    }
-    let m;
-    try {
-      m = JSON.parse(ev.data);
-    } catch {
-      return;
-    }
-    if (m.type === "partial" && typeof m.text === "string") {
-      this.handlers.onPartial?.(m.text);
-    } else if (m.type === "turn" && typeof m.text === "string") {
-      const turn = {
-        text: m.text,
-        reply: m.reply ?? "",
-        language: m.language,
-        speechId: m.speech_id
-      };
-      const waiter = m.request_id ? this.textWaiters.get(m.request_id) : void 0;
-      if (waiter && m.request_id) {
-        clearTimeout(waiter.timer);
-        this.textWaiters.delete(m.request_id);
-        waiter.resolve(turn);
-      } else {
-        this.handlers.onTurn?.(turn);
-      }
-    } else if (m.type === "audio_reset") {
-      this.player?.flush();
-    } else if (m.type === "error") {
-      const error = new Error(m.error ?? "mic stream error");
-      const waiter = m.request_id ? this.textWaiters.get(m.request_id) : void 0;
-      if (waiter && m.request_id) {
-        clearTimeout(waiter.timer);
-        this.textWaiters.delete(m.request_id);
-        waiter.reject(error);
-      } else {
-        this.handlers.onError?.(error);
-      }
-    }
   }
   onPcm(chunk, contextTime, dev) {
     if (this.closed) return;
@@ -626,70 +719,16 @@ var MicCapture = class {
       const sample = (buf[i] ?? 0) * (1 - f) + (buf[i + 1] ?? 0) * f;
       if (this.frameLen === 0) this.frameStartContextTime = bufContextTime + pos / this.inRate;
       this.frame[this.frameLen++] = clamp16(sample);
-      if (this.frameLen === FRAME_SAMPLES) this.flushFrame(dev);
+      if (this.frameLen === MIC_FRAME_SAMPLES) this.flushFrame();
       pos += ratio;
     }
     const keepFrom = Math.min(Math.floor(pos), buf.length);
     this.resTail = buf.slice(keepFrom);
     this.resPos = pos - keepFrom;
   }
-  setMuted(m) {
-    this.muted = m;
-  }
-  unmuteAudio() {
-    return this.player?.unmute() ?? true;
-  }
-  async sendText(text) {
-    const value = text.trim();
-    if (!value) throw new Error("text is required");
-    if (value.length > 2e3) throw new Error("text is too long");
-    if (!this.wsReady) throw new Error("text transport is unavailable");
-    await this.wsReady;
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      throw new Error("text transport is unavailable");
-    }
-    this.textSequence += 1;
-    const id = `text-${this.textSequence}`;
-    const result = new Promise((resolve2, reject) => {
-      const timer = setTimeout(() => {
-        this.textWaiters.delete(id);
-        reject(new Error("text response timed out"));
-      }, 3e4);
-      this.textWaiters.set(id, { resolve: resolve2, reject, timer });
-    });
-    this.ws.send(JSON.stringify({ op: "text", id, text: value }));
-    return result;
-  }
-  /** Re-pin the ASR recognition language(s) mid-session. Sends a {op:'set_langs'} text frame the
-   *  edge applies on the next turn; also stored so a socket reconnect carries the latest pick. */
-  setLangs(langs) {
-    this.langs = langs;
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ op: "set_langs", langs }));
-    }
-  }
-  /** Change the preferred REPLY language mid-session (BCP-47; '' clears). Sends a
-   *  {op:'set_response_language'} text frame the edge applies on the next turn; also stored so
-   *  a socket reconnect's hello carries the latest pick. */
-  setResponseLanguage(lang) {
-    this.responseLanguage = lang;
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ op: "set_response_language", language: lang }));
-    }
-  }
-  /** Replace the hidden runtime instruction appended to the avatar's system prompt. The edge
-   *  applies it from the next genuine user turn without speaking or emitting a transcript turn.
-   *  An empty string clears the instruction. */
-  setRuntimeInstruction(instruction) {
-    const value = instruction.trim();
-    if (value.length > 2e3) throw new Error("runtime instruction is too long");
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ op: "set_instruction", instruction: value }));
-    }
-  }
-  flushFrame(dev) {
-    let header = null;
-    if (this.ctx) {
+  flushFrame() {
+    const opts = this.opts;
+    if (this.ctx && opts) {
       const ts = this.ctx.getOutputTimestamp();
       this.audioClockMap.record(
         ts.contextTime ?? this.ctx.currentTime,
@@ -699,55 +738,22 @@ var MicCapture = class {
         this.frameStartContextTime,
         this.inputLatencySeconds,
         this.audioClockMap,
-        this.getVideoMediaTimeMs,
+        opts.getVideoMediaTimeMs,
         performance.timeOrigin
       );
       if (result) {
         this.micSeq += 1;
-        header = { version: MIC_FRAME_HEADER_VERSION, micSeq: this.micSeq, ...result };
-        this.handlers.onFrameTimestamp?.(header);
+        const pcm = this.muted ? new Int16Array(MIC_FRAME_SAMPLES) : this.frame.slice();
+        opts.onFrame(pcm, { micSeq: this.micSeq, ...result });
       }
-    }
-    if (header && this.ws && this.ws.readyState === WebSocket.OPEN) {
-      const pcm = this.muted ? new Int16Array(FRAME_SAMPLES) : this.frame.slice();
-      if (dev) {
-        let allZero = true;
-        for (let i = 0; i < pcm.length; i++) {
-          if (pcm[i] !== 0) {
-            allZero = false;
-            break;
-          }
-        }
-        if (allZero && !this.muted && this.pcmCallCount <= 10) {
-          console.warn(
-            "[mic] flushFrame: sending all-zero frame (possible silence / rate mismatch)"
-          );
-        }
-      }
-      this.sendFrame(pcm, header);
     }
     this.frameLen = 0;
   }
-  /** Prepends the wire header (section 4) to a 1600-sample PCM frame and sends it as one binary
-   *  WS message. Used by both flushFrame() and the preroll send in openWs(). */
-  sendFrame(pcm, header) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    const pcmBytes = new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength);
-    const wireFrame = new Uint8Array(MIC_FRAME_HEADER_BYTES + pcmBytes.byteLength);
-    wireFrame.set(encodeMicFrameHeader(header), 0);
-    wireFrame.set(pcmBytes, MIC_FRAME_HEADER_BYTES);
-    this.ws.send(wireFrame);
+  setMuted(m) {
+    this.muted = m;
   }
   stop() {
     this.closed = true;
-    this.rejectTextWaiters(new Error("mic transport stopped"));
-    try {
-      this.ws?.close();
-    } catch {
-    }
-    this.ws = null;
-    this.player?.stop();
-    this.player = null;
     try {
       this.node?.disconnect();
       this.sink?.disconnect();
@@ -761,17 +767,11 @@ var MicCapture = class {
     });
     this.ctx = null;
   }
-  rejectTextWaiters(error) {
-    for (const waiter of this.textWaiters.values()) {
-      clearTimeout(waiter.timer);
-      waiter.reject(error);
-    }
-    this.textWaiters.clear();
-  }
 };
 
 // src/mse-player.ts
 function getMediaSourceCtor() {
+  if (typeof window === "undefined") return null;
   const w = window;
   return w.ManagedMediaSource ?? w.MediaSource ?? null;
 }
@@ -781,8 +781,6 @@ var MsePlayer = class {
     this.dev = dev;
     __publicField(this, "ms", null);
     __publicField(this, "sb", null);
-    __publicField(this, "ws", null);
-    __publicField(this, "pcmPlayer", null);
     __publicField(this, "mime", null);
     __publicField(this, "pending", []);
     __publicField(this, "sourceOpen", false);
@@ -807,7 +805,8 @@ var MsePlayer = class {
     this.firstFrameFired = true;
     this.handlers.onFirstFrame?.();
   }
-  connect(wsUrl, handlers = {}) {
+  /** Create the MediaSource and arm the element. Call once, then setMime() + append(). */
+  attach(handlers = {}) {
     this.handlers = handlers;
     const Ctor = getMediaSourceCtor();
     if (!Ctor) {
@@ -864,7 +863,17 @@ var MsePlayer = class {
     this.video.addEventListener("loadeddata", fireFirstIfPlaying);
     this.video.addEventListener("canplay", fireFirstIfPlaying);
     this.scheduleFrameCallback();
-    this.openWs(wsUrl);
+  }
+  /** Declare the stream's MSE mime (from the accept's video channel descriptor). */
+  setMime(mime) {
+    this.mime = mime;
+    this.trySetup();
+  }
+  /** Append one fMP4 payload (init segment or media segment, in wire order). */
+  append(bytes) {
+    if (this.closed) return;
+    this.pending.push(bytes.slice());
+    this.drain();
   }
   /** Re-arms itself each callback (rVFC only fires once per registration) to keep sampling the
    *  mediaTime <-> performanceTime relationship for the life of playback. No-op where unsupported
@@ -898,53 +907,7 @@ var MsePlayer = class {
     });
     this.audioBlocked = false;
     this.resumeAttempts = 0;
-    const pcm = this.pcmPlayer?.unmute() ?? true;
-    return !v.muted && pcm;
-  }
-  openWs(wsUrl) {
-    const ws = new WebSocket(wsUrl);
-    ws.binaryType = "arraybuffer";
-    this.ws = ws;
-    ws.addEventListener("message", (ev) => this.onMessage(ev));
-    ws.addEventListener("close", () => {
-      if (!this.closed) this.handlers.onClose?.();
-    });
-    ws.addEventListener("error", () => this.handlers.onError?.(new Error("mse socket error")));
-  }
-  onMessage(ev) {
-    if (typeof ev.data === "string") {
-      try {
-        const m = JSON.parse(ev.data);
-        if (m.type === "session_ended") {
-          this.handlers.onEnded?.(m.reason ?? "generic");
-          return;
-        }
-        if (m.mode === "poster-pcm") {
-          if (m.poster_url) this.video.poster = m.poster_url;
-          this.handlers.onMode?.(m.mode);
-          this.fireFirstFrame();
-          return;
-        }
-        if (m.type === "audio_reset") {
-          this.pcmPlayer?.flush();
-          return;
-        }
-        if (m.mime) {
-          this.mime = m.mime;
-          this.trySetup();
-        }
-      } catch {
-      }
-      return;
-    }
-    const pcm = decodePcmDownlinkFrame(ev.data);
-    if (pcm) {
-      this.pcmPlayer ?? (this.pcmPlayer = new PcmPlayer(() => this.setAudioBlocked()));
-      this.pcmPlayer.enqueue(pcm);
-      return;
-    }
-    this.pending.push(new Uint8Array(ev.data));
-    this.drain();
+    return !v.muted;
   }
   trySetup() {
     if (this.sb || !this.sourceOpen || !this.mime || !this.ms) return;
@@ -1061,13 +1024,6 @@ var MsePlayer = class {
     this.rvfcHandle = null;
     this.mediaTimeMap.clear();
     try {
-      this.ws?.close();
-    } catch {
-    }
-    this.ws = null;
-    this.pcmPlayer?.stop();
-    this.pcmPlayer = null;
-    try {
       if (this.ms && this.ms.readyState === "open") this.ms.endOfStream();
     } catch {
     }
@@ -1123,19 +1079,481 @@ var StateMachine = class {
   }
 };
 
+// src/pcm-player.ts
+var PcmPlayer = class {
+  constructor(onBlocked) {
+    this.onBlocked = onBlocked;
+    __publicField(this, "ctx", null);
+    __publicField(this, "nextStart", 0);
+    __publicField(this, "scheduled", /* @__PURE__ */ new Set());
+    __publicField(this, "lastEndedPtsUs", 0);
+    __publicField(this, "blocked", false);
+  }
+  enqueue(frame) {
+    if (frame.pcm.length === 0 || frame.sampleRate <= 0) return;
+    const ctx = this.ensureContext();
+    const audio = ctx.createBuffer(1, frame.pcm.length, frame.sampleRate);
+    const channel = audio.getChannelData(0);
+    for (let i = 0; i < frame.pcm.length; i++) channel[i] = (frame.pcm[i] ?? 0) / 32768;
+    const source = ctx.createBufferSource();
+    source.buffer = audio;
+    source.connect(ctx.destination);
+    const startAt = Math.max(ctx.currentTime + 0.04, this.nextStart);
+    const entry = {
+      source,
+      startCtxTime: startAt,
+      durationSec: audio.duration,
+      ptsUs: frame.ptsUs
+    };
+    source.addEventListener("ended", () => {
+      if (this.scheduled.delete(entry)) {
+        this.lastEndedPtsUs = Math.max(
+          this.lastEndedPtsUs,
+          entry.ptsUs + entry.durationSec * 1e6
+        );
+      }
+    });
+    this.scheduled.add(entry);
+    source.start(startAt);
+    this.nextStart = startAt + audio.duration;
+    if (ctx.state === "suspended") {
+      void ctx.resume().catch(() => {
+        if (!this.blocked) {
+          this.blocked = true;
+          this.onBlocked?.();
+        }
+      });
+    }
+  }
+  /** Stop every scheduled source whose frame starts at/after `cutoffUs` on the session clock
+   *  (the interruption contract: the user has not heard past the cutoff, so drop it). */
+  flushFrom(cutoffUs) {
+    for (const entry of [...this.scheduled]) {
+      if (entry.ptsUs < cutoffUs) continue;
+      try {
+        entry.source.stop();
+      } catch {
+      }
+      this.scheduled.delete(entry);
+    }
+    this.recomputeNextStart();
+  }
+  flush() {
+    for (const entry of this.scheduled) {
+      try {
+        entry.source.stop();
+      } catch {
+      }
+    }
+    this.scheduled.clear();
+    this.nextStart = this.ctx?.currentTime ?? 0;
+  }
+  /** Session-clock position (µs) of what the speaker is emitting right now: interpolated inside
+   *  the currently playing source, else the end of the last finished one. */
+  playedPtsUs() {
+    const now = this.ctx?.currentTime ?? 0;
+    let played = this.lastEndedPtsUs;
+    for (const entry of this.scheduled) {
+      if (entry.startCtxTime > now) continue;
+      const into = Math.min(now - entry.startCtxTime, entry.durationSec);
+      played = Math.max(played, entry.ptsUs + into * 1e6);
+    }
+    return Math.round(played);
+  }
+  /** Audio queued ahead of the playhead, in ms. */
+  bufferedMs() {
+    const now = this.ctx?.currentTime ?? 0;
+    return Math.max(0, Math.round((this.nextStart - now) * 1e3));
+  }
+  unmute() {
+    this.blocked = false;
+    if (!this.ctx) return true;
+    void this.ctx.resume().catch(() => {
+    });
+    return this.ctx.state !== "suspended";
+  }
+  stop() {
+    this.flush();
+    void this.ctx?.close().catch(() => {
+    });
+    this.ctx = null;
+  }
+  recomputeNextStart() {
+    const now = this.ctx?.currentTime ?? 0;
+    let end = now;
+    for (const entry of this.scheduled) {
+      end = Math.max(end, entry.startCtxTime + entry.durationSec);
+    }
+    this.nextStart = end;
+  }
+  ensureContext() {
+    if (!this.ctx) this.ctx = new AudioContext();
+    return this.ctx;
+  }
+};
+
+// src/v2/driver.ts
+var CLOSE_CODE_ERRORS = {
+  [CloseCode.UNAUTHORIZED]: "session token rejected (4001 unauthorized)",
+  [CloseCode.PROTOCOL_MISMATCH]: "box does not speak protocol v2 (4002)",
+  [CloseCode.PERSONA_UNRESOLVABLE]: "persona unresolvable on the box (4003)",
+  [CloseCode.CAPACITY]: "box at capacity (4004)",
+  [CloseCode.POLICY]: "protocol policy violation (4008)"
+};
+var END_REASONS = ["cap", "kicked", "expired", "dropped"];
+var PLAYOUT_ACK_INTERVAL_MS = 300;
+var KEEPALIVE_PING_MS = 15e3;
+var TEXT_TIMEOUT_MS = 3e4;
+var V2Driver = class {
+  constructor(opts) {
+    this.opts = opts;
+    __publicField(this, "conn", null);
+    __publicField(this, "mse", null);
+    __publicField(this, "player", null);
+    __publicField(this, "pipeline", null);
+    __publicField(this, "accepted", null);
+    __publicField(this, "audioCh", null);
+    __publicField(this, "micCh", null);
+    __publicField(this, "endReason", null);
+    __publicField(this, "finished", false);
+    __publicField(this, "handshakeTimer", null);
+    __publicField(this, "ackTimer", null);
+    __publicField(this, "pingTimer", null);
+    __publicField(this, "textSequence", 0);
+    __publicField(this, "textWaiters", /* @__PURE__ */ new Map());
+    __publicField(this, "langs");
+    __publicField(this, "responseLanguage");
+    this.langs = opts.langs;
+    this.responseLanguage = opts.responseLanguage;
+  }
+  connect() {
+    const { opts } = this;
+    const create = opts.createSocket ?? ((url, protocols) => new WebSocket(url, protocols));
+    let socket;
+    try {
+      socket = create(opts.sessionWsUrl, [SUBPROTOCOL]);
+    } catch (err) {
+      this.fail(err);
+      return;
+    }
+    const transport = webSocketTransport(socket);
+    const conn = clientProtocolConnection(transport);
+    this.conn = conn;
+    transport.onOpen(() => {
+      if (this.finished) return;
+      if (socket.protocol !== void 0 && socket.protocol !== SUBPROTOCOL) {
+        this.fail(new Error(`server did not echo subprotocol ${SUBPROTOCOL}`));
+        return;
+      }
+      conn.send({
+        type: "hello",
+        proto: 2,
+        accept: {
+          audio: ["pcm16"],
+          ...MsePlayer.supported() ? { video: ["fmp4"] } : {}
+        },
+        ...opts.mic ? { mic: { codec: "pcm16", sample_rate: 16e3 } } : {},
+        ...this.langs.length ? { langs: this.langs } : {},
+        ...this.responseLanguage !== void 0 ? { response_language: this.responseLanguage } : {}
+      });
+      this.handshakeTimer = setTimeout(() => {
+        this.fail(new Error("handshake timeout: no accept from the box"));
+      }, HANDSHAKE_TIMEOUT_MS);
+    });
+    conn.onMessage((msg) => this.onServerMessage(msg));
+    conn.onFrame((frame) => this.onMediaFrame(frame));
+    conn.onViolation((v) => {
+      if (opts.dev) console.warn("[v2] protocol violation", v.kind, v.detail);
+    });
+    conn.onClose((ev) => this.onSocketClose(ev.code));
+  }
+  onServerMessage(msg) {
+    if (this.finished) return;
+    switch (msg.type) {
+      case "accept":
+        this.onAccept(msg);
+        break;
+      case "partial":
+        this.opts.handlers.onPartial(msg.text);
+        break;
+      case "turn": {
+        const turn = {
+          text: msg.text,
+          reply: msg.reply ?? "",
+          language: msg.language,
+          speechId: msg.speech_id
+        };
+        const waiter = msg.request_id ? this.textWaiters.get(msg.request_id) : void 0;
+        if (waiter && msg.request_id) {
+          clearTimeout(waiter.timer);
+          this.textWaiters.delete(msg.request_id);
+          waiter.resolve(turn);
+        } else {
+          this.opts.handlers.onTurn(turn);
+        }
+        break;
+      }
+      case "speech_start":
+        this.opts.handlers.onSpeechStart(msg.speech_id);
+        break;
+      case "speech_end":
+        this.opts.handlers.onSpeechEnd(msg.speech_id);
+        break;
+      case "interruption":
+        if (msg.cutoff_pts_us === null) this.player?.flush();
+        else this.player?.flushFrom(msg.cutoff_pts_us);
+        break;
+      case "instruction_set":
+        break;
+      case "error": {
+        const error = new Error(msg.message ?? msg.code);
+        const waiter = msg.request_id ? this.textWaiters.get(msg.request_id) : void 0;
+        if (waiter && msg.request_id) {
+          clearTimeout(waiter.timer);
+          this.textWaiters.delete(msg.request_id);
+          waiter.reject(error);
+        } else {
+          this.opts.handlers.onError(error, false);
+        }
+        break;
+      }
+      case "session_end":
+        this.endReason = END_REASONS.includes(msg.reason) ? msg.reason : "generic";
+        break;
+      case "ping":
+        this.conn?.send({ type: "pong", t: msg.t });
+        break;
+      case "pong":
+      case "go_away":
+        break;
+    }
+  }
+  onAccept(accept) {
+    if (this.accepted) return;
+    if (this.handshakeTimer) {
+      clearTimeout(this.handshakeTimer);
+      this.handshakeTimer = null;
+    }
+    this.accepted = accept;
+    const { handlers } = this.opts;
+    const channels = accept.channels;
+    const videoCh = channels.find((c) => c.kind === "video");
+    this.audioCh = channels.find((c) => c.kind === "audio" && c.dir === "down") ?? null;
+    this.micCh = channels.find((c) => c.kind === "audio" && c.dir === "up") ?? null;
+    if (this.audioCh) {
+      this.player = new PcmPlayer(() => handlers.onAudioBlocked());
+      this.ackTimer = setInterval(() => {
+        const player = this.player;
+        if (!player) return;
+        this.conn?.send({
+          type: "playout_ack",
+          played_pts_us: player.playedPtsUs(),
+          buffered_ms: player.bufferedMs()
+        });
+      }, PLAYOUT_ACK_INTERVAL_MS);
+    }
+    this.pingTimer = setInterval(() => {
+      this.conn?.send({ type: "ping", t: Date.now() });
+    }, KEEPALIVE_PING_MS);
+    if (videoCh) {
+      const mse = new MsePlayer(this.opts.videoEl, this.opts.dev);
+      this.mse = mse;
+      mse.attach({
+        onFirstFrame: () => handlers.onFirstFrame(),
+        onError: (err) => handlers.onError(err, false),
+        onAudioBlocked: () => handlers.onAudioBlocked()
+      });
+      mse.setMime(videoCh.mime);
+    } else {
+      if (accept.poster?.url) this.opts.videoEl.poster = accept.poster.url;
+      handlers.onFirstFrame();
+    }
+    if (this.opts.mic && this.micCh) this.startMic(this.micCh);
+    handlers.onAccept({
+      capSeconds: accept.cap_seconds,
+      personaKey: accept.persona_key,
+      posterUrl: accept.poster?.url ?? null,
+      hasVideo: Boolean(videoCh)
+    });
+  }
+  startMic(micCh) {
+    const pipeline = new MicPipeline();
+    this.pipeline = pipeline;
+    pipeline.start({
+      workletUrl: this.opts.workletUrl,
+      stream: this.opts.permittedStream,
+      dev: this.opts.dev,
+      getVideoMediaTimeMs: this.mse ? (t) => this.mse?.mediaTimeAt(t) ?? null : void 0,
+      onFrame: (pcm, info) => this.sendMicFrame(micCh.id, pcm, info)
+    }).then(() => {
+      if (!this.finished) this.opts.handlers.onMicReady();
+    }).catch((err) => {
+      this.fail(err);
+    });
+  }
+  sendMicFrame(channelId, pcm, info) {
+    const conn = this.conn;
+    if (this.finished || !conn || conn.protocolState !== "active") return;
+    const ptsUs = info.videoMediaTimeMs === VIDEO_MEDIA_TIME_UNKNOWN ? 0 : info.videoMediaTimeMs * 1e3;
+    conn.sendFrame({
+      frameType: FrameType.MEDIA,
+      channelId,
+      flags: 0,
+      seq: info.micSeq % (MAX_SEQ + 1),
+      ptsUs,
+      payload: new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength)
+    });
+    this.opts.handlers.onAudioFrameSent(info);
+  }
+  onMediaFrame(frame) {
+    if (this.finished) return;
+    if (frame.frameType !== FrameType.MEDIA_INIT && frame.frameType !== FrameType.MEDIA) return;
+    if (this.audioCh && frame.channelId === this.audioCh.id) {
+      if (frame.payload.byteLength === 0 || frame.payload.byteLength % 2 !== 0) return;
+      const pcm = new Int16Array(
+        frame.payload.buffer.slice(
+          frame.payload.byteOffset,
+          frame.payload.byteOffset + frame.payload.byteLength
+        )
+      );
+      this.player?.enqueue({ pcm, sampleRate: this.audioCh.sample_rate, ptsUs: frame.ptsUs });
+      return;
+    }
+    if (this.mse && this.accepted?.channels.some((c) => c.kind === "video" && c.id === frame.channelId)) {
+      this.mse.append(frame.payload);
+    }
+  }
+  onSocketClose(code) {
+    if (this.finished) {
+      this.teardown();
+      return;
+    }
+    this.finished = true;
+    const { handlers } = this.opts;
+    const accepted = this.accepted !== null;
+    const endReason = this.endReason;
+    this.teardown();
+    if (endReason) {
+      handlers.onEnded(endReason);
+    } else if (accepted) {
+      handlers.onEnded("edge_disconnect");
+    } else {
+      handlers.onError(
+        new Error(CLOSE_CODE_ERRORS[code] ?? `session socket closed before accept (${code})`),
+        true
+      );
+    }
+  }
+  fail(err) {
+    if (this.finished) return;
+    this.finished = true;
+    this.teardown();
+    try {
+      this.conn?.close(CloseCode.NORMAL);
+    } catch {
+    }
+    this.opts.handlers.onError(err, true);
+  }
+  async sendText(text) {
+    const value = text.trim();
+    if (!value) throw new Error("text is required");
+    if (value.length > MAX_TEXT_CHARS) throw new Error("text is too long");
+    const conn = this.conn;
+    if (this.finished || !conn || conn.protocolState !== "active") {
+      throw new Error("text transport is unavailable");
+    }
+    this.textSequence += 1;
+    const id = `text-${this.textSequence}`;
+    const result = new Promise((resolve2, reject) => {
+      const timer = setTimeout(() => {
+        this.textWaiters.delete(id);
+        reject(new Error("text response timed out"));
+      }, TEXT_TIMEOUT_MS);
+      this.textWaiters.set(id, { resolve: resolve2, reject, timer });
+    });
+    conn.send({ type: "text", id, text: value });
+    return result;
+  }
+  /** Re-pin the ASR recognition language(s) mid-session; applied by the box on the next turn. */
+  setLangs(langs) {
+    this.langs = langs;
+    if (this.conn?.protocolState === "active") this.conn.send({ type: "set_langs", langs });
+  }
+  /** Change the preferred REPLY language mid-session (BCP-47; '' clears). */
+  setResponseLanguage(language) {
+    this.responseLanguage = language;
+    if (this.conn?.protocolState === "active") {
+      this.conn.send({ type: "set_response_language", language });
+    }
+  }
+  /** Replace the hidden runtime instruction appended to the avatar's system prompt. */
+  setRuntimeInstruction(instruction) {
+    const value = instruction.trim();
+    if (value.length > MAX_INSTRUCTION_CHARS) throw new Error("runtime instruction is too long");
+    if (this.conn?.protocolState === "active") {
+      this.conn.send({ type: "set_instruction", instruction: value });
+    }
+  }
+  setMuted(muted) {
+    this.pipeline?.setMuted(muted);
+  }
+  unmuteAudio() {
+    const mse = this.mse?.unmuteAudio() ?? true;
+    const pcm = this.player?.unmute() ?? true;
+    return mse && pcm;
+  }
+  /** Deliberate local end: say goodbye, close, release resources. Fires no handler — the
+   *  caller (AvatarSession) already decided the outcome. */
+  stop() {
+    const wasFinished = this.finished;
+    this.finished = true;
+    if (!wasFinished && this.conn) {
+      if (this.conn.protocolState === "active") {
+        try {
+          this.conn.send({ type: "bye" });
+        } catch {
+        }
+      }
+      try {
+        this.conn.close(CloseCode.NORMAL);
+      } catch {
+      }
+    }
+    this.teardown();
+  }
+  teardown() {
+    if (this.handshakeTimer) clearTimeout(this.handshakeTimer);
+    this.handshakeTimer = null;
+    if (this.ackTimer) clearInterval(this.ackTimer);
+    this.ackTimer = null;
+    if (this.pingTimer) clearInterval(this.pingTimer);
+    this.pingTimer = null;
+    for (const waiter of this.textWaiters.values()) {
+      clearTimeout(waiter.timer);
+      waiter.reject(new Error("session ended"));
+    }
+    this.textWaiters.clear();
+    this.pipeline?.stop();
+    this.pipeline = null;
+    this.player?.stop();
+    this.player = null;
+    this.mse?.stop();
+    this.mse = null;
+  }
+};
+
 // src/session.ts
 var AvatarSession = class {
   constructor(opts) {
     this.opts = opts;
     __publicField(this, "sm");
-    __publicField(this, "mse", null);
-    __publicField(this, "mic", null);
+    __publicField(this, "driver", null);
     __publicField(this, "done", false);
     __publicField(this, "_sessionCapSeconds");
+    __publicField(this, "_personaKey");
     __publicField(this, "permittedStream");
     __publicField(this, "langs");
     __publicField(this, "_responseLanguage");
-    __publicField(this, "fallbackInBandText", false);
     this.sm = new StateMachine(opts.dev ?? false);
     this.sm.onChange((next, prev) => {
       opts.callbacks?.onStateChange?.(next, prev);
@@ -1150,11 +1568,17 @@ var AvatarSession = class {
   get sessionCapSeconds() {
     return this._sessionCapSeconds;
   }
+  /** The avatar_versions.id the box bound, echoed in the accept (the persona-pinning ack). */
+  get personaKey() {
+    return this._personaKey;
+  }
   // Returns the live stream so callers can pass it back via opts.permittedStream,
   // avoiding a second getUserMedia call (and second permission prompt on Firefox).
   static ensureMicPermission() {
-    return MicCapture.ensurePermission();
+    return MicPipeline.ensurePermission();
   }
+  /** Whether this browser can play the fMP4 video channel. Poster-mode sessions (audio + still)
+   *  work regardless — the hello simply doesn't offer video. */
   static mediaSupported() {
     return MsePlayer.supported();
   }
@@ -1162,14 +1586,11 @@ var AvatarSession = class {
     if (this.done || this.sm.state !== "idle") return Promise.resolve();
     this.sm.set("waiting");
     this.opts.connect.connect({
-      onStatus: (s) => {
-        this.opts.callbacks?.onQueueStatus?.(s);
-      },
       onReady: (target) => {
         if (this.done) return;
         this._sessionCapSeconds = target.sessionCapSeconds;
         this.sm.set("ready");
-        void this.openMedia(target);
+        void this.openSession(target);
       },
       onEnded: (reason) => {
         this.internalEnd(reason);
@@ -1180,7 +1601,7 @@ var AvatarSession = class {
     });
     return Promise.resolve();
   }
-  async openMedia(target) {
+  async openSession(target) {
     if (this.done) return;
     this.sm.set("connecting");
     try {
@@ -1189,104 +1610,67 @@ var AvatarSession = class {
     }
     if (this.done) return;
     const dev = this.opts.dev ?? false;
-    this.mse = new MsePlayer(this.opts.videoEl, dev);
-    this.mse.connect(target.mseWsUrl, {
-      onMode: (mode) => {
-        if (mode !== "poster-pcm") return;
-        this.fallbackInBandText = true;
-        if (this.opts.mic === false && !this.mic) {
-          this.openReceiveOnlyTransport(target, dev);
-        }
-      },
-      onFirstFrame: () => {
-        if (this.done) return;
-        const s = this.sm.state;
-        if (s === "connecting" || s === "ready") {
-          this.sm.set("live");
-          this.opts.callbacks?.onFirstFrame?.();
-        }
-      },
-      onAudioBlocked: () => {
-        if (!this.done) this.opts.callbacks?.onAudioBlocked?.();
-      },
-      onClose: () => {
-        if (this.done) return;
-        const s = this.sm.state;
-        if (s === "live" || s === "connecting") this.internalEnd("edge_disconnect");
-      },
-      onEnded: (reason) => {
-        this.internalEnd(reason);
-      },
-      onError: (err) => {
-        if (dev) console.warn("[mse] error", err);
-      }
-    });
-    if (this.opts.mic !== false) {
-      const streamForMic = this.permittedStream;
-      this.permittedStream = null;
-      this.mic = new MicCapture();
-      try {
-        await this.mic.start(
-          target.micWsUrl,
-          this.opts.lang ?? "en",
-          {
-            onReady: () => {
-              if (!this.done) this.opts.callbacks?.onMicReady?.();
-            },
-            onPartial: (text) => {
-              if (!this.done) this.opts.callbacks?.onPartial?.(text);
-            },
-            onTurn: (turn) => {
-              if (!this.done) this.opts.callbacks?.onTurn?.(turn);
-            },
-            onFrameTimestamp: (info) => {
-              if (!this.done) this.opts.callbacks?.onAudioFrameSent?.(info);
-            },
-            onError: (err) => {
-              if (dev) console.warn("[mic] error", err);
-              if (!this.done) this.opts.callbacks?.onError?.(err);
-            },
-            onAudioBlocked: () => {
-              if (!this.done) this.opts.callbacks?.onAudioBlocked?.();
-            }
-          },
-          this.opts.workletUrl ?? "/mic-worklet.js",
-          streamForMic ?? void 0,
-          dev,
-          this.langs,
-          this._responseLanguage,
-          (t) => this.mse?.mediaTimeAt(t) ?? null
-        );
-      } catch (err) {
-        this.internalFail(err);
-      }
-    }
-  }
-  openReceiveOnlyTransport(target, dev) {
-    if (this.done || this.mic) return;
-    this.mic = new MicCapture();
-    this.mic.startReceiveOnly(
-      target.micWsUrl,
-      this.opts.lang ?? "en",
-      {
+    const streamForMic = this.permittedStream;
+    this.permittedStream = null;
+    this.driver = new V2Driver({
+      videoEl: this.opts.videoEl,
+      sessionWsUrl: target.sessionWsUrl,
+      mic: this.opts.mic !== false,
+      langs: this.langs,
+      responseLanguage: this._responseLanguage,
+      workletUrl: this.opts.workletUrl ?? "/mic-worklet.js",
+      permittedStream: streamForMic ?? void 0,
+      dev,
+      createSocket: this.opts.createSocket,
+      handlers: {
+        onAccept: (info) => {
+          if (this.done) return;
+          this._sessionCapSeconds = info.capSeconds;
+          this._personaKey = info.personaKey;
+        },
+        onFirstFrame: () => {
+          if (this.done) return;
+          const s = this.sm.state;
+          if (s === "connecting" || s === "ready") {
+            this.sm.set("live");
+            this.opts.callbacks?.onFirstFrame?.();
+          }
+        },
+        onMicReady: () => {
+          if (!this.done) this.opts.callbacks?.onMicReady?.();
+        },
         onPartial: (text) => {
           if (!this.done) this.opts.callbacks?.onPartial?.(text);
         },
         onTurn: (turn) => {
           if (!this.done) this.opts.callbacks?.onTurn?.(turn);
         },
-        onError: (err) => {
-          if (dev) console.warn("[mic] receive-only error", err);
-          if (!this.done) this.opts.callbacks?.onError?.(err);
+        onSpeechStart: (id) => {
+          if (!this.done) this.opts.callbacks?.onSpeechStart?.(id);
+        },
+        onSpeechEnd: (id) => {
+          if (!this.done) this.opts.callbacks?.onSpeechEnd?.(id);
+        },
+        onAudioFrameSent: (info) => {
+          if (!this.done) this.opts.callbacks?.onAudioFrameSent?.(info);
         },
         onAudioBlocked: () => {
           if (!this.done) this.opts.callbacks?.onAudioBlocked?.();
+        },
+        onEnded: (reason) => {
+          this.internalEnd(reason);
+        },
+        onError: (err, terminal) => {
+          if (terminal) {
+            this.internalFail(err);
+          } else {
+            if (dev) console.warn("[v2] session error", err);
+            if (!this.done) this.opts.callbacks?.onError?.(err);
+          }
         }
-      },
-      dev,
-      this.langs,
-      this._responseLanguage
-    );
+      }
+    });
+    this.driver.connect();
   }
   leave() {
     if (this.done) return;
@@ -1296,27 +1680,18 @@ var AvatarSession = class {
     this.opts.callbacks?.onClose?.("generic");
   }
   setMuted(muted) {
-    this.mic?.setMuted(muted);
+    this.driver?.setMuted(muted);
   }
-  /** Send a typed user turn through the active session. Workers fallback sessions use their
-   *  in-band WebSocket; GPU sessions use the optional application-supplied textTransport. */
-  async sendText(text) {
-    const value = text.trim();
-    if (!value) throw new Error("text is required");
-    if (this.fallbackInBandText) {
-      if (!this.mic) throw new Error("fallback text transport is not ready");
-      return this.mic.sendText(value);
-    }
-    if (!this.opts.textTransport) throw new Error("text transport is unavailable");
-    const reply = await this.opts.textTransport(value);
-    return { text: value, reply };
+  /** Send a typed user turn through the session socket. Resolves with the box's reply. */
+  sendText(text) {
+    const driver = this.driver;
+    if (!driver) return Promise.reject(new Error("text transport is unavailable"));
+    return driver.sendText(text);
   }
   /** Unmute avatar audio from a user-gesture context (tap-for-sound button). Returns whether
    *  audio is now unblocked. Pair with callbacks.onAudioBlocked. */
   unmuteAudio() {
-    const mse = this.mse?.unmuteAudio() ?? true;
-    const pcm = this.mic?.unmuteAudio() ?? true;
-    return mse && pcm;
+    return this.driver?.unmuteAudio() ?? true;
   }
   /** Call synchronously inside the click/tap handler that starts a call, BEFORE any await:
    *  a user-gestured play()/load() clears WebKit's per-element gesture restrictions so the
@@ -1332,25 +1707,25 @@ var AvatarSession = class {
     }
   }
   /** Change the ASR recognition language(s) — applies live mid-session and persists for the
-   *  session (and any socket reconnect). [] = auto-detect across the box's configured set. */
+   *  session. [] = auto-detect across the box's configured set. */
   setLangs(langs) {
     this.langs = langs;
-    this.mic?.setLangs(langs);
+    this.driver?.setLangs(langs);
   }
   get asrLangs() {
     return this.langs;
   }
   /** Change the avatar's preferred REPLY language mid-session (BCP-47; '' = back to the LLM's
-   *  own choice). Applies from the next turn and persists for the session (and any socket
-   *  reconnect). Distinct from setLangs (ASR recognition pin). */
+   *  own choice). Applies from the next turn and persists for the session. Distinct from
+   *  setLangs (ASR recognition pin). */
   setResponseLanguage(lang) {
     this._responseLanguage = lang;
-    this.mic?.setResponseLanguage(lang);
+    this.driver?.setResponseLanguage(lang);
   }
   /** Replace hidden system-level guidance for subsequent turns. Unlike sendText(), this does not
    *  create a user message, request an immediate response, or surface in transcript callbacks. */
   setRuntimeInstruction(instruction) {
-    this.mic?.setRuntimeInstruction(instruction);
+    this.driver?.setRuntimeInstruction(instruction);
   }
   get responseLanguage() {
     return this._responseLanguage;
@@ -1375,10 +1750,8 @@ var AvatarSession = class {
   }
   teardown() {
     this.opts.connect.close();
-    this.mse?.stop();
-    this.mse = null;
-    this.mic?.stop();
-    this.mic = null;
+    this.driver?.stop();
+    this.driver = null;
     this.permittedStream?.getTracks().forEach((t) => {
       t.stop();
     });
@@ -1387,6 +1760,8 @@ var AvatarSession = class {
 };
 export {
   AvatarSession,
+  CloseCode,
+  SUBPROTOCOL,
   attachDisclosure,
   attachSessionControls,
   connectViaToken

@@ -7,13 +7,15 @@ export type {
 export { attachSessionControls } from './controls';
 export type { DisclosureController, DisclosureOptions } from './disclosure';
 export { attachDisclosure } from './disclosure';
-export type { Turn } from './mic-capture';
+// Wire identifiers, for advanced integrations (custom ConnectStrategy / diagnostics).
+export { CloseCode, SUBPROTOCOL } from './protocol';
 export type {
   AvatarSessionOpts,
   ConnectHandlers,
   ConnectStrategy,
   EdgeTarget,
   EndReason,
+  Turn,
 } from './session';
 export { AvatarSession } from './session';
 export type { Listener, WidgetState } from './state';

@@ -1,3 +1,14 @@
+/**
+ * controls.ts — optional SDK-rendered mute and hang-up buttons.
+ *
+ * The SDK owns native button semantics, accessible state, pending-state protection and safe text
+ * rendering. The HOST owns what the buttons actually do, through `onMutedChange` / `onHangup`:
+ * ending a product session can also release a seat, request feedback, generate a report, or
+ * finish another domain-specific flow, and none of that can live in a rendering helper.
+ *
+ * A control with no callback renders disabled rather than lying about what it will do.
+ */
+
 export interface SessionControlLabels {
   /** Accessible and visible label while the microphone is active. */
   mute: string;
@@ -52,17 +63,23 @@ const DEFAULT_LABELS: SessionControlLabels = {
   ending: 'Ending call…',
 };
 
-const attached = new WeakMap<HTMLElement, SessionControlsController>();
+const DEFAULT_GROUP_LABEL = 'Call controls';
 
-type ResolvedOptions = Required<
-  Pick<
-    SessionControlsOptions,
-    'visible' | 'mute' | 'hangup' | 'muted' | 'muteDisabled' | 'hangupDisabled' | 'ending' | 'label'
-  >
-> &
-  Pick<SessionControlsOptions, 'onMutedChange' | 'onHangup' | 'onError'> & {
-    labels: SessionControlLabels;
-  };
+/** Every optional field settled, so `render()` never re-derives defaults. */
+interface ResolvedOptions extends SessionControlsOptions {
+  visible: boolean;
+  mute: boolean;
+  hangup: boolean;
+  muted: boolean;
+  muteDisabled: boolean;
+  hangupDisabled: boolean;
+  ending: boolean;
+  label: string;
+  labels: SessionControlLabels;
+}
+
+/** One controller per target: re-attaching destroys the previous one rather than double-rendering. */
+const attached = new WeakMap<HTMLElement, SessionControlsController>();
 
 function resolve(initial: SessionControlsOptions): ResolvedOptions {
   return {
@@ -73,7 +90,7 @@ function resolve(initial: SessionControlsOptions): ResolvedOptions {
     muteDisabled: initial.muteDisabled ?? false,
     hangupDisabled: initial.hangupDisabled ?? false,
     ending: initial.ending ?? false,
-    label: initial.label?.trim() || 'Call controls',
+    label: initial.label?.trim() || DEFAULT_GROUP_LABEL,
     labels: { ...DEFAULT_LABELS, ...initial.labels },
     onMutedChange: initial.onMutedChange,
     onHangup: initial.onHangup,
@@ -105,9 +122,8 @@ export function attachSessionControls(
   let options = resolve(initial);
   let destroyed = false;
 
-  const render = () => {
+  const render = (): void => {
     if (destroyed) return;
-
     const document = target.ownerDocument;
     const children: HTMLButtonElement[] = [];
 
@@ -122,6 +138,7 @@ export function attachSessionControls(
       button.appendChild(buttonLabel(document, 'casola-session-controls__mute-label', label));
       button.addEventListener('click', () => {
         if (destroyed || button.disabled) return;
+        // Optimistic: the button reads as muted immediately, and reverts if the host throws.
         const previous = options.muted;
         options = { ...options, muted: !previous };
         render();
@@ -147,11 +164,13 @@ export function attachSessionControls(
       button.appendChild(buttonLabel(document, 'casola-session-controls__hangup-label', label));
       button.addEventListener('click', () => {
         if (destroyed || button.disabled) return;
+        // Both controls disable while the host's end-of-session flow runs, so a slow teardown
+        // cannot be fired twice.
         options = { ...options, ending: true };
         render();
         Promise.resolve()
           .then(() => options.onHangup?.())
-          .catch((error) => {
+          .catch((error: unknown) => {
             if (!destroyed) options.onError?.(error);
           })
           .finally(() => {
@@ -178,7 +197,10 @@ export function attachSessionControls(
       options = {
         ...options,
         ...next,
-        label: next.label?.trim() || (next.label === undefined ? options.label : 'Call controls'),
+        // An omitted `label` keeps the current one; an explicitly blank one resets to the default,
+        // so the group is never left without an accessible name.
+        label:
+          next.label?.trim() || (next.label === undefined ? options.label : DEFAULT_GROUP_LABEL),
         labels: next.labels ? { ...options.labels, ...next.labels } : options.labels,
       };
       render();

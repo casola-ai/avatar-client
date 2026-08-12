@@ -1,3 +1,12 @@
+/**
+ * disclosure.ts — the canonical persistent in-session disclosure: `● REC · AI · name · details`.
+ *
+ * The SDK owns the wording, the DOM construction, and the accessible label because the disclosure
+ * is a compliance surface, not decoration: every integration must say the same thing the same way.
+ * The application owns placement and presentation through the documented class hooks.
+ *
+ * Text is always written with `textContent`, never markup — `name` and `details` are host input.
+ */
 /** Options for the persistent in-session AI and recording disclosure. */
 export interface DisclosureOptions {
     /** Avatar or character name shown after the required AI label. */

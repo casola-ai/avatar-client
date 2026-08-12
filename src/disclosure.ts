@@ -1,3 +1,13 @@
+/**
+ * disclosure.ts — the canonical persistent in-session disclosure: `● REC · AI · name · details`.
+ *
+ * The SDK owns the wording, the DOM construction, and the accessible label because the disclosure
+ * is a compliance surface, not decoration: every integration must say the same thing the same way.
+ * The application owns placement and presentation through the documented class hooks.
+ *
+ * Text is always written with `textContent`, never markup — `name` and `details` are host input.
+ */
+
 /** Options for the persistent in-session AI and recording disclosure. */
 export interface DisclosureOptions {
   /** Avatar or character name shown after the required AI label. */
@@ -18,13 +28,16 @@ export interface DisclosureController {
   destroy(): void;
 }
 
+/** One controller per target: re-attaching destroys the previous one rather than double-rendering. */
 const attached = new WeakMap<HTMLElement, DisclosureController>();
+
+const SEPARATOR = '·';
 
 function clean(value: string | undefined): string {
   return value?.trim() ?? '';
 }
 
-function detailsFrom(value: DisclosureOptions['details']): string[] {
+function detailsFrom(value: string | readonly string[] | undefined): string[] {
   return (typeof value === 'string' ? [value] : (value ?? []))
     .map((part) => part.trim())
     .filter(Boolean);
@@ -52,8 +65,7 @@ export function attachDisclosure(
 ): DisclosureController {
   attached.get(target)?.destroy();
 
-  let options: Required<Pick<DisclosureOptions, 'recording' | 'visible'>> &
-    Pick<DisclosureOptions, 'name' | 'details'> = {
+  let options: DisclosureOptions = {
     name: initial.name,
     recording: initial.recording ?? true,
     details: initial.details,
@@ -61,10 +73,12 @@ export function attachDisclosure(
   };
   let destroyed = false;
 
-  const render = () => {
+  const render = (): void => {
     if (destroyed) return;
-
     const document = target.ownerDocument;
+
+    // Built in parallel: the visual row carries the dot (aria-hidden, colour is never the only
+    // carrier) while the accessible label spells "Recording" out for assistive technology.
     const visualSegments: HTMLElement[] = [];
     const accessibleSegments: string[] = [];
 
@@ -79,6 +93,7 @@ export function attachDisclosure(
       accessibleSegments.push('Recording');
     }
 
+    // The AI segment is not conditional. It is the one thing every session must disclose.
     visualSegments.push(textSpan(document, 'casola-disclosure__ai', 'AI'));
     accessibleSegments.push('AI');
 
@@ -96,7 +111,7 @@ export function attachDisclosure(
     const children: HTMLElement[] = [];
     for (const [index, segment] of visualSegments.entries()) {
       if (index > 0) {
-        const separator = textSpan(document, 'casola-disclosure__separator', '·');
+        const separator = textSpan(document, 'casola-disclosure__separator', SEPARATOR);
         separator.setAttribute('aria-hidden', 'true');
         children.push(separator);
       }
@@ -105,8 +120,10 @@ export function attachDisclosure(
 
     target.replaceChildren(...children);
     target.classList.add('casola-disclosure');
+    // A host that hid the element before attaching must not leave it hidden from screen readers:
+    // the label below is the disclosure.
     target.removeAttribute('aria-hidden');
-    target.setAttribute('aria-label', accessibleSegments.join(' · '));
+    target.setAttribute('aria-label', accessibleSegments.join(` ${SEPARATOR} `));
     target.toggleAttribute('data-recording', options.recording);
     target.hidden = !options.visible;
   };
