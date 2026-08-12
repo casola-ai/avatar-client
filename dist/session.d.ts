@@ -1,6 +1,55 @@
+import { AvatarError } from './errors';
 import type { WidgetState } from './state';
 import { type DriverSocket, type EndReason, type Turn } from './v2/driver';
 export type { EndReason, Turn, WidgetState };
+/** What {@link AvatarSession.preflight} found. `ok: false` carries the classified reason, so a
+ *  host picks copy from `error.kind` instead of sniffing DOMException names itself. */
+export type PreflightResult = {
+    ok: true;
+    stream: MediaStream | null;
+    video: boolean;
+} | {
+    ok: false;
+    error: AvatarError;
+};
+/**
+ * Why the microphone is (or is not) muted. `userMuted` is what the person chose; `suppressed` is
+ * the application temporarily holding the mic closed — driving a scripted turn, playing an
+ * interstitial. `effective` is what the wire is doing. Keeping them apart is what lets a mute
+ * button reflect intent instead of being fought by the app's own `setMuted` calls.
+ */
+export interface MicMuteState {
+    userMuted: boolean;
+    suppressed: boolean;
+    effective: boolean;
+}
+/** Calibration for one outgoing mic frame — see `callbacks.onAudioFrameSent`. */
+export interface MicFrameSentInfo {
+    micSeq: number;
+    videoMediaTimeMs: number;
+    captureEpochMs: number;
+}
+/**
+ * The events {@link AvatarSession.on} exposes — the same moments the constructor `callbacks`
+ * fire, addressable after construction so a helper can subscribe itself instead of the host
+ * forwarding each one by hand.
+ */
+export interface AvatarSessionEvents {
+    state: (next: WidgetState, prev: WidgetState) => void;
+    partial: (text: string) => void;
+    turn: (t: Turn) => void;
+    firstFrame: () => void;
+    micReady: () => void;
+    speechStart: (speechId: string) => void;
+    speechEnd: (speechId: string) => void;
+    audioFrameSent: (info: MicFrameSentInfo) => void;
+    audioBlocked: () => void;
+    /** The microphone's mute state changed — from the user, or from `suppressMic`. */
+    muteChange: (state: MicMuteState) => void;
+    close: (r: EndReason) => void;
+    error: (e: AvatarError) => void;
+}
+type EventName = keyof AvatarSessionEvents;
 export interface EdgeTarget {
     /** The box's `/v2/session` WebSocket URL, session token included. */
     sessionWsUrl: string;
@@ -61,11 +110,11 @@ export interface AvatarSessionOpts {
         onClose?(r: EndReason): void;
         /** Fired on a terminal session failure (connect/handshake/mic setup) AND on non-terminal
          *  in-band errors (server error message, media hiccup) so a degraded session is never
-         *  silent. For non-terminal errors the session keeps running; inspect the error and decide
-         *  whether to warn or leave(). getUserMedia denial and a failed worklet load are terminal.
-         *  Pre-flight the mic with AvatarSession.ensureMicPermission() to catch permission problems
-         *  before you spend a seat. */
-        onError?(e: unknown): void;
+         *  silent. Branch on `e.kind` — `e.terminal` says whether the session is over. Showing
+         *  microphone copy for every error is wrong: a box that cannot bind the pinned avatar
+         *  arrives here as `persona-unavailable`, not as anything the user's mic can fix.
+         *  Pre-flight with AvatarSession.preflight() to catch permission problems before a seat. */
+        onError?(e: AvatarError): void;
     };
 }
 export declare class AvatarSession {
@@ -78,7 +127,27 @@ export declare class AvatarSession {
     private permittedStream;
     private langs;
     private _responseLanguage;
+    private _userMuted;
+    private _micSuppressed;
+    private readonly listeners;
     constructor(opts: AvatarSessionOpts);
+    /**
+     * Subscribe to a session event. Returns an unsubscribe function.
+     *
+     * The constructor's `callbacks` still work and fire first; this exists because a callback bag
+     * fixed at construction cannot be joined later, which forced every host to hand-forward events
+     * into helpers like `attachCaptions`. A throwing handler is caught and never breaks the session
+     * or the other subscribers.
+     *
+     * ```ts
+     * const off = session.on('turn', (t) => captions.turn(t));
+     * // …later
+     * off();
+     * ```
+     */
+    on<K extends EventName>(event: K, handler: AvatarSessionEvents[K]): () => void;
+    /** Fire the matching constructor callback, then every subscriber. */
+    private emit;
     get state(): WidgetState;
     get sessionCapSeconds(): number | undefined;
     /** The avatar_versions.id the box bound, echoed in the accept (the persona-pinning ack). */
@@ -87,10 +156,43 @@ export declare class AvatarSession {
     /** Whether this browser can play the fMP4 video channel. Poster-mode sessions (audio + still)
      *  work regardless — the hello simply doesn't offer video. */
     static mediaSupported(): boolean;
+    /**
+     * Everything that must be true before spending a fleet seat, in one call: microphone permission,
+     * MSE support, and the browser gate — returning a classified result instead of a raw
+     * DOMException.
+     *
+     * Hold the returned `stream` and pass it as `permittedStream` so the session does not call
+     * getUserMedia twice (a second permission prompt on Firefox). `video: false` means poster mode
+     * is the only option here; that is a degradation, not a failure, so `ok` stays true.
+     *
+     * ```ts
+     * const pre = await AvatarSession.preflight();
+     * if (!pre.ok) return showError(COPY.errors[pre.error.kind] ?? COPY.errors.generic);
+     * new AvatarSession({ permittedStream: pre.stream ?? undefined, ... });
+     * ```
+     */
+    static preflight(options?: {
+        mic?: boolean;
+    }): Promise<PreflightResult>;
     start(): Promise<void>;
     private openSession;
     leave(): void;
+    /** The user's choice — what a mute button sets. Survives `suppressMic`. */
     setMuted(muted: boolean): void;
+    /**
+     * Hold the microphone closed without changing the user's choice, and release it back to
+     * whatever they had set. Use this around app-driven turns rather than calling `setMuted(true)`
+     * then `setMuted(previous)` — that pattern loses the user's intent whenever the two interleave,
+     * and it fights any UI bound to the mute state.
+     */
+    suppressMic(suppressed: boolean): void;
+    /** What the user chose, ignoring any active suppression. */
+    get userMuted(): boolean;
+    /** Whether the application is currently holding the mic closed. */
+    get micSuppressed(): boolean;
+    /** What the wire is actually doing: the user's choice OR an active suppression. */
+    get micMuted(): boolean;
+    private applyMic;
     /** Send a typed user turn through the session socket. Resolves with the box's reply. */
     sendText(text: string): Promise<Turn>;
     /** Unmute avatar audio from a user-gesture context (tap-for-sound button). Returns whether

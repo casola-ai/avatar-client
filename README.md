@@ -140,6 +140,135 @@ controls.destroy();
 
 Both helpers are protocol-agnostic DOM utilities — they behave identically to 0.1.4/0.1.5.
 
+### `attachCaptions(target, options)`
+
+Populates an application-owned element with the streaming caption surface: the live ASR partial,
+each settled user turn, and the avatar's reply revealed in step with the utterance that speaks it.
+
+Reply text arrives whole, with no per-word timing, so rendering `turn.reply` directly either
+races ahead of the voice or waits on an invented delay. This helper uses what the wire actually
+provides — `speech_start` / `speech_end` and the `speechId` they share with the turn:
+
+- a reply waits for its `speech_start`, the real audio onset, when the box marks utterances
+  (`startTimeoutMs` is the backstop if that marker never lands);
+- it does not wait at all when the box has sent no marker this session;
+- `speech_end` retimes the words still queued to finish inside `tailMs`, so the text cannot keep
+  crawling after the voice has stopped;
+- a reply for an utterance that already ended opens straight into that tail pace.
+
+Style hooks are `casola-captions` on the target and `casola-captions__line` on each line, with
+`--partial`, `--user`, `--reply` and `--fading` modifiers. The target becomes a polite live region
+(`role="log"`); a line still arriving is `aria-hidden` and announces once, whole, when it settles.
+
+```typescript
+const captions = attachCaptions(document.querySelector('#captions'), {
+  maxLines: 6,
+  holdMs: 2000, // 0 keeps lines until they are trimmed
+  fadeMs: 600,
+});
+
+new AvatarSession({
+  callbacks: {
+    onPartial: (text) => captions.partial(text),
+    onTurn: (turn) => captions.turn(turn),
+    onSpeechStart: (id) => captions.speechStart(id),
+    onSpeechEnd: (id) => captions.speechEnd(id),
+  },
+  // …
+});
+
+captions.update({ visible: false });
+captions.destroy();
+```
+
+Wiring `onSpeechStart` / `onSpeechEnd` is what buys the alignment; without them the helper still
+renders, it just reveals every reply as soon as it arrives.
+
+`captions.line({ text, kind, speaker })` writes a line your application authored — a written
+fallback when a spoken reply fails, an interstitial — into the same ribbon, with no reveal
+schedule.
+
+### `attachSessionUI(container, options)`
+
+Mounts the disclosure, controls and captions together, wires them to a session, and decides which
+states show what. The three helpers stay individually exported; this is composition.
+
+```typescript
+import { attachSessionUI, AvatarSession } from '@casola/avatar-client';
+import '@casola/avatar-client/styles.css';
+
+const ui = attachSessionUI(document.querySelector('#call'), {
+  name: 'Mia',
+  controls: { hangup: false },   // this product has its own end-call button
+  onHangup: () => endCallFlow(),
+});
+
+const session = new AvatarSession({ videoEl, connect });
+ui.bind(session);
+session.start();
+```
+
+It owns no layout — it creates one child per part and stops, because a laptop mock, a modal and a
+16:9 shadow root place these very differently. It owns no product copy either.
+
+**"Live" is not always `WidgetState.live`.** If your product waits for the first frame *and* the
+microphone before it considers the call started, say so with `visibleWhen`, or drive it yourself
+with `ui.setLive(true)` / `ui.setLive(null)`.
+
+### `session.on(event, handler)`
+
+Subscribe after construction; the returned function unsubscribes. The constructor `callbacks` still
+work and fire first. Events: `state`, `partial`, `turn`, `firstFrame`, `micReady`, `speechStart`,
+`speechEnd`, `audioFrameSent`, `audioBlocked`, `muteChange`, `close`, `error`. A throwing handler
+is caught, so one bad subscriber cannot break the session.
+
+### `AvatarSession.preflight(options?)`
+
+Microphone permission, MSE support and the browser gate in one call, before you spend a fleet seat:
+
+```typescript
+const pre = await AvatarSession.preflight();
+if (!pre.ok) return showError(myCopy[pre.error.kind] ?? myCopy.generic);
+const session = new AvatarSession({ permittedStream: pre.stream ?? undefined, videoEl, connect });
+```
+
+Hold `pre.stream` and pass it as `permittedStream` so the session does not prompt twice.
+`pre.video === false` means poster mode is the only option here — a degradation, not a failure.
+
+### Errors
+
+`callbacks.onError` and the `error` event receive an `AvatarError`: a real `Error` with a `kind`
+and a `terminal` flag. Branch on `kind` instead of sniffing `DOMException` names.
+
+| kind | meaning |
+|---|---|
+| `mic-permission`, `mic-unavailable`, `mic-failed` | the microphone — the only kinds "check your mic" is correct for (`isMicError`) |
+| `unsupported-browser` | this browser cannot do what the session needs |
+| `connect`, `handshake` | the socket never opened, or the box never completed the handshake |
+| `unauthorized`, `protocol-mismatch`, `persona-unavailable`, `capacity`, `policy` | the box refused: close 4001 / 4002 / 4003 / 4004 / 4008 |
+| `server`, `media` | in-band error or a playback hiccup — usually `terminal: false` |
+
+Treat an unrecognized kind as `unknown`; the list grows.
+
+### Muting: user choice vs application suppression
+
+`setMuted()` is the user's choice. `suppressMic(true)` holds the microphone closed *without*
+discarding it, and `suppressMic(false)` restores whatever they had set — use it around app-driven
+turns rather than `setMuted(true)` … `setMuted(previous)`, which loses the user's intent whenever
+the two interleave. Read `userMuted` / `micSuppressed` / `micMuted`, or subscribe to `muteChange`.
+
+### Default styles
+
+```typescript
+import '@casola/avatar-client/styles.css';        // ordinary pages
+import { adoptSessionUIStyles } from '@casola/avatar-client';
+adoptSessionUIStyles(myShadowRoot);               // shadow roots, which a stylesheet never reaches
+```
+
+Theme with custom properties on the container rather than overriding rules — `--casola-accent`,
+`--casola-caption-font`, `--casola-caption-bg`, `--casola-caption-blur`, `--casola-caption-max-height`,
+`--casola-speaker-*`, `--casola-control-*`, `--casola-disclosure-*`, `--casola-rec-color`.
+
 ### Key types
 
 **`WidgetState`**

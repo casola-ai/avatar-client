@@ -1,9 +1,16 @@
+export type { CaptionLineInput, CaptionsController, CaptionsOptions, CaptionTurn, } from './captions';
+export { attachCaptions } from './captions';
 export { connectViaToken } from './connect/token';
 export type { SessionControlLabels, SessionControlsController, SessionControlsOptions, } from './controls';
 export { attachSessionControls } from './controls';
 export type { DisclosureController, DisclosureOptions } from './disclosure';
 export { attachDisclosure } from './disclosure';
+export type { AvatarErrorKind } from './errors';
+export { AvatarError, classifyMicError, isMicError } from './errors';
 export { CloseCode, SUBPROTOCOL } from './protocol';
-export type { AvatarSessionOpts, ConnectHandlers, ConnectStrategy, EdgeTarget, EndReason, Turn, } from './session';
+export type { AvatarSessionEvents, AvatarSessionOpts, ConnectHandlers, ConnectStrategy, EdgeTarget, EndReason, MicFrameSentInfo, MicMuteState, PreflightResult, Turn, } from './session';
 export { AvatarSession } from './session';
+export type { SessionUIController, SessionUIOptions, SessionUIPart } from './session-ui';
+export { attachSessionUI } from './session-ui';
 export type { Listener, WidgetState } from './state';
+export { adoptSessionUIStyles, SESSION_UI_CSS } from './styles';

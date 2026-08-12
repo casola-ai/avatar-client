@@ -1,3 +1,4 @@
+import { AvatarError } from '../errors';
 import { type MicFrameInfo } from '../mic-pipeline';
 import { type WebSocketLike } from '../protocol';
 export type EndReason = 'cap' | 'edge_disconnect' | 'kicked' | 'expired' | 'dropped' | 'generic';
@@ -30,8 +31,9 @@ export interface V2DriverHandlers {
     /** The session is over after a successful handshake — server end or transport loss. */
     onEnded(reason: EndReason): void;
     /** terminal=true: the session cannot proceed (connect/handshake/mic failure).
-     *  terminal=false: an in-band server error or media hiccup; the session keeps running. */
-    onError(err: unknown, terminal: boolean): void;
+     *  terminal=false: an in-band server error or media hiccup; the session keeps running.
+     *  Always an `AvatarError` — the driver classifies before it hands anything up. */
+    onError(err: AvatarError, terminal: boolean): void;
 }
 export interface V2DriverOpts {
     videoEl: HTMLVideoElement;

@@ -6,6 +6,47 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-12
+
+Everything here is additive and opt-in. A host that calls none of it behaves exactly as on 0.2.0,
+and with `sideEffects: false` bundles none of it.
+
+### Added
+- `attachCaptions(target, options)` — the streaming caption surface: ASR partials, settled user
+  turns, and the avatar's reply revealed against the utterance that speaks it. It paces the reply
+  from `speech_start` / `speech_end` and the `speechId` they share with the turn, rather than from
+  a delay constant, and compresses the remaining words once the utterance ends. Wire
+  `onSpeechStart` / `onSpeechEnd` alongside `onPartial` / `onTurn` to get the alignment.
+  `captions.line({text, kind, speaker})` writes a line your application authored — a written
+  fallback, an interstitial — into the same ribbon.
+- `session.on(event, handler)` — subscribe after construction, unsubscribe with the returned
+  function. The constructor `callbacks` still work and fire first; this exists because a callback
+  bag fixed at construction cannot be joined later, which forced every host to hand-forward events
+  into the DOM helpers. A throwing handler cannot break the session or the other subscribers.
+- `attachSessionUI(container, options)` — mounts the disclosure, controls and captions together and
+  wires them to a session, including which states show what. It does not own layout or product
+  copy. `visibleWhen` / `controlsEnabledWhen` / `setLive()` exist because "live" is not always the
+  SDK's `WidgetState.live` — some products wait for the first frame *and* the mic.
+- `AvatarSession.preflight()` — microphone permission, MSE support and the browser gate in one
+  call, returning a classified result instead of a raw `DOMException`. Hold its `stream` and pass
+  it as `permittedStream` to avoid a second permission prompt.
+- `AvatarSession.suppressMic(bool)`, plus `userMuted` / `micSuppressed` / `micMuted` and a
+  `muteChange` event — hold the mic closed around an app-driven turn without discarding the user's
+  own choice. `setMuted(true)` … `setMuted(previous)` loses that intent whenever the two
+  interleave, and fights any UI bound to the mute state.
+- `SESSION_UI_CSS` and `adoptSessionUIStyles(root)`, plus a `@casola/avatar-client/styles.css`
+  subpath — the default look for the helpers, themed through custom properties. It ships as a
+  string as well as a file because a shadow root never sees a document stylesheet, and a
+  shadow-root embed is exactly the surface that most needs a default.
+
+### Changed
+- **`callbacks.onError` now receives a classified `AvatarError`** (`kind` + `terminal`) instead of
+  `unknown`. Existing handlers typed `(e: unknown)` keep compiling — this narrows what the SDK
+  passes, it does not change what it calls. Branch on `e.kind` rather than sniffing DOMException
+  names: a box that cannot bind the pinned avatar arrives as `persona-unavailable`, and telling
+  that user to check their microphone is a bug this replaces. `classifyMicError` and `isMicError`
+  are exported for hosts that map errors to their own copy.
+
 ## [0.2.0] - 2026-08-11
 
 ### Changed

@@ -1,3 +1,4 @@
+import { AvatarError, type AvatarErrorKind, classifyMicError, toAvatarError } from '../errors';
 import { type MicFrameInfo, MicPipeline, VIDEO_MEDIA_TIME_UNKNOWN } from '../mic-pipeline';
 import { MsePlayer } from '../mse-player';
 import { PcmPlayer } from '../pcm-player';
@@ -59,8 +60,9 @@ export interface V2DriverHandlers {
   /** The session is over after a successful handshake — server end or transport loss. */
   onEnded(reason: EndReason): void;
   /** terminal=true: the session cannot proceed (connect/handshake/mic failure).
-   *  terminal=false: an in-band server error or media hiccup; the session keeps running. */
-  onError(err: unknown, terminal: boolean): void;
+   *  terminal=false: an in-band server error or media hiccup; the session keeps running.
+   *  Always an `AvatarError` — the driver classifies before it hands anything up. */
+  onError(err: AvatarError, terminal: boolean): void;
 }
 
 export interface V2DriverOpts {
@@ -77,12 +79,23 @@ export interface V2DriverOpts {
   createSocket?: (url: string, protocols: string[]) => DriverSocket;
 }
 
-const CLOSE_CODE_ERRORS: Record<number, string> = {
-  [CloseCode.UNAUTHORIZED]: 'session token rejected (4001 unauthorized)',
-  [CloseCode.PROTOCOL_MISMATCH]: 'box does not speak protocol v2 (4002)',
-  [CloseCode.PERSONA_UNRESOLVABLE]: 'persona unresolvable on the box (4003)',
-  [CloseCode.CAPACITY]: 'box at capacity (4004)',
-  [CloseCode.POLICY]: 'protocol policy violation (4008)',
+/** Close code → what the host should tell the user. The `kind` is the point: a 4003 is the box
+ *  refusing the pinned avatar, which has nothing to do with the caller's microphone. */
+const CLOSE_CODE_ERRORS: Record<number, { kind: AvatarErrorKind; message: string }> = {
+  [CloseCode.UNAUTHORIZED]: {
+    kind: 'unauthorized',
+    message: 'session token rejected (4001 unauthorized)',
+  },
+  [CloseCode.PROTOCOL_MISMATCH]: {
+    kind: 'protocol-mismatch',
+    message: 'box does not speak protocol v2 (4002)',
+  },
+  [CloseCode.PERSONA_UNRESOLVABLE]: {
+    kind: 'persona-unavailable',
+    message: 'persona unresolvable on the box (4003)',
+  },
+  [CloseCode.CAPACITY]: { kind: 'capacity', message: 'box at capacity (4004)' },
+  [CloseCode.POLICY]: { kind: 'policy', message: 'protocol policy violation (4008)' },
 };
 
 const END_REASONS: readonly EndReason[] = ['cap', 'kicked', 'expired', 'dropped'];
@@ -143,7 +156,7 @@ export class V2Driver {
       // Browsers fail the connection themselves when a requested subprotocol is not granted;
       // this guards the non-browser sockets (tests, future runtimes) to the same rule.
       if (socket.protocol !== undefined && socket.protocol !== SUBPROTOCOL) {
-        this.fail(new Error(`server did not echo subprotocol ${SUBPROTOCOL}`));
+        this.fail(new Error(`server did not echo subprotocol ${SUBPROTOCOL}`), 'protocol-mismatch');
         return;
       }
       conn.send({
@@ -160,7 +173,7 @@ export class V2Driver {
           : {}),
       });
       this.handshakeTimer = setTimeout(() => {
-        this.fail(new Error('handshake timeout: no accept from the box'));
+        this.fail(new Error('handshake timeout: no accept from the box'), 'handshake');
       }, HANDSHAKE_TIMEOUT_MS);
     });
 
@@ -219,7 +232,8 @@ export class V2Driver {
           this.textWaiters.delete(msg.request_id);
           waiter.reject(error);
         } else {
-          this.opts.handlers.onError(error, false);
+          // In-band: the box reported a problem but the socket stays up.
+          this.opts.handlers.onError(toAvatarError(error, 'server', { terminal: false }), false);
         }
         break;
       }
@@ -276,7 +290,7 @@ export class V2Driver {
       this.mse = mse;
       mse.attach({
         onFirstFrame: () => handlers.onFirstFrame(),
-        onError: (err) => handlers.onError(err, false),
+        onError: (err) => handlers.onError(toAvatarError(err, 'media', { terminal: false }), false),
         onAudioBlocked: () => handlers.onAudioBlocked(),
       });
       mse.setMime(videoCh.mime);
@@ -312,7 +326,8 @@ export class V2Driver {
       })
       .catch((err: unknown) => {
         // getUserMedia denial / worklet load failure — terminal, matching the v1 contract.
-        this.fail(err);
+        // Classified here so the host can tell "you denied the mic" from "the worklet died".
+        this.fail(err, classifyMicError(err));
       });
   }
 
@@ -374,14 +389,18 @@ export class V2Driver {
     } else if (accepted) {
       handlers.onEnded('edge_disconnect');
     } else {
+      const known = CLOSE_CODE_ERRORS[code];
       handlers.onError(
-        new Error(CLOSE_CODE_ERRORS[code] ?? `session socket closed before accept (${code})`),
+        new AvatarError(
+          known?.kind ?? 'connect',
+          known?.message ?? `session socket closed before accept (${code})`
+        ),
         true
       );
     }
   }
 
-  private fail(err: unknown): void {
+  private fail(err: unknown, kind: AvatarErrorKind = 'connect'): void {
     if (this.finished) return;
     this.finished = true;
     this.teardown();
@@ -390,7 +409,7 @@ export class V2Driver {
     } catch {
       /* */
     }
-    this.opts.handlers.onError(err, true);
+    this.opts.handlers.onError(toAvatarError(err, kind), true);
   }
 
   async sendText(text: string): Promise<Turn> {

@@ -2,6 +2,283 @@ var __defProp = Object.defineProperty;
 var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
 var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);
 
+// src/captions.ts
+var DEFAULTS = {
+  visible: true,
+  maxLines: 6,
+  holdMs: 0,
+  fadeMs: 300,
+  wordsPerMinute: 160,
+  startTimeoutMs: 2e3,
+  tailMs: 1e3
+};
+var MIN_INTERVAL_MS = 16;
+var MAX_TRACKED_SPEECHES = 16;
+var BASE_CLASS = "casola-captions";
+var LINE_CLASS = `${BASE_CLASS}__line`;
+var attached = /* @__PURE__ */ new WeakMap();
+function resolve(base, next) {
+  return {
+    visible: next.visible ?? base.visible,
+    maxLines: Math.max(1, Math.floor(next.maxLines ?? base.maxLines)),
+    holdMs: Math.max(0, next.holdMs ?? base.holdMs),
+    fadeMs: Math.max(0, next.fadeMs ?? base.fadeMs),
+    wordsPerMinute: Math.max(1, next.wordsPerMinute ?? base.wordsPerMinute),
+    startTimeoutMs: Math.max(0, next.startTimeoutMs ?? base.startTimeoutMs),
+    tailMs: Math.max(0, next.tailMs ?? base.tailMs)
+  };
+}
+function tokenize(text) {
+  return text.match(/\S+\s*/g) ?? [text];
+}
+function attachCaptions(target, initial = {}) {
+  attached.get(target)?.destroy();
+  let options = resolve(DEFAULTS, initial);
+  let destroyed = false;
+  const timers = /* @__PURE__ */ new Set();
+  const speeches = /* @__PURE__ */ new Map();
+  let marksSpeech = false;
+  let partialEl = null;
+  let waiting = null;
+  let reveal = null;
+  const after = (ms, fn) => {
+    const id = setTimeout(() => {
+      timers.delete(id);
+      if (!destroyed) fn();
+    }, ms);
+    timers.add(id);
+    return id;
+  };
+  const cancel = (id) => {
+    if (id === null) return;
+    clearTimeout(id);
+    timers.delete(id);
+  };
+  const line = (modifier, text = "", language, speaker) => {
+    const doc = target.ownerDocument;
+    const el = doc.createElement("div");
+    el.className = `${LINE_CLASS} ${LINE_CLASS}--${modifier}`;
+    if (speaker) {
+      const label = doc.createElement("span");
+      label.className = `${BASE_CLASS}__speaker`;
+      label.textContent = speaker;
+      el.appendChild(label);
+      const body = doc.createElement("span");
+      body.className = `${BASE_CLASS}__text`;
+      body.textContent = text;
+      el.appendChild(body);
+    } else {
+      el.textContent = text;
+    }
+    if (language) el.lang = language;
+    el.dir = "auto";
+    return el;
+  };
+  const bodyOf = (el) => el.querySelector(`.${BASE_CLASS}__text`) ?? el;
+  const scrollToEnd = () => {
+    target.scrollTop = target.scrollHeight;
+  };
+  const trim = () => {
+    while (target.children.length > options.maxLines) {
+      const oldest = target.firstElementChild;
+      if (!oldest) break;
+      if (oldest === partialEl) partialEl = null;
+      if (oldest === reveal?.el) reveal = null;
+      oldest.remove();
+    }
+  };
+  const settle = (el) => {
+    el.removeAttribute("aria-hidden");
+    if (options.holdMs <= 0) return;
+    after(options.holdMs, () => {
+      el.classList.add(`${LINE_CLASS}--fading`);
+      after(options.fadeMs, () => {
+        if (el === partialEl) partialEl = null;
+        el.remove();
+      });
+    });
+  };
+  const intervalFor = (r) => r.tailIntervalMs ?? 6e4 / options.wordsPerMinute;
+  const step = () => {
+    const r = reveal;
+    if (!r) return;
+    r.timer = null;
+    bodyOf(r.el).textContent += r.tokens[r.index] ?? "";
+    r.index += 1;
+    scrollToEnd();
+    if (r.index < r.tokens.length) {
+      r.timer = after(intervalFor(r), step);
+      return;
+    }
+    reveal = null;
+    settle(r.el);
+  };
+  const enterTail = (r) => {
+    if (r.tailIntervalMs !== null) return;
+    const remaining = Math.max(1, r.tokens.length - r.index);
+    r.tailIntervalMs = Math.max(MIN_INTERVAL_MS, options.tailMs / remaining);
+    if (r.timer === null) return;
+    cancel(r.timer);
+    r.timer = after(r.tailIntervalMs, step);
+  };
+  const finishReveal = () => {
+    const r = reveal;
+    if (!r) return;
+    reveal = null;
+    cancel(r.timer);
+    r.timer = null;
+    bodyOf(r.el).textContent += r.tokens.slice(r.index).join("");
+    settle(r.el);
+  };
+  const startReveal = (replyText, speechId, language, tail) => {
+    const tokens = tokenize(replyText);
+    const el = line("reply", tokens[0] ?? "", language);
+    el.setAttribute("aria-hidden", "true");
+    target.appendChild(el);
+    const r = { el, tokens, index: 1, speechId, tailIntervalMs: null, timer: null };
+    reveal = r;
+    trim();
+    scrollToEnd();
+    if (r.index >= tokens.length) {
+      reveal = null;
+      settle(el);
+      return;
+    }
+    if (tail) enterTail(r);
+    if (r.timer === null) r.timer = after(intervalFor(r), step);
+  };
+  const startWaiting = () => {
+    const pending = waiting;
+    if (!pending) return;
+    waiting = null;
+    startReveal(
+      pending.reply,
+      pending.speechId,
+      pending.language,
+      speeches.get(pending.speechId) === "ended"
+    );
+  };
+  const remember = (speechId, state) => {
+    marksSpeech = true;
+    speeches.delete(speechId);
+    speeches.set(speechId, state);
+    while (speeches.size > MAX_TRACKED_SPEECHES) {
+      const oldest = speeches.keys().next();
+      if (oldest.done) break;
+      speeches.delete(oldest.value);
+    }
+  };
+  const cancelPending = () => {
+    for (const id of timers) clearTimeout(id);
+    timers.clear();
+    waiting = null;
+    reveal = null;
+  };
+  const render = () => {
+    target.classList.add(BASE_CLASS);
+    target.setAttribute("role", "log");
+    target.setAttribute("aria-live", "polite");
+    target.setAttribute("aria-atomic", "false");
+    target.hidden = !options.visible;
+  };
+  const controller = {
+    partial(text) {
+      if (destroyed) return;
+      const value = text.trim();
+      if (!value) return;
+      if (!partialEl) {
+        partialEl = line("partial");
+        partialEl.setAttribute("aria-hidden", "true");
+        target.appendChild(partialEl);
+      }
+      partialEl.textContent = value;
+      trim();
+      scrollToEnd();
+    },
+    line(input) {
+      if (destroyed) return;
+      const text = input.text?.trim() ?? "";
+      if (!text) return;
+      const el = line(input.kind ?? "note", text, input.language, input.speaker);
+      target.appendChild(el);
+      settle(el);
+      trim();
+      scrollToEnd();
+    },
+    turn(turn) {
+      if (destroyed) return;
+      if (partialEl) {
+        partialEl.remove();
+        partialEl = null;
+      }
+      const text = turn.text?.trim() ?? "";
+      if (text) {
+        const el = line("user", text, turn.language);
+        target.appendChild(el);
+        settle(el);
+      }
+      const reply = turn.reply?.trim() ?? "";
+      if (reply) {
+        finishReveal();
+        const state = turn.speechId ? speeches.get(turn.speechId) : void 0;
+        if (state === void 0 && turn.speechId && marksSpeech) {
+          waiting = { reply, speechId: turn.speechId, language: turn.language };
+          const held = turn.speechId;
+          after(options.startTimeoutMs, () => {
+            if (waiting?.speechId === held) startWaiting();
+          });
+        } else {
+          startReveal(reply, turn.speechId, turn.language, state === "ended");
+        }
+      }
+      trim();
+      scrollToEnd();
+    },
+    speechStart(speechId) {
+      if (destroyed || !speechId) return;
+      remember(speechId, "started");
+      if (waiting?.speechId === speechId) startWaiting();
+    },
+    speechEnd(speechId) {
+      if (destroyed || !speechId) return;
+      remember(speechId, "ended");
+      if (waiting?.speechId === speechId) {
+        startWaiting();
+        return;
+      }
+      if (reveal?.speechId === speechId) enterTail(reveal);
+    },
+    clear() {
+      if (destroyed) return;
+      cancelPending();
+      partialEl = null;
+      target.replaceChildren();
+    },
+    update(next) {
+      if (destroyed) return;
+      options = resolve(options, next);
+      render();
+      trim();
+    },
+    destroy() {
+      if (destroyed) return;
+      destroyed = true;
+      cancelPending();
+      partialEl = null;
+      if (attached.get(target) === controller) attached.delete(target);
+      target.replaceChildren();
+      target.classList.remove(BASE_CLASS);
+      target.removeAttribute("role");
+      target.removeAttribute("aria-live");
+      target.removeAttribute("aria-atomic");
+      target.hidden = true;
+    }
+  };
+  attached.set(target, controller);
+  render();
+  return controller;
+}
+
 // src/connect/token.ts
 function connectViaToken(o) {
   const u = new URL("/v2/session", o.connectUrl);
@@ -25,8 +302,8 @@ var DEFAULT_LABELS = {
   ending: "Ending call\u2026"
 };
 var DEFAULT_GROUP_LABEL = "Call controls";
-var attached = /* @__PURE__ */ new WeakMap();
-function resolve(initial) {
+var attached2 = /* @__PURE__ */ new WeakMap();
+function resolve2(initial) {
   return {
     visible: initial.visible ?? true,
     mute: initial.mute ?? true,
@@ -42,29 +319,29 @@ function resolve(initial) {
     onError: initial.onError
   };
 }
-function buttonLabel(document, className, text) {
-  const label = document.createElement("span");
+function buttonLabel(document2, className, text) {
+  const label = document2.createElement("span");
   label.className = className;
   label.textContent = text;
   return label;
 }
 function attachSessionControls(target, initial = {}) {
-  attached.get(target)?.destroy();
-  let options = resolve(initial);
+  attached2.get(target)?.destroy();
+  let options = resolve2(initial);
   let destroyed = false;
   const render = () => {
     if (destroyed) return;
-    const document = target.ownerDocument;
+    const document2 = target.ownerDocument;
     const children = [];
     if (options.mute) {
       const label = options.muted ? options.labels.unmute : options.labels.mute;
-      const button = document.createElement("button");
+      const button = document2.createElement("button");
       button.type = "button";
       button.className = "casola-session-controls__mute";
       button.setAttribute("aria-label", label);
       button.setAttribute("aria-pressed", String(options.muted));
       button.disabled = options.ending || options.muteDisabled || !options.onMutedChange;
-      button.appendChild(buttonLabel(document, "casola-session-controls__mute-label", label));
+      button.appendChild(buttonLabel(document2, "casola-session-controls__mute-label", label));
       button.addEventListener("click", () => {
         if (destroyed || button.disabled) return;
         const previous = options.muted;
@@ -82,13 +359,13 @@ function attachSessionControls(target, initial = {}) {
     }
     if (options.hangup) {
       const label = options.ending ? options.labels.ending : options.labels.hangup;
-      const button = document.createElement("button");
+      const button = document2.createElement("button");
       button.type = "button";
       button.className = "casola-session-controls__hangup";
       button.setAttribute("aria-label", label);
       button.setAttribute("aria-busy", String(options.ending));
       button.disabled = options.ending || options.hangupDisabled || !options.onHangup;
-      button.appendChild(buttonLabel(document, "casola-session-controls__hangup-label", label));
+      button.appendChild(buttonLabel(document2, "casola-session-controls__hangup-label", label));
       button.addEventListener("click", () => {
         if (destroyed || button.disabled) return;
         options = { ...options, ending: true };
@@ -127,7 +404,7 @@ function attachSessionControls(target, initial = {}) {
     destroy() {
       if (destroyed) return;
       destroyed = true;
-      if (attached.get(target) === controller) attached.delete(target);
+      if (attached2.get(target) === controller) attached2.delete(target);
       target.replaceChildren();
       target.classList.remove("casola-session-controls");
       target.removeAttribute("role");
@@ -137,13 +414,13 @@ function attachSessionControls(target, initial = {}) {
       target.hidden = true;
     }
   };
-  attached.set(target, controller);
+  attached2.set(target, controller);
   render();
   return controller;
 }
 
 // src/disclosure.ts
-var attached2 = /* @__PURE__ */ new WeakMap();
+var attached3 = /* @__PURE__ */ new WeakMap();
 var SEPARATOR = "\xB7";
 function clean(value) {
   return value?.trim() ?? "";
@@ -151,14 +428,14 @@ function clean(value) {
 function detailsFrom(value) {
   return (typeof value === "string" ? [value] : value ?? []).map((part) => part.trim()).filter(Boolean);
 }
-function textSpan(document, className, text) {
-  const span = document.createElement("span");
+function textSpan(document2, className, text) {
+  const span = document2.createElement("span");
   span.className = className;
   span.textContent = text;
   return span;
 }
 function attachDisclosure(target, initial = {}) {
-  attached2.get(target)?.destroy();
+  attached3.get(target)?.destroy();
   let options = {
     name: initial.name,
     recording: initial.recording ?? true,
@@ -168,34 +445,34 @@ function attachDisclosure(target, initial = {}) {
   let destroyed = false;
   const render = () => {
     if (destroyed) return;
-    const document = target.ownerDocument;
+    const document2 = target.ownerDocument;
     const visualSegments = [];
     const accessibleSegments = [];
     if (options.recording) {
-      const recording = document.createElement("span");
+      const recording = document2.createElement("span");
       recording.className = "casola-disclosure__recording-group";
-      const dot = document.createElement("span");
+      const dot = document2.createElement("span");
       dot.className = "casola-disclosure__recording-dot";
       dot.setAttribute("aria-hidden", "true");
-      recording.replaceChildren(dot, textSpan(document, "casola-disclosure__recording", "REC"));
+      recording.replaceChildren(dot, textSpan(document2, "casola-disclosure__recording", "REC"));
       visualSegments.push(recording);
       accessibleSegments.push("Recording");
     }
-    visualSegments.push(textSpan(document, "casola-disclosure__ai", "AI"));
+    visualSegments.push(textSpan(document2, "casola-disclosure__ai", "AI"));
     accessibleSegments.push("AI");
     const name = clean(options.name);
     if (name) {
-      visualSegments.push(textSpan(document, "casola-disclosure__name", name));
+      visualSegments.push(textSpan(document2, "casola-disclosure__name", name));
       accessibleSegments.push(name);
     }
     for (const detail of detailsFrom(options.details)) {
-      visualSegments.push(textSpan(document, "casola-disclosure__detail", detail));
+      visualSegments.push(textSpan(document2, "casola-disclosure__detail", detail));
       accessibleSegments.push(detail);
     }
     const children = [];
     for (const [index, segment] of visualSegments.entries()) {
       if (index > 0) {
-        const separator = textSpan(document, "casola-disclosure__separator", SEPARATOR);
+        const separator = textSpan(document2, "casola-disclosure__separator", SEPARATOR);
         separator.setAttribute("aria-hidden", "true");
         children.push(separator);
       }
@@ -217,7 +494,7 @@ function attachDisclosure(target, initial = {}) {
     destroy() {
       if (destroyed) return;
       destroyed = true;
-      if (attached2.get(target) === controller) attached2.delete(target);
+      if (attached3.get(target) === controller) attached3.delete(target);
       target.replaceChildren();
       target.classList.remove("casola-disclosure");
       target.removeAttribute("aria-label");
@@ -225,9 +502,38 @@ function attachDisclosure(target, initial = {}) {
       target.hidden = true;
     }
   };
-  attached2.set(target, controller);
+  attached3.set(target, controller);
   render();
   return controller;
+}
+
+// src/errors.ts
+var AvatarError = class extends Error {
+  constructor(kind, message, options = {}) {
+    super(message);
+    __publicField(this, "kind");
+    /** `false` when the session is still running and this is a degradation, not an ending. */
+    __publicField(this, "terminal");
+    this.name = "AvatarError";
+    this.kind = kind;
+    this.terminal = options.terminal ?? true;
+    if (options.cause !== void 0) this.cause = options.cause;
+  }
+};
+function isMicError(error) {
+  return error instanceof AvatarError && (error.kind === "mic-permission" || error.kind === "mic-unavailable" || error.kind === "mic-failed");
+}
+function classifyMicError(error) {
+  const name = error?.name;
+  if (name === "NotAllowedError" || name === "SecurityError") return "mic-permission";
+  if (name === "NotFoundError" || name === "OverconstrainedError") return "mic-unavailable";
+  if (name === "NotSupportedError") return "unsupported-browser";
+  return "mic-failed";
+}
+function toAvatarError(error, kind, options = {}) {
+  if (error instanceof AvatarError) return error;
+  const message = options.message ?? (error instanceof Error ? error.message : typeof error === "string" ? error : String(error));
+  return new AvatarError(kind, message, { terminal: options.terminal, cause: error });
 }
 
 // src/protocol/codes.ts
@@ -1194,11 +1500,20 @@ var PcmPlayer = class {
 
 // src/v2/driver.ts
 var CLOSE_CODE_ERRORS = {
-  [CloseCode.UNAUTHORIZED]: "session token rejected (4001 unauthorized)",
-  [CloseCode.PROTOCOL_MISMATCH]: "box does not speak protocol v2 (4002)",
-  [CloseCode.PERSONA_UNRESOLVABLE]: "persona unresolvable on the box (4003)",
-  [CloseCode.CAPACITY]: "box at capacity (4004)",
-  [CloseCode.POLICY]: "protocol policy violation (4008)"
+  [CloseCode.UNAUTHORIZED]: {
+    kind: "unauthorized",
+    message: "session token rejected (4001 unauthorized)"
+  },
+  [CloseCode.PROTOCOL_MISMATCH]: {
+    kind: "protocol-mismatch",
+    message: "box does not speak protocol v2 (4002)"
+  },
+  [CloseCode.PERSONA_UNRESOLVABLE]: {
+    kind: "persona-unavailable",
+    message: "persona unresolvable on the box (4003)"
+  },
+  [CloseCode.CAPACITY]: { kind: "capacity", message: "box at capacity (4004)" },
+  [CloseCode.POLICY]: { kind: "policy", message: "protocol policy violation (4008)" }
 };
 var END_REASONS = ["cap", "kicked", "expired", "dropped"];
 var PLAYOUT_ACK_INTERVAL_MS = 300;
@@ -1242,7 +1557,7 @@ var V2Driver = class {
     transport.onOpen(() => {
       if (this.finished) return;
       if (socket.protocol !== void 0 && socket.protocol !== SUBPROTOCOL) {
-        this.fail(new Error(`server did not echo subprotocol ${SUBPROTOCOL}`));
+        this.fail(new Error(`server did not echo subprotocol ${SUBPROTOCOL}`), "protocol-mismatch");
         return;
       }
       conn.send({
@@ -1257,7 +1572,7 @@ var V2Driver = class {
         ...this.responseLanguage !== void 0 ? { response_language: this.responseLanguage } : {}
       });
       this.handshakeTimer = setTimeout(() => {
-        this.fail(new Error("handshake timeout: no accept from the box"));
+        this.fail(new Error("handshake timeout: no accept from the box"), "handshake");
       }, HANDSHAKE_TIMEOUT_MS);
     });
     conn.onMessage((msg) => this.onServerMessage(msg));
@@ -1313,7 +1628,7 @@ var V2Driver = class {
           this.textWaiters.delete(msg.request_id);
           waiter.reject(error);
         } else {
-          this.opts.handlers.onError(error, false);
+          this.opts.handlers.onError(toAvatarError(error, "server", { terminal: false }), false);
         }
         break;
       }
@@ -1360,7 +1675,7 @@ var V2Driver = class {
       this.mse = mse;
       mse.attach({
         onFirstFrame: () => handlers.onFirstFrame(),
-        onError: (err) => handlers.onError(err, false),
+        onError: (err) => handlers.onError(toAvatarError(err, "media", { terminal: false }), false),
         onAudioBlocked: () => handlers.onAudioBlocked()
       });
       mse.setMime(videoCh.mime);
@@ -1388,7 +1703,7 @@ var V2Driver = class {
     }).then(() => {
       if (!this.finished) this.opts.handlers.onMicReady();
     }).catch((err) => {
-      this.fail(err);
+      this.fail(err, classifyMicError(err));
     });
   }
   sendMicFrame(channelId, pcm, info) {
@@ -1438,13 +1753,17 @@ var V2Driver = class {
     } else if (accepted) {
       handlers.onEnded("edge_disconnect");
     } else {
+      const known = CLOSE_CODE_ERRORS[code];
       handlers.onError(
-        new Error(CLOSE_CODE_ERRORS[code] ?? `session socket closed before accept (${code})`),
+        new AvatarError(
+          known?.kind ?? "connect",
+          known?.message ?? `session socket closed before accept (${code})`
+        ),
         true
       );
     }
   }
-  fail(err) {
+  fail(err, kind = "connect") {
     if (this.finished) return;
     this.finished = true;
     this.teardown();
@@ -1452,7 +1771,7 @@ var V2Driver = class {
       this.conn?.close(CloseCode.NORMAL);
     } catch {
     }
-    this.opts.handlers.onError(err, true);
+    this.opts.handlers.onError(toAvatarError(err, kind), true);
   }
   async sendText(text) {
     const value = text.trim();
@@ -1464,12 +1783,12 @@ var V2Driver = class {
     }
     this.textSequence += 1;
     const id = `text-${this.textSequence}`;
-    const result = new Promise((resolve2, reject) => {
+    const result = new Promise((resolve3, reject) => {
       const timer = setTimeout(() => {
         this.textWaiters.delete(id);
         reject(new Error("text response timed out"));
       }, TEXT_TIMEOUT_MS);
-      this.textWaiters.set(id, { resolve: resolve2, reject, timer });
+      this.textWaiters.set(id, { resolve: resolve3, reject, timer });
     });
     conn.send({ type: "text", id, text: value });
     return result;
@@ -1554,13 +1873,96 @@ var AvatarSession = class {
     __publicField(this, "permittedStream");
     __publicField(this, "langs");
     __publicField(this, "_responseLanguage");
+    __publicField(this, "_userMuted", false);
+    __publicField(this, "_micSuppressed", false);
+    __publicField(this, "listeners", /* @__PURE__ */ new Map());
     this.sm = new StateMachine(opts.dev ?? false);
     this.sm.onChange((next, prev) => {
-      opts.callbacks?.onStateChange?.(next, prev);
+      this.emit("state", next, prev);
     });
     this.permittedStream = opts.permittedStream ?? null;
     this.langs = opts.langs ?? [];
     this._responseLanguage = opts.responseLanguage;
+  }
+  /**
+   * Subscribe to a session event. Returns an unsubscribe function.
+   *
+   * The constructor's `callbacks` still work and fire first; this exists because a callback bag
+   * fixed at construction cannot be joined later, which forced every host to hand-forward events
+   * into helpers like `attachCaptions`. A throwing handler is caught and never breaks the session
+   * or the other subscribers.
+   *
+   * ```ts
+   * const off = session.on('turn', (t) => captions.turn(t));
+   * // …later
+   * off();
+   * ```
+   */
+  on(event, handler) {
+    let set = this.listeners.get(event);
+    if (!set) {
+      set = /* @__PURE__ */ new Set();
+      this.listeners.set(event, set);
+    }
+    const entry = handler;
+    set.add(entry);
+    return () => {
+      set.delete(entry);
+    };
+  }
+  /** Fire the matching constructor callback, then every subscriber. */
+  emit(event, ...args) {
+    const cb = this.opts.callbacks;
+    try {
+      switch (event) {
+        case "state":
+          cb?.onStateChange?.(...args);
+          break;
+        case "partial":
+          cb?.onPartial?.(...args);
+          break;
+        case "turn":
+          cb?.onTurn?.(...args);
+          break;
+        case "firstFrame":
+          cb?.onFirstFrame?.();
+          break;
+        case "micReady":
+          cb?.onMicReady?.();
+          break;
+        case "speechStart":
+          cb?.onSpeechStart?.(...args);
+          break;
+        case "speechEnd":
+          cb?.onSpeechEnd?.(...args);
+          break;
+        case "audioFrameSent":
+          cb?.onAudioFrameSent?.(...args);
+          break;
+        case "audioBlocked":
+          cb?.onAudioBlocked?.();
+          break;
+        case "muteChange":
+          break;
+        case "close":
+          cb?.onClose?.(...args);
+          break;
+        case "error":
+          cb?.onError?.(...args);
+          break;
+      }
+    } catch (err) {
+      if (this.opts.dev) console.warn(`[avatar] callbacks.${event} threw`, err);
+    }
+    const set = this.listeners.get(event);
+    if (!set) return;
+    for (const handler of [...set]) {
+      try {
+        handler(...args);
+      } catch (err) {
+        if (this.opts.dev) console.warn(`[avatar] on('${event}') handler threw`, err);
+      }
+    }
   }
   get state() {
     return this.sm.state;
@@ -1581,6 +1983,43 @@ var AvatarSession = class {
    *  work regardless — the hello simply doesn't offer video. */
   static mediaSupported() {
     return MsePlayer.supported();
+  }
+  /**
+   * Everything that must be true before spending a fleet seat, in one call: microphone permission,
+   * MSE support, and the browser gate — returning a classified result instead of a raw
+   * DOMException.
+   *
+   * Hold the returned `stream` and pass it as `permittedStream` so the session does not call
+   * getUserMedia twice (a second permission prompt on Firefox). `video: false` means poster mode
+   * is the only option here; that is a degradation, not a failure, so `ok` stays true.
+   *
+   * ```ts
+   * const pre = await AvatarSession.preflight();
+   * if (!pre.ok) return showError(COPY.errors[pre.error.kind] ?? COPY.errors.generic);
+   * new AvatarSession({ permittedStream: pre.stream ?? undefined, ... });
+   * ```
+   */
+  static async preflight(options = {}) {
+    const wantsMic = options.mic !== false;
+    const video = MsePlayer.supported();
+    if (!wantsMic) {
+      return { ok: true, stream: null, video };
+    }
+    if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+      return {
+        ok: false,
+        error: new AvatarError(
+          "unsupported-browser",
+          "this browser does not support microphone capture"
+        )
+      };
+    }
+    try {
+      const stream = await MicPipeline.ensurePermission();
+      return { ok: true, stream, video };
+    } catch (err) {
+      return { ok: false, error: toAvatarError(err, classifyMicError(err)) };
+    }
   }
   start() {
     if (this.done || this.sm.state !== "idle") return Promise.resolve();
@@ -1633,29 +2072,31 @@ var AvatarSession = class {
           const s = this.sm.state;
           if (s === "connecting" || s === "ready") {
             this.sm.set("live");
-            this.opts.callbacks?.onFirstFrame?.();
+            this.emit("firstFrame");
           }
         },
         onMicReady: () => {
-          if (!this.done) this.opts.callbacks?.onMicReady?.();
+          if (this.done) return;
+          if (this.micMuted) this.driver?.setMuted(true);
+          this.emit("micReady");
         },
         onPartial: (text) => {
-          if (!this.done) this.opts.callbacks?.onPartial?.(text);
+          if (!this.done) this.emit("partial", text);
         },
         onTurn: (turn) => {
-          if (!this.done) this.opts.callbacks?.onTurn?.(turn);
+          if (!this.done) this.emit("turn", turn);
         },
         onSpeechStart: (id) => {
-          if (!this.done) this.opts.callbacks?.onSpeechStart?.(id);
+          if (!this.done) this.emit("speechStart", id);
         },
         onSpeechEnd: (id) => {
-          if (!this.done) this.opts.callbacks?.onSpeechEnd?.(id);
+          if (!this.done) this.emit("speechEnd", id);
         },
         onAudioFrameSent: (info) => {
-          if (!this.done) this.opts.callbacks?.onAudioFrameSent?.(info);
+          if (!this.done) this.emit("audioFrameSent", info);
         },
         onAudioBlocked: () => {
-          if (!this.done) this.opts.callbacks?.onAudioBlocked?.();
+          if (!this.done) this.emit("audioBlocked");
         },
         onEnded: (reason) => {
           this.internalEnd(reason);
@@ -1665,7 +2106,7 @@ var AvatarSession = class {
             this.internalFail(err);
           } else {
             if (dev) console.warn("[v2] session error", err);
-            if (!this.done) this.opts.callbacks?.onError?.(err);
+            if (!this.done) this.emit("error", err);
           }
         }
       }
@@ -1677,10 +2118,42 @@ var AvatarSession = class {
     this.done = true;
     this.teardown();
     this.sm.set("idle");
-    this.opts.callbacks?.onClose?.("generic");
+    this.emit("close", "generic");
   }
+  /** The user's choice — what a mute button sets. Survives `suppressMic`. */
   setMuted(muted) {
-    this.driver?.setMuted(muted);
+    this._userMuted = muted;
+    this.applyMic();
+  }
+  /**
+   * Hold the microphone closed without changing the user's choice, and release it back to
+   * whatever they had set. Use this around app-driven turns rather than calling `setMuted(true)`
+   * then `setMuted(previous)` — that pattern loses the user's intent whenever the two interleave,
+   * and it fights any UI bound to the mute state.
+   */
+  suppressMic(suppressed) {
+    this._micSuppressed = suppressed;
+    this.applyMic();
+  }
+  /** What the user chose, ignoring any active suppression. */
+  get userMuted() {
+    return this._userMuted;
+  }
+  /** Whether the application is currently holding the mic closed. */
+  get micSuppressed() {
+    return this._micSuppressed;
+  }
+  /** What the wire is actually doing: the user's choice OR an active suppression. */
+  get micMuted() {
+    return this._userMuted || this._micSuppressed;
+  }
+  applyMic() {
+    this.driver?.setMuted(this.micMuted);
+    this.emit("muteChange", {
+      userMuted: this._userMuted,
+      suppressed: this._micSuppressed,
+      effective: this.micMuted
+    });
   }
   /** Send a typed user turn through the session socket. Resolves with the box's reply. */
   sendText(text) {
@@ -1739,14 +2212,14 @@ var AvatarSession = class {
     this.done = true;
     this.teardown();
     this.sm.set("ended");
-    this.opts.callbacks?.onClose?.(reason);
+    this.emit("close", reason);
   }
   internalFail(err) {
     if (this.done) return;
     this.done = true;
     this.teardown();
     this.sm.set("error");
-    this.opts.callbacks?.onError?.(err);
+    this.emit("error", toAvatarError(err, "connect"));
   }
   teardown() {
     this.opts.connect.close();
@@ -1758,12 +2231,327 @@ var AvatarSession = class {
     this.permittedStream = null;
   }
 };
+
+// src/session-ui.ts
+var PART_CLASS = {
+  disclosure: "casola-session-ui__disclosure",
+  controls: "casola-session-ui__controls",
+  captions: "casola-session-ui__captions"
+};
+var attached4 = /* @__PURE__ */ new WeakMap();
+function optionsFor(value) {
+  if (value === false) return null;
+  if (value === void 0 || value === true) return {};
+  return value;
+}
+function attachSessionUI(container, initial = {}) {
+  attached4.get(container)?.destroy();
+  const document2 = container.ownerDocument;
+  let destroyed = false;
+  let unbind = null;
+  let liveOverride = null;
+  let name = initial.name;
+  let recording = initial.recording ?? true;
+  const mount = (part) => {
+    const el = document2.createElement("div");
+    el.className = PART_CLASS[part];
+    container.appendChild(el);
+    return el;
+  };
+  const disclosureOpts = optionsFor(initial.disclosure);
+  const controlsOpts = optionsFor(initial.controls);
+  const captionsOpts = optionsFor(initial.captions);
+  const disclosure = disclosureOpts ? attachDisclosure(mount("disclosure"), {
+    name,
+    recording,
+    visible: false,
+    ...disclosureOpts
+  }) : null;
+  const controls = controlsOpts ? attachSessionControls(mount("controls"), {
+    visible: false,
+    ...controlsOpts,
+    onHangup: controlsOpts.onHangup ?? initial.onHangup,
+    onError: controlsOpts.onError ?? initial.onError
+  }) : null;
+  const captions = captionsOpts ? attachCaptions(mount("captions"), { visible: false, ...captionsOpts }) : null;
+  container.classList.add("casola-session-ui");
+  const isVisible = (state, session) => {
+    if (liveOverride !== null) return liveOverride;
+    return initial.visibleWhen ? initial.visibleWhen(state, session) : state === "live";
+  };
+  const controlsEnabled = (state, session) => initial.controlsEnabledWhen ? initial.controlsEnabledWhen(state, session) : isVisible(state, session);
+  const applyState = (session) => {
+    if (destroyed) return;
+    const state = session.state;
+    const visible = isVisible(state, session);
+    disclosure?.update({ visible, name, recording });
+    captions?.update({ visible });
+    if (!visible) captions?.clear();
+    controls?.update({
+      visible,
+      muted: session.userMuted,
+      // Held closed by the application: the button must not fight it, and must not read as
+      // the user's own choice either.
+      muteDisabled: session.micSuppressed || !controlsEnabled(state, session)
+    });
+  };
+  const controller = {
+    disclosure,
+    controls,
+    captions,
+    bind(session) {
+      unbind?.();
+      if (destroyed) return () => {
+      };
+      controls?.update({ onMutedChange: (muted) => session.setMuted(muted) });
+      const offs = [
+        session.on("state", () => applyState(session)),
+        session.on("firstFrame", () => applyState(session)),
+        session.on("micReady", () => applyState(session)),
+        session.on("muteChange", () => applyState(session)),
+        session.on("partial", (text) => captions?.partial(text)),
+        session.on("turn", (turn) => captions?.turn(turn)),
+        session.on("speechStart", (id) => captions?.speechStart(id)),
+        session.on("speechEnd", (id) => captions?.speechEnd(id))
+      ];
+      applyState(session);
+      const off = () => {
+        for (const remove of offs) remove();
+        if (unbind === off) unbind = null;
+      };
+      unbind = off;
+      return off;
+    },
+    setLive(live) {
+      liveOverride = live;
+    },
+    update(next) {
+      if (destroyed) return;
+      if (next.name !== void 0) name = next.name;
+      if (next.recording !== void 0) recording = next.recording;
+      disclosure?.update({ name, recording });
+    },
+    destroy() {
+      if (destroyed) return;
+      destroyed = true;
+      unbind?.();
+      unbind = null;
+      disclosure?.destroy();
+      controls?.destroy();
+      captions?.destroy();
+      if (attached4.get(container) === controller) attached4.delete(container);
+      container.replaceChildren();
+      container.classList.remove("casola-session-ui");
+    }
+  };
+  attached4.set(container, controller);
+  return controller;
+}
+
+// src/styles.ts
+var SESSION_UI_CSS = `
+.casola-captions,
+.casola-session-controls,
+.casola-disclosure {
+  --casola-accent: #6366f1;
+  --casola-surface: rgb(8 6 4 / 0.55);
+  --casola-on-surface: #fff;
+  --casola-blur: 12px;
+  --casola-radius: 14px;
+  --casola-gap: 6px;
+  --casola-font: system-ui, -apple-system, sans-serif;
+}
+
+/* \u2500\u2500 captions \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
+
+.casola-captions {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--casola-captions-gap, var(--casola-gap));
+  font-family: var(--casola-caption-font, var(--casola-font));
+  color: var(--casola-caption-color, var(--casola-on-surface));
+  pointer-events: none;
+}
+
+.casola-captions[hidden] {
+  display: none;
+}
+
+.casola-captions__line {
+  max-width: var(--casola-caption-max-width, min(72%, 520px));
+  max-height: var(--casola-caption-max-height, none);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: var(--casola-caption-padding, 7px 13px);
+  border-radius: var(--casola-caption-radius, var(--casola-radius));
+  background: var(--casola-caption-bg, var(--casola-surface));
+  backdrop-filter: blur(var(--casola-caption-blur, var(--casola-blur))) saturate(140%);
+  -webkit-backdrop-filter: blur(var(--casola-caption-blur, var(--casola-blur))) saturate(140%);
+  box-shadow: var(--casola-caption-shadow, 0 1px 12px rgb(0 0 0 / 0.28));
+  font-size: var(--casola-caption-size, 15px);
+  line-height: var(--casola-caption-line-height, 1.4);
+  text-shadow: var(--casola-caption-text-shadow, 0 1px 3px rgb(0 0 0 / 0.45));
+  text-wrap: pretty;
+  transition: opacity var(--casola-fade-ms, 300ms) ease;
+}
+
+/* In-progress ASR: a fainter bubble, not a faded one \u2014 element opacity is reserved for the
+   fade-out below, and stacking the two makes partial\u2192committed jump. */
+.casola-captions__line--partial {
+  background: var(--casola-caption-partial-bg, rgb(8 6 4 / 0.42));
+  color: var(--casola-caption-partial-color, rgb(255 255 255 / 0.82));
+  font-style: italic;
+}
+
+.casola-captions__line--reply {
+  color: var(--casola-caption-reply-color, color-mix(in srgb, var(--casola-accent) 35%, #fff));
+  font-weight: var(--casola-caption-reply-weight, 600);
+}
+
+.casola-captions__line--note {
+  color: var(--casola-caption-note-color, rgb(255 255 255 / 0.88));
+  font-style: italic;
+}
+
+.casola-captions__line--fading {
+  opacity: 0;
+}
+
+.casola-captions__speaker {
+  display: block;
+  margin-bottom: var(--casola-speaker-gap, 4px);
+  color: var(--casola-speaker-color, var(--casola-accent));
+  font-size: var(--casola-speaker-size, 0.66em);
+  font-weight: var(--casola-speaker-weight, 600);
+  letter-spacing: var(--casola-speaker-tracking, 0.14em);
+  text-transform: var(--casola-speaker-transform, uppercase);
+}
+
+/* \u2500\u2500 controls \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
+
+.casola-session-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--casola-controls-gap, 10px);
+}
+
+.casola-session-controls[hidden] {
+  display: none;
+}
+
+.casola-session-controls button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: var(--casola-control-size, 40px);
+  padding: var(--casola-control-padding, 0 16px);
+  border: var(--casola-control-border, 1px solid rgb(255 255 255 / 0.14));
+  border-radius: var(--casola-control-radius, 999px);
+  background: var(--casola-control-bg, var(--casola-surface));
+  color: var(--casola-control-color, var(--casola-on-surface));
+  font: inherit;
+  font-family: var(--casola-font);
+  font-size: var(--casola-control-font-size, 14px);
+  cursor: pointer;
+  transition: background 0.15s ease, opacity 0.15s ease;
+}
+
+.casola-session-controls button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.casola-session-controls[data-muted] .casola-session-controls__mute {
+  background: var(--casola-control-active-bg, color-mix(in srgb, var(--casola-accent) 30%, #000));
+}
+
+.casola-session-controls__hangup {
+  background: var(--casola-hangup-bg, #e5484d);
+  border-color: transparent;
+}
+
+/* \u2500\u2500 disclosure \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500 */
+
+.casola-disclosure {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--casola-disclosure-gap, 6px);
+  padding: var(--casola-disclosure-padding, 5px 10px);
+  border-radius: var(--casola-disclosure-radius, 8px);
+  background: var(--casola-disclosure-bg, rgb(0 0 0 / 0.45));
+  backdrop-filter: blur(var(--casola-blur));
+  -webkit-backdrop-filter: blur(var(--casola-blur));
+  color: var(--casola-disclosure-color, var(--casola-on-surface));
+  font-family: var(--casola-font);
+  font-size: var(--casola-disclosure-size, 13px);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.casola-disclosure[hidden] {
+  display: none;
+}
+
+/* Red, and always beside the word REC \u2014 colour must never be the only carrier of the notice. */
+.casola-disclosure__recording-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--casola-rec-color, #ff453a);
+}
+
+.casola-disclosure__recording-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: casola-rec-pulse 1.4s ease-in-out infinite;
+}
+
+.casola-disclosure__separator {
+  opacity: 0.5;
+}
+
+@keyframes casola-rec-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .casola-disclosure__recording-dot { animation: none; }
+  .casola-captions__line { transition: none; }
+}
+`;
+function adoptSessionUIStyles(root) {
+  const supportsConstructable = typeof CSSStyleSheet !== "undefined" && "replaceSync" in CSSStyleSheet.prototype && "adoptedStyleSheets" in root;
+  if (supportsConstructable) {
+    const sheet = new CSSStyleSheet();
+    sheet.replaceSync(SESSION_UI_CSS);
+    root.adoptedStyleSheets = [...root.adoptedStyleSheets, sheet];
+    return () => {
+      root.adoptedStyleSheets = root.adoptedStyleSheets.filter((s) => s !== sheet);
+    };
+  }
+  const doc = root instanceof Document ? root : root.ownerDocument ?? document;
+  const style = doc.createElement("style");
+  style.textContent = SESSION_UI_CSS;
+  (root instanceof Document ? root.head ?? root.body : root).appendChild(style);
+  return () => style.remove();
+}
 export {
+  AvatarError,
   AvatarSession,
   CloseCode,
+  SESSION_UI_CSS,
   SUBPROTOCOL,
+  adoptSessionUIStyles,
+  attachCaptions,
   attachDisclosure,
   attachSessionControls,
-  connectViaToken
+  attachSessionUI,
+  classifyMicError,
+  connectViaToken,
+  isMicError
 };
 //# sourceMappingURL=index.js.map

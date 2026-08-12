@@ -1,6 +1,6 @@
 {
   "name": "@casola/avatar-client",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Browser SDK for Casola live avatar sessions over avatar protocol v2 (one multiplexed WebSocket).",
   "license": "MIT",
   "type": "module",
@@ -12,7 +12,8 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
-    "./worklet": "./dist/worklet/mic-worklet.js"
+    "./worklet": "./dist/worklet/mic-worklet.js",
+    "./styles.css": "./dist/styles.css"
   },
   "files": [
     "dist"
