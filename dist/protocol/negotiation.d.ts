@@ -1,4 +1,8 @@
 import type { AcceptMessage, HelloMessage } from './messages';
+export declare const Feature: {
+    readonly UTTERANCE_TIMING_V1: "utterance_timing_v1";
+    readonly MEDIA_UNIT_FLAGS_V1: "media_unit_flags_v1";
+};
 /**
  * hello → accept negotiation, server side. Pure: the caller supplies what the session can offer
  * (from the JWT + its own capabilities) and gets back either the accept body (minus `seq`, which

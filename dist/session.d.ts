@@ -1,5 +1,6 @@
 import { AvatarError } from './errors';
 import type { WidgetState } from './state';
+import type { TimedUtterance } from './utterance-scheduler';
 import { type DriverSocket, type EndReason, type Turn } from './v2/driver';
 export type { EndReason, Turn, WidgetState };
 /** What {@link AvatarSession.preflight} found. `ok: false` carries the classified reason, so a
@@ -42,6 +43,10 @@ export interface AvatarSessionEvents {
     micReady: () => void;
     speechStart: (speechId: string) => void;
     speechEnd: (speechId: string) => void;
+    utteranceStart: (utterance: TimedUtterance) => void;
+    utteranceText: (utterance: TimedUtterance) => void;
+    utteranceEnd: (utterance: TimedUtterance) => void;
+    mediaDiscarded: (cutoffPtsUs: number) => void;
     audioFrameSent: (info: MicFrameSentInfo) => void;
     audioBlocked: () => void;
     /** The microphone's mute state changed — from the user, or from `suppressMic`. */
@@ -95,6 +100,12 @@ export interface AvatarSessionOpts {
         /** The box marked the start of an assistant utterance (speech_id groups its turn/audio). */
         onSpeechStart?(speechId: string): void;
         onSpeechEnd?(speechId: string): void;
+        /** Fired only when the local playout clock reaches the timed utterance boundary. */
+        onUtteranceStart?(utterance: TimedUtterance): void;
+        onUtteranceText?(utterance: TimedUtterance): void;
+        onUtteranceEnd?(utterance: TimedUtterance): void;
+        /** Diagnostic hook fired after local interruption media removal completes. */
+        onMediaDiscarded?(cutoffPtsUs: number): void;
         /** Fired once per outgoing 100ms mic frame with its capture calibration — analytics/debugging
          *  hook, not required for normal operation. `videoMediaTimeMs` is the unknown sentinel
          *  (0xFFFFFFFF) before the avatar video has displayed its first frame (always, in poster
@@ -198,6 +209,14 @@ export declare class AvatarSession {
     /** Unmute avatar audio from a user-gesture context (tap-for-sound button). Returns whether
      *  audio is now unblocked. Pair with callbacks.onAudioBlocked. */
     unmuteAudio(): boolean;
+    /** Avatar voice still queued to play, in ms, or `null` when this session has no playout clock
+     *  to ask — a video session or one that has not accepted yet. `null` is "unknown", not "none".
+     *
+     *  Intended for `attachCaptions`'s `remainingVoiceMs`, which needs to know how much voice is
+     *  left when an utterance ends so it can time the words it has not revealed yet. */
+    bufferedVoiceMs(): number | null;
+    /** Current local playout position on the server media timeline. Null before playback starts. */
+    playedPtsUs(): number | null;
     /** Call synchronously inside the click/tap handler that starts a call, BEFORE any await:
      *  a user-gestured play()/load() clears WebKit's per-element gesture restrictions so the
      *  SDK's scripted unmute isn't answered with a pause on iOS Safari (which otherwise turns

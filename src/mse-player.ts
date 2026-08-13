@@ -1,4 +1,5 @@
 import { ClockMap } from './clock-map';
+import type { PlayoutClock } from './playout-clock';
 
 export interface MseHandlers {
   onFirstFrame?: () => void;
@@ -10,6 +11,12 @@ export interface MseHandlers {
 }
 
 type MediaSourceCtor = { new (): MediaSource };
+
+interface PendingAppend {
+  bytes: Uint8Array<ArrayBuffer>;
+  ptsUs: number;
+  init: boolean;
+}
 
 function getMediaSourceCtor(): MediaSourceCtor | null {
   if (typeof window === 'undefined') return null;
@@ -26,7 +33,7 @@ function getMediaSourceCtor(): MediaSourceCtor | null {
  * MEDIA frames) via append(). Everything else — buffering, live-edge chasing, eviction, the
  * pause watchdog, the rVFC media-time calibration — is unchanged from the v1 player.
  */
-export class MsePlayer {
+export class MsePlayer implements PlayoutClock {
   static supported(): boolean {
     return getMediaSourceCtor() !== null;
   }
@@ -34,7 +41,9 @@ export class MsePlayer {
   private ms: MediaSource | null = null;
   private sb: SourceBuffer | null = null;
   private mime: string | null = null;
-  private readonly pending: BufferSource[] = [];
+  private readonly pending: PendingAppend[] = [];
+  private activeAppend: PendingAppend | null = null;
+  private discarding = false;
   private sourceOpen = false;
   private streaming = true;
   private started = false;
@@ -47,7 +56,10 @@ export class MsePlayer {
   private resumeAttempts = 0;
   private watchdogListeners: Array<[string, EventListener]> = [];
   private readonly mediaTimeMap = new ClockMap();
+  private mediaUnitDurationUs: number | null = null;
   private rvfcHandle: number | null = null;
+  private lastPlayedPtsUs: number | null = null;
+  private readonly advanceHandlers = new Set<() => void>();
 
   private fireFirstFrame(): void {
     if (this.firstFrameFired) return;
@@ -113,6 +125,17 @@ export class MsePlayer {
     v.addEventListener('playing', onPlaying);
     this.watchdogListeners.push(['pause', onPause], ['playing', onPlaying]);
 
+    const onAdvance: EventListener = () => {
+      if (this.video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+        this.lastPlayedPtsUs = Math.max(0, Math.round(this.video.currentTime * 1_000_000));
+      }
+      this.emitAdvance();
+    };
+    for (const event of ['timeupdate', 'seeking', 'seeked', 'playing', 'loadeddata']) {
+      v.addEventListener(event, onAdvance);
+      this.watchdogListeners.push([event, onAdvance]);
+    }
+
     // Fire onFirstFrame unconditionally on 'playing' (that event guarantees playback started).
     // Use conditional check for the other events as fallbacks.
     const fireFirst = () => this.fireFirstFrame();
@@ -137,12 +160,23 @@ export class MsePlayer {
   }
 
   /** Append one fMP4 payload (init segment or media segment, in wire order). */
-  append(bytes: Uint8Array): void {
+  append(bytes: Uint8Array, ptsUs = 0, init = false): void {
     if (this.closed) return;
     // Copy: the payload is a subarray view into the transport's frame buffer, which the caller
     // may reuse; SourceBuffer.appendBuffer needs stable bytes until updateend.
-    this.pending.push(bytes.slice());
+    const copy = new Uint8Array(new ArrayBuffer(bytes.byteLength));
+    copy.set(bytes);
+    this.pending.push({ bytes: copy, ptsUs, init });
     this.drain();
+  }
+
+  /** Nominal complete-unit duration from the negotiated video channel descriptor. The rollout
+   *  intentionally leaves duration out of the binary header, so this is what lets interruption
+   *  reject a queued unit whose start precedes, but whose tail crosses, the cutoff. */
+  setMediaUnitTiming(fps: number, segmentFrames: number): void {
+    if (Number.isFinite(fps) && fps > 0 && Number.isInteger(segmentFrames) && segmentFrames > 0) {
+      this.mediaUnitDurationUs = Math.round((segmentFrames / fps) * 1_000_000);
+    }
   }
 
   /** Re-arms itself each callback (rVFC only fires once per registration) to keep sampling the
@@ -154,6 +188,8 @@ export class MsePlayer {
     this.rvfcHandle = this.video.requestVideoFrameCallback((_now, metadata) => {
       if (this.closed) return;
       this.mediaTimeMap.record(metadata.expectedDisplayTime, metadata.mediaTime * 1000);
+      this.lastPlayedPtsUs = Math.max(0, Math.round(metadata.mediaTime * 1_000_000));
+      this.emitAdvance();
       this.scheduleFrameCallback();
     });
   }
@@ -163,6 +199,79 @@ export class MsePlayer {
    *  change handling). Returns null before the first displayed frame. */
   mediaTimeAt(performanceTimeMs: number): number | null {
     return this.mediaTimeMap.at(performanceTimeMs);
+  }
+
+  playedPtsUs(): number | null {
+    if (this.lastPlayedPtsUs !== null) return this.lastPlayedPtsUs;
+    if (this.video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return null;
+    const current = this.video.currentTime;
+    return Number.isFinite(current) ? Math.max(0, Math.round(current * 1_000_000)) : null;
+  }
+
+  bufferedMs(): number {
+    const buffered = this.video.buffered;
+    if (!buffered.length) return 0;
+    try {
+      return Math.max(
+        0,
+        Math.round((buffered.end(buffered.length - 1) - this.video.currentTime) * 1000)
+      );
+    } catch {
+      return 0;
+    }
+  }
+
+  onAdvance(handler: () => void): () => void {
+    this.advanceHandlers.add(handler);
+    return () => this.advanceHandlers.delete(handler);
+  }
+
+  /** Remove queued and MSE-buffered media at/after the server-timeline cutoff. */
+  async discardFrom(cutoffPtsUs: number): Promise<void> {
+    const retained = (entry: PendingAppend): boolean => {
+      if (entry.init) return true;
+      if (this.mediaUnitDurationUs === null) return false;
+      return entry.ptsUs + this.mediaUnitDurationUs <= cutoffPtsUs;
+    };
+    this.pending.splice(0, this.pending.length, ...this.pending.filter(retained));
+    const sb = this.sb;
+    if (!sb) {
+      this.emitAdvance();
+      return;
+    }
+    this.discarding = true;
+    const activeCrossesCutoff =
+      this.activeAppend !== null &&
+      !this.activeAppend.init &&
+      (this.mediaUnitDurationUs === null ||
+        this.activeAppend.ptsUs + this.mediaUnitDurationUs > cutoffPtsUs);
+    if (activeCrossesCutoff && sb.updating) {
+      try {
+        sb.abort();
+      } catch {
+        /* append finished between the checks */
+      }
+      this.activeAppend = null;
+    }
+    await this.waitForIdle(sb);
+    const cutoffSec = cutoffPtsUs / 1_000_000;
+    if (sb.buffered.length) {
+      const end = sb.buffered.end(sb.buffered.length - 1);
+      if (end > cutoffSec) {
+        const start = Math.max(cutoffSec, sb.buffered.start(0));
+        if (end > start) {
+          try {
+            sb.remove(start, end);
+            await this.waitForIdle(sb);
+          } catch {
+            /* SourceBuffer closed while interruption was being applied */
+          }
+        }
+      }
+    }
+    this.discarding = false;
+    this.drain();
+    this.emitAdvance();
   }
 
   private setAudioBlocked(): void {
@@ -192,7 +301,10 @@ export class MsePlayer {
     try {
       const sb = this.ms.addSourceBuffer(this.mime);
       sb.mode = 'segments';
-      sb.addEventListener('updateend', () => this.drain());
+      sb.addEventListener('updateend', () => {
+        this.activeAppend = null;
+        if (!this.discarding) this.drain();
+      });
       this.sb = sb;
       this.drain();
     } catch (e) {
@@ -202,14 +314,15 @@ export class MsePlayer {
 
   private drain(): void {
     const sb = this.sb;
-    if (!sb || sb.updating || !this.streaming) return;
+    if (!sb || sb.updating || !this.streaming || this.discarding) return;
     const next = this.pending.shift();
     if (next === undefined) {
       this.housekeep(false);
       return;
     }
     try {
-      sb.appendBuffer(next);
+      this.activeAppend = next;
+      sb.appendBuffer(next.bytes);
       if (!this.started) {
         this.started = true;
         // Force muted before play() — muted autoplay is always permitted (Firefox requires this).
@@ -252,6 +365,7 @@ export class MsePlayer {
       }
     } catch (e) {
       if (e instanceof DOMException && e.name === 'QuotaExceededError') {
+        this.activeAppend = null;
         this.pending.unshift(next);
         this.housekeep(true);
       } else {
@@ -321,12 +435,14 @@ export class MsePlayer {
       /* */
     }
     this.pending.length = 0;
+    this.activeAppend = null;
     this.sb = null;
     this.ms = null;
     for (const [ev, fn] of this.watchdogListeners) {
       this.video.removeEventListener(ev, fn);
     }
     this.watchdogListeners = [];
+    this.advanceHandlers.clear();
     try {
       this.video.removeAttribute('src');
       this.video.srcObject = null;
@@ -334,5 +450,24 @@ export class MsePlayer {
     } catch {
       /* */
     }
+  }
+
+  private emitAdvance(): void {
+    for (const handler of this.advanceHandlers) handler();
+  }
+
+  private waitForIdle(sb: SourceBuffer): Promise<void> {
+    if (!sb.updating) return Promise.resolve();
+    return new Promise((resolve) => {
+      const done = () => {
+        sb.removeEventListener('updateend', done);
+        sb.removeEventListener('abort', done);
+        sb.removeEventListener('error', done);
+        resolve();
+      };
+      sb.addEventListener('updateend', done, { once: true });
+      sb.addEventListener('abort', done, { once: true });
+      sb.addEventListener('error', done, { once: true });
+    });
   }
 }

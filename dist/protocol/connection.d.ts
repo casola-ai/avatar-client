@@ -9,7 +9,7 @@ import type { Transport, TransportCloseEvent, Unsubscribe } from './transport';
  * test clients share; it owns no I/O beyond the Transport it is given.
  */
 export interface ProtocolViolation {
-    kind: 'illegal_message' | 'illegal_frame' | 'bad_frame';
+    kind: 'illegal_message' | 'illegal_frame' | 'bad_frame' | 'sequence_violation';
     detail: string;
     state: ProtocolState;
 }

@@ -14,8 +14,10 @@
  *  - reply held for its `speech_start` — the real audio onset — when the box marks utterances,
  *    with `startTimeoutMs` as the backstop for a marker that never lands;
  *  - never held at all when the box has sent no marker this session (nothing to wait for);
- *  - `speech_end` retimes the remaining words to finish inside `tailMs`, so the text cannot
- *    keep crawling after the voice has stopped;
+ *  - `speech_end` retimes the remaining words to finish inside the voice that is left, so the
+ *    text cannot keep crawling after the speaker has stopped. That marker means the box stopped
+ *    *producing* audio, not that the user stopped hearing it, so the budget is the player's own
+ *    buffered voice via `remainingVoiceMs`, falling back to the fixed `tailMs` guess;
  *  - a reply committed for an already-ended utterance opens straight into that tail pace.
  *
  * The SDK owns DOM construction, safe text rendering, the live-region behavior and the schedule.
@@ -25,6 +27,8 @@
  *
  * Text is always written with `textContent`, never markup — every string here is remote input.
  */
+
+import type { TimedUtterance } from './utterance-scheduler';
 
 /** A committed turn, shaped like the SDK's `Turn` so a callback can be forwarded verbatim. */
 export interface CaptionTurn {
@@ -36,6 +40,8 @@ export interface CaptionTurn {
   speechId?: string;
   /** BCP-47 tag for the turn; sets `lang` on the rendered lines. */
   language?: string;
+  /** Assistant text is delivered by timed utterance callbacks; keep reply transcript-only. */
+  timedUtterances?: boolean;
 }
 
 /** Options for the streaming caption surface. */
@@ -53,9 +59,19 @@ export interface CaptionsOptions {
   wordsPerMinute?: number;
   /** How long a reply waits for its `speech_start` before revealing anyway. Defaults to 2000. */
   startTimeoutMs?: number;
-  /** Window the remaining words are compressed into once the utterance has ended. Defaults
-   *  to 1000. */
+  /** Fallback window the remaining words are compressed into once the utterance has ended, used
+   *  when `remainingVoiceMs` is absent or cannot answer. Defaults to 1000. */
   tailMs?: number;
+  /** How much avatar voice is still queued to play, in ms — `AvatarSession.bufferedVoiceMs`.
+   *
+   *  `speech_end` means the box has stopped *producing* audio, not that the speaker has stopped:
+   *  what is buffered is still to be heard. Supplying this spends exactly that much time on the
+   *  words not yet revealed, instead of the fixed `tailMs` guess. Return `null` when the answer
+   *  is unknown (no playout clock) and `tailMs` is used for that utterance.
+   *
+   *  Captions are usually attached before the session exists, so close over a mutable reference:
+   *  `remainingVoiceMs: () => session?.bufferedVoiceMs() ?? null`. Pass `null` to unset. */
+  remainingVoiceMs?: (() => number | null) | null;
 }
 
 /** A line the application authored, rather than one that came off the wire. */
@@ -89,6 +105,11 @@ export interface CaptionsController {
   speechStart(speechId: string): void;
   /** The box finished an utterance (`onSpeechEnd`). */
   speechEnd(speechId: string): void;
+  /** Show a timed assistant utterance. The SDK scheduler calls this only at its media PTS. */
+  utteranceStart(utterance: TimedUtterance): void;
+  /** Update the currently visible text without exposing a pending utterance. */
+  utteranceText(utterance: TimedUtterance): void;
+  utteranceEnd(utterance: TimedUtterance): void;
   /** Drop every line and cancel pending reveals, keeping the attachment. */
   clear(): void;
   /** Update any subset of the options. */
@@ -104,8 +125,9 @@ interface Reveal {
   tokens: string[];
   index: number;
   speechId: string | undefined;
-  /** Set once the utterance is over: a fixed pace that spends `tailMs` on the words left at that
-   *  moment. Recomputing it per word would stretch the budget instead of spending it. */
+  /** Set once the utterance is over: a fixed pace that spends the remaining voice on the words
+   *  left at that moment. Recomputing it per word would stretch the budget instead of spending
+   *  it — and would re-read a buffer that is draining as the words come out. */
   tailIntervalMs: number | null;
   /** The armed step timer, so the tail can re-time a word that is already waiting. */
   timer: ReturnType<typeof setTimeout> | null;
@@ -117,8 +139,11 @@ interface Waiting {
   language: string | undefined;
 }
 
-/** Every optional field settled, so the render path never re-derives defaults. */
-type ResolvedOptions = Required<CaptionsOptions>;
+/** Every optional field settled, so the render path never re-derives defaults. The supplier
+ *  settles to `null` rather than to a function, so "no supplier" stays one check. */
+type ResolvedOptions = Required<Omit<CaptionsOptions, 'remainingVoiceMs'>> & {
+  remainingVoiceMs: (() => number | null) | null;
+};
 
 const DEFAULTS: ResolvedOptions = {
   visible: true,
@@ -128,6 +153,7 @@ const DEFAULTS: ResolvedOptions = {
   wordsPerMinute: 160,
   startTimeoutMs: 2000,
   tailMs: 1000,
+  remainingVoiceMs: null,
 };
 
 /** Floor on the retimed tail, so a long reply cannot schedule a timer per animation frame. */
@@ -150,6 +176,9 @@ function resolve(base: ResolvedOptions, next: Partial<CaptionsOptions>): Resolve
     wordsPerMinute: Math.max(1, next.wordsPerMinute ?? base.wordsPerMinute),
     startTimeoutMs: Math.max(0, next.startTimeoutMs ?? base.startTimeoutMs),
     tailMs: Math.max(0, next.tailMs ?? base.tailMs),
+    // `undefined` means "leave it alone", so an explicit `null` is the only way to unset.
+    remainingVoiceMs:
+      next.remainingVoiceMs === undefined ? base.remainingVoiceMs : next.remainingVoiceMs,
   };
 }
 
@@ -166,8 +195,12 @@ function tokenize(text: string): string[] {
  * Calling this again for the same target replaces the previous attachment.
  *
  * ```ts
- * const captions = attachCaptions(document.querySelector('#captions'), { holdMs: 2000 });
- * new AvatarSession({
+ * let session: AvatarSession | null = null;
+ * const captions = attachCaptions(document.querySelector('#captions'), {
+ *   holdMs: 2000,
+ *   remainingVoiceMs: () => session?.bufferedVoiceMs() ?? null,
+ * });
+ * session = new AvatarSession({
  *   callbacks: {
  *     onPartial: (text) => captions.partial(text),
  *     onTurn: (turn) => captions.turn(turn),
@@ -198,6 +231,8 @@ export function attachCaptions(
   let partialEl: HTMLElement | null = null;
   let waiting: Waiting | null = null;
   let reveal: Reveal | null = null;
+  const timedLines = new Map<string, HTMLElement>();
+  let timedMode = false;
 
   const after = (ms: number, fn: () => void): ReturnType<typeof setTimeout> => {
     const id = setTimeout(() => {
@@ -250,6 +285,9 @@ export function attachCaptions(
       if (!oldest) break;
       if (oldest === partialEl) partialEl = null;
       if (oldest === reveal?.el) reveal = null;
+      for (const [id, el] of timedLines) {
+        if (el === oldest) timedLines.delete(id);
+      }
       oldest.remove();
     }
   };
@@ -284,12 +322,28 @@ export function attachCaptions(
     settle(r.el);
   };
 
-  /** The voice has stopped: spend what is left of `tailMs` on the words still queued, and re-time
-   *  the word already waiting — it was armed at the slower speaking pace. */
+  /** How long the words still queued should take. The voice actually left in the player when the
+   *  host supplies a reading, and the fixed `tailMs` guess when it does not — including when the
+   *  supplier throws or answers with something that is not a duration, because a caption helper
+   *  is not the place for a host bug to become an unhandled error. */
+  const tailBudgetMs = (): number => {
+    const read = options.remainingVoiceMs;
+    if (!read) return options.tailMs;
+    let ms: number | null;
+    try {
+      ms = read();
+    } catch {
+      return options.tailMs;
+    }
+    return typeof ms === 'number' && Number.isFinite(ms) && ms >= 0 ? ms : options.tailMs;
+  };
+
+  /** The voice has stopped being *produced*: spend what is left of it on the words still queued,
+   *  and re-time the word already waiting — it was armed at the slower speaking pace. */
   const enterTail = (r: Reveal): void => {
     if (r.tailIntervalMs !== null) return;
     const remaining = Math.max(1, r.tokens.length - r.index);
-    r.tailIntervalMs = Math.max(MIN_INTERVAL_MS, options.tailMs / remaining);
+    r.tailIntervalMs = Math.max(MIN_INTERVAL_MS, tailBudgetMs() / remaining);
     if (r.timer === null) return;
     cancel(r.timer);
     r.timer = after(r.tailIntervalMs, step);
@@ -409,7 +463,8 @@ export function attachCaptions(
         settle(el);
       }
       const reply = turn.reply?.trim() ?? '';
-      if (reply) {
+      if (turn.timedUtterances) timedMode = true;
+      if (reply && !timedMode) {
         // An earlier reply still crawling is finished on the spot rather than interleaved.
         finishReveal();
         const state = turn.speechId ? speeches.get(turn.speechId) : undefined;
@@ -446,10 +501,45 @@ export function attachCaptions(
       if (reveal?.speechId === speechId) enterTail(reveal);
     },
 
+    utteranceStart(utterance) {
+      if (destroyed || !utterance.utteranceId) return;
+      timedMode = true;
+      waiting = null;
+      finishReveal();
+      const existing = timedLines.get(utterance.utteranceId);
+      existing?.remove();
+      const text = utterance.text?.trim() ?? '';
+      const el = line('reply', text, utterance.language);
+      if (!text) el.setAttribute('aria-hidden', 'true');
+      target.appendChild(el);
+      timedLines.set(utterance.utteranceId, el);
+      trim();
+      scrollToEnd();
+    },
+
+    utteranceText(utterance) {
+      if (destroyed) return;
+      const el = timedLines.get(utterance.utteranceId);
+      if (!el) return;
+      bodyOf(el).textContent = utterance.text ?? '';
+      if (utterance.language) el.lang = utterance.language;
+      if (utterance.text) el.removeAttribute('aria-hidden');
+      scrollToEnd();
+    },
+
+    utteranceEnd(utterance) {
+      if (destroyed) return;
+      const el = timedLines.get(utterance.utteranceId);
+      if (!el) return;
+      timedLines.delete(utterance.utteranceId);
+      settle(el);
+    },
+
     clear() {
       if (destroyed) return;
       cancelPending();
       partialEl = null;
+      timedLines.clear();
       target.replaceChildren();
     },
 
@@ -465,6 +555,7 @@ export function attachCaptions(
       destroyed = true;
       cancelPending();
       partialEl = null;
+      timedLines.clear();
       if (attached.get(target) === controller) attached.delete(target);
       target.replaceChildren();
       target.classList.remove(BASE_CLASS);

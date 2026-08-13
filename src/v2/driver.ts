@@ -1,13 +1,16 @@
 import { AvatarError, type AvatarErrorKind, classifyMicError, toAvatarError } from '../errors';
+import { type MediaUnit, MediaUnitAssembler } from '../media-unit-assembler';
 import { type MicFrameInfo, MicPipeline, VIDEO_MEDIA_TIME_UNKNOWN } from '../mic-pipeline';
 import { MsePlayer } from '../mse-player';
 import { PcmPlayer } from '../pcm-player';
+import type { PlayoutClock } from '../playout-clock';
 import {
   type AcceptMessage,
   type AudioChannelDescriptor,
   type ClientConnection,
   CloseCode,
   clientProtocolConnection,
+  Feature,
   FrameType,
   HANDSHAKE_TIMEOUT_MS,
   MAX_INSTRUCTION_CHARS,
@@ -20,6 +23,7 @@ import {
   type WebSocketLike,
   webSocketTransport,
 } from '../protocol';
+import { type TimedUtterance, UtteranceScheduler } from '../utterance-scheduler';
 
 export type EndReason = 'cap' | 'edge_disconnect' | 'kicked' | 'expired' | 'dropped' | 'generic';
 
@@ -28,6 +32,8 @@ export interface Turn {
   reply: string;
   language?: string;
   speechId?: string;
+  /** True when assistant caption visibility comes from timed utterance callbacks, not turn.reply. */
+  timedUtterances?: boolean;
 }
 
 interface TextWaiter {
@@ -55,6 +61,10 @@ export interface V2DriverHandlers {
   onTurn(turn: Turn): void;
   onSpeechStart(speechId: string): void;
   onSpeechEnd(speechId: string): void;
+  onUtteranceStart(utterance: TimedUtterance): void;
+  onUtteranceText(utterance: TimedUtterance): void;
+  onUtteranceEnd(utterance: TimedUtterance): void;
+  onMediaDiscarded(cutoffPtsUs: number): void;
   onAudioFrameSent(info: MicFrameInfo): void;
   onAudioBlocked(): void;
   /** The session is over after a successful handshake — server end or transport loss. */
@@ -113,6 +123,9 @@ export class V2Driver {
   private conn: ClientConnection | null = null;
   private mse: MsePlayer | null = null;
   private player: PcmPlayer | null = null;
+  private clock: PlayoutClock | null = null;
+  private scheduler: UtteranceScheduler | null = null;
+  private readonly unitAssembler = new MediaUnitAssembler();
   private pipeline: MicPipeline | null = null;
 
   private accepted: AcceptMessage | null = null;
@@ -120,6 +133,8 @@ export class V2Driver {
   private micCh: AudioChannelDescriptor | null = null;
   private endReason: EndReason | null = null;
   private finished = false;
+  private timedUtterances = false;
+  private framedMediaUnits = false;
 
   private handshakeTimer: ReturnType<typeof setTimeout> | null = null;
   private ackTimer: ReturnType<typeof setInterval> | null = null;
@@ -171,6 +186,8 @@ export class V2Driver {
         ...(this.responseLanguage !== undefined
           ? { response_language: this.responseLanguage }
           : {}),
+        features: [Feature.UTTERANCE_TIMING_V1, Feature.MEDIA_UNIT_FLAGS_V1],
+        resume: null,
       });
       this.handshakeTimer = setTimeout(() => {
         this.fail(new Error('handshake timeout: no accept from the box'), 'handshake');
@@ -200,6 +217,7 @@ export class V2Driver {
           reply: msg.reply ?? '',
           language: msg.language,
           speechId: msg.speech_id,
+          ...(this.timedUtterances ? { timedUtterances: true } : {}),
         };
         const waiter = msg.request_id ? this.textWaiters.get(msg.request_id) : undefined;
         if (waiter && msg.request_id) {
@@ -212,14 +230,41 @@ export class V2Driver {
         break;
       }
       case 'speech_start':
-        this.opts.handlers.onSpeechStart(msg.speech_id);
+        if (!this.timedUtterances) this.opts.handlers.onSpeechStart(msg.speech_id);
         break;
       case 'speech_end':
-        this.opts.handlers.onSpeechEnd(msg.speech_id);
+        if (!this.timedUtterances) this.opts.handlers.onSpeechEnd(msg.speech_id);
+        break;
+      case 'utterance_start':
+        if (this.timedUtterances) this.scheduler?.receiveStart(msg);
+        break;
+      case 'utterance_text':
+        if (this.timedUtterances) this.scheduler?.receiveText(msg);
+        break;
+      case 'utterance_end':
+        if (this.timedUtterances) this.scheduler?.receiveEnd(msg);
         break;
       case 'interruption':
-        if (msg.cutoff_pts_us === null) this.player?.flush();
-        else this.player?.flushFrom(msg.cutoff_pts_us);
+        if (msg.cutoff_pts_us === null) {
+          this.player?.flush();
+          const cutoff = this.clock?.playedPtsUs() ?? 0;
+          this.unitAssembler.discardFrom(cutoff);
+          if (this.mse) {
+            void this.mse
+              .discardFrom(cutoff)
+              .then(() => this.opts.handlers.onMediaDiscarded(cutoff));
+          } else {
+            this.opts.handlers.onMediaDiscarded(cutoff);
+          }
+        } else {
+          this.unitAssembler.discardFrom(msg.cutoff_pts_us);
+          const cutoff = msg.cutoff_pts_us;
+          const discarded = this.clock?.discardFrom(cutoff) ?? Promise.resolve();
+          void discarded.then(() => this.opts.handlers.onMediaDiscarded(cutoff));
+          if ('utterance_ids' in msg) {
+            this.scheduler?.interrupt(msg.cutoff_pts_us, msg.utterance_ids);
+          }
+        }
         break;
       case 'instruction_set':
         // idempotent ack; nothing to surface
@@ -258,6 +303,9 @@ export class V2Driver {
       this.handshakeTimer = null;
     }
     this.accepted = accept;
+    const acceptedFeatures = accept.features ?? [];
+    this.timedUtterances = acceptedFeatures.includes(Feature.UTTERANCE_TIMING_V1);
+    this.framedMediaUnits = acceptedFeatures.includes(Feature.MEDIA_UNIT_FLAGS_V1);
     const { handlers } = this.opts;
 
     const channels = accept.channels;
@@ -271,15 +319,7 @@ export class V2Driver {
 
     if (this.audioCh) {
       this.player = new PcmPlayer(() => handlers.onAudioBlocked());
-      this.ackTimer = setInterval(() => {
-        const player = this.player;
-        if (!player) return;
-        this.conn?.send({
-          type: 'playout_ack',
-          played_pts_us: player.playedPtsUs(),
-          buffered_ms: player.bufferedMs(),
-        });
-      }, PLAYOUT_ACK_INTERVAL_MS);
+      this.clock = this.player;
     }
     this.pingTimer = setInterval(() => {
       this.conn?.send({ type: 'ping', t: Date.now() });
@@ -294,11 +334,39 @@ export class V2Driver {
         onAudioBlocked: () => handlers.onAudioBlocked(),
       });
       mse.setMime(videoCh.mime);
+      if (videoCh.fps !== undefined && videoCh.seg_frames !== undefined) {
+        mse.setMediaUnitTiming(videoCh.fps, videoCh.seg_frames);
+      }
+      this.clock = mse;
     } else {
       // Poster mode: no video channel this session; the poster is the visual.
       if (accept.poster?.url) this.opts.videoEl.poster = accept.poster.url;
       handlers.onFirstFrame();
     }
+
+    if (this.timedUtterances && this.clock) {
+      this.scheduler = new UtteranceScheduler(this.clock, {
+        onStart: (utterance) => {
+          handlers.onUtteranceStart(utterance);
+          handlers.onSpeechStart(utterance.utteranceId);
+        },
+        onText: (utterance) => handlers.onUtteranceText(utterance),
+        onEnd: (utterance) => {
+          handlers.onUtteranceEnd(utterance);
+          handlers.onSpeechEnd(utterance.utteranceId);
+        },
+      });
+    }
+    this.ackTimer = setInterval(() => {
+      const clock = this.clock;
+      const playedPtsUs = clock?.playedPtsUs() ?? null;
+      if (!clock || playedPtsUs === null) return;
+      this.conn?.send({
+        type: 'playout_ack',
+        played_pts_us: playedPtsUs,
+        buffered_ms: clock.bufferedMs(),
+      });
+    }, PLAYOUT_ACK_INTERVAL_MS);
 
     if (this.opts.mic && this.micCh) this.startMic(this.micCh);
 
@@ -352,24 +420,37 @@ export class V2Driver {
   private onMediaFrame(frame: MediaFrame): void {
     if (this.finished) return;
     if (frame.frameType !== FrameType.MEDIA_INIT && frame.frameType !== FrameType.MEDIA) return;
-    if (this.audioCh && frame.channelId === this.audioCh.id) {
-      if (frame.payload.byteLength === 0 || frame.payload.byteLength % 2 !== 0) return;
+    const unit = this.framedMediaUnits
+      ? this.unitAssembler.push(frame)
+      : {
+          frameType: frame.frameType,
+          channelId: frame.channelId,
+          ptsUs: frame.ptsUs,
+          payload: frame.payload,
+        };
+    if (!unit) return;
+    this.onMediaUnit(unit);
+  }
+
+  private onMediaUnit(unit: MediaUnit): void {
+    if (this.audioCh && unit.channelId === this.audioCh.id) {
+      if (unit.payload.byteLength === 0 || unit.payload.byteLength % 2 !== 0) return;
       // Copy: Int16Array needs 2-byte alignment, and a subarray into the frame buffer has
       // arbitrary byteOffset.
       const pcm = new Int16Array(
-        frame.payload.buffer.slice(
-          frame.payload.byteOffset,
-          frame.payload.byteOffset + frame.payload.byteLength
+        unit.payload.buffer.slice(
+          unit.payload.byteOffset,
+          unit.payload.byteOffset + unit.payload.byteLength
         )
       );
-      this.player?.enqueue({ pcm, sampleRate: this.audioCh.sample_rate, ptsUs: frame.ptsUs });
+      this.player?.enqueue({ pcm, sampleRate: this.audioCh.sample_rate, ptsUs: unit.ptsUs });
       return;
     }
     if (
       this.mse &&
-      this.accepted?.channels.some((c) => c.kind === 'video' && c.id === frame.channelId)
+      this.accepted?.channels.some((c) => c.kind === 'video' && c.id === unit.channelId)
     ) {
-      this.mse.append(frame.payload);
+      this.mse.append(unit.payload, unit.ptsUs, unit.frameType === FrameType.MEDIA_INIT);
     }
     // Frames on undeclared/unknown channels: must-ignore.
   }
@@ -466,6 +547,18 @@ export class V2Driver {
     return mse && pcm;
   }
 
+  /** Avatar voice queued ahead of the playhead, in ms — how much is still to be heard. `null`
+   *  when this session has no playout clock to ask: a video session, whose audio is muxed into
+   *  the fMP4 and never reaches a `PcmPlayer`, or a session that has not accepted yet. `null`
+   *  means "unknown", never "nothing left", so a caller must not read it as zero. */
+  bufferedVoiceMs(): number | null {
+    return this.clock?.bufferedMs() ?? null;
+  }
+
+  playedPtsUs(): number | null {
+    return this.clock?.playedPtsUs() ?? null;
+  }
+
   /** Deliberate local end: say goodbye, close, release resources. Fires no handler — the
    *  caller (AvatarSession) already decided the outcome. */
   stop(): void {
@@ -506,5 +599,9 @@ export class V2Driver {
     this.player = null;
     this.mse?.stop();
     this.mse = null;
+    this.scheduler?.stop();
+    this.scheduler = null;
+    this.clock = null;
+    this.unitAssembler.clear();
   }
 }

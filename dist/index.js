@@ -10,7 +10,8 @@ var DEFAULTS = {
   fadeMs: 300,
   wordsPerMinute: 160,
   startTimeoutMs: 2e3,
-  tailMs: 1e3
+  tailMs: 1e3,
+  remainingVoiceMs: null
 };
 var MIN_INTERVAL_MS = 16;
 var MAX_TRACKED_SPEECHES = 16;
@@ -25,7 +26,9 @@ function resolve(base, next) {
     fadeMs: Math.max(0, next.fadeMs ?? base.fadeMs),
     wordsPerMinute: Math.max(1, next.wordsPerMinute ?? base.wordsPerMinute),
     startTimeoutMs: Math.max(0, next.startTimeoutMs ?? base.startTimeoutMs),
-    tailMs: Math.max(0, next.tailMs ?? base.tailMs)
+    tailMs: Math.max(0, next.tailMs ?? base.tailMs),
+    // `undefined` means "leave it alone", so an explicit `null` is the only way to unset.
+    remainingVoiceMs: next.remainingVoiceMs === void 0 ? base.remainingVoiceMs : next.remainingVoiceMs
   };
 }
 function tokenize(text) {
@@ -41,6 +44,8 @@ function attachCaptions(target, initial = {}) {
   let partialEl = null;
   let waiting = null;
   let reveal = null;
+  const timedLines = /* @__PURE__ */ new Map();
+  let timedMode = false;
   const after = (ms, fn) => {
     const id = setTimeout(() => {
       timers.delete(id);
@@ -84,6 +89,9 @@ function attachCaptions(target, initial = {}) {
       if (!oldest) break;
       if (oldest === partialEl) partialEl = null;
       if (oldest === reveal?.el) reveal = null;
+      for (const [id, el] of timedLines) {
+        if (el === oldest) timedLines.delete(id);
+      }
       oldest.remove();
     }
   };
@@ -113,10 +121,21 @@ function attachCaptions(target, initial = {}) {
     reveal = null;
     settle(r.el);
   };
+  const tailBudgetMs = () => {
+    const read = options.remainingVoiceMs;
+    if (!read) return options.tailMs;
+    let ms;
+    try {
+      ms = read();
+    } catch {
+      return options.tailMs;
+    }
+    return typeof ms === "number" && Number.isFinite(ms) && ms >= 0 ? ms : options.tailMs;
+  };
   const enterTail = (r) => {
     if (r.tailIntervalMs !== null) return;
     const remaining = Math.max(1, r.tokens.length - r.index);
-    r.tailIntervalMs = Math.max(MIN_INTERVAL_MS, options.tailMs / remaining);
+    r.tailIntervalMs = Math.max(MIN_INTERVAL_MS, tailBudgetMs() / remaining);
     if (r.timer === null) return;
     cancel(r.timer);
     r.timer = after(r.tailIntervalMs, step);
@@ -218,7 +237,8 @@ function attachCaptions(target, initial = {}) {
         settle(el);
       }
       const reply = turn.reply?.trim() ?? "";
-      if (reply) {
+      if (turn.timedUtterances) timedMode = true;
+      if (reply && !timedMode) {
         finishReveal();
         const state = turn.speechId ? speeches.get(turn.speechId) : void 0;
         if (state === void 0 && turn.speechId && marksSpeech) {
@@ -248,10 +268,42 @@ function attachCaptions(target, initial = {}) {
       }
       if (reveal?.speechId === speechId) enterTail(reveal);
     },
+    utteranceStart(utterance) {
+      if (destroyed || !utterance.utteranceId) return;
+      timedMode = true;
+      waiting = null;
+      finishReveal();
+      const existing = timedLines.get(utterance.utteranceId);
+      existing?.remove();
+      const text = utterance.text?.trim() ?? "";
+      const el = line("reply", text, utterance.language);
+      if (!text) el.setAttribute("aria-hidden", "true");
+      target.appendChild(el);
+      timedLines.set(utterance.utteranceId, el);
+      trim();
+      scrollToEnd();
+    },
+    utteranceText(utterance) {
+      if (destroyed) return;
+      const el = timedLines.get(utterance.utteranceId);
+      if (!el) return;
+      bodyOf(el).textContent = utterance.text ?? "";
+      if (utterance.language) el.lang = utterance.language;
+      if (utterance.text) el.removeAttribute("aria-hidden");
+      scrollToEnd();
+    },
+    utteranceEnd(utterance) {
+      if (destroyed) return;
+      const el = timedLines.get(utterance.utteranceId);
+      if (!el) return;
+      timedLines.delete(utterance.utteranceId);
+      settle(el);
+    },
     clear() {
       if (destroyed) return;
       cancelPending();
       partialEl = null;
+      timedLines.clear();
       target.replaceChildren();
     },
     update(next) {
@@ -265,6 +317,7 @@ function attachCaptions(target, initial = {}) {
       destroyed = true;
       cancelPending();
       partialEl = null;
+      timedLines.clear();
       if (attached.get(target) === controller) attached.delete(target);
       target.replaceChildren();
       target.classList.remove(BASE_CLASS);
@@ -555,6 +608,14 @@ var FrameType = {
   /** Media payload (fMP4 segment, PCM slice, data blob). */
   MEDIA: 2
 };
+var FrameFlags = {
+  /** Payload starts a keyframe-aligned group (video). */
+  KEYFRAME: 1,
+  /** Payload begins a complete codec unit (init segment, fMP4 segment, or PCM unit). */
+  UNIT_START: 2,
+  /** Payload ends a complete codec unit. A one-frame unit carries UNIT_START | UNIT_END. */
+  UNIT_END: 4
+};
 var MAX_SEQ = 4294967295;
 var MAX_PTS = BigInt(Number.MAX_SAFE_INTEGER);
 function checkRange(name, value, max) {
@@ -602,17 +663,45 @@ function decodeFrame(bytes) {
 // src/protocol/messages.ts
 var isStr = (v) => typeof v === "string";
 var isNum = (v) => typeof v === "number" && Number.isFinite(v);
+var isStrArray = (v) => Array.isArray(v) && v.every(isStr);
+var isBool = (v) => typeof v === "boolean";
+var isObj = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
+var isUInt = (v) => Number.isSafeInteger(v) && Number(v) >= 0;
+var isSeq = (v) => Number.isSafeInteger(v) && Number(v) >= 1;
+var has = (m, key) => Object.hasOwn(m, key);
+var optional = (m, key, check) => !has(m, key) || check(m[key]);
+var oneOf = (...values) => (v) => isStr(v) && values.includes(v);
+var isChannel = (v) => {
+  if (!isObj(v) || !isUInt(v.id) || v.id > 255) return false;
+  if (v.dir !== "up" && v.dir !== "down") return false;
+  if (v.kind === "audio") {
+    return v.codec === "pcm16" && isUInt(v.sample_rate) && v.sample_rate > 0 && v.channels === 1;
+  }
+  if (v.kind === "video") {
+    return v.dir === "down" && v.codec === "fmp4" && isStr(v.mime) && optional(v, "fps", (x) => isNum(x) && Number(x) > 0) && optional(v, "seg_frames", (x) => isUInt(x) && Number(x) > 0);
+  }
+  return v.kind === "data" && v.codec === "binary";
+};
 var SERVER_CHECKS = {
-  accept: (m) => isNum(m.seq) && m.proto === 2 && isStr(m.persona_key) && isNum(m.cap_seconds) && Array.isArray(m.channels),
-  partial: (m) => isNum(m.seq) && isStr(m.text),
-  turn: (m) => isNum(m.seq) && isStr(m.text) && (m.reply === null || isStr(m.reply)),
-  speech_start: (m) => isNum(m.seq) && isStr(m.speech_id),
-  speech_end: (m) => isNum(m.seq) && isStr(m.speech_id),
-  interruption: (m) => isNum(m.seq) && (m.cutoff_pts_us === null || isNum(m.cutoff_pts_us)),
-  instruction_set: (m) => isNum(m.seq),
-  error: (m) => isNum(m.seq) && isStr(m.code),
-  session_end: (m) => isNum(m.seq) && isStr(m.reason),
-  go_away: (m) => isNum(m.seq),
+  accept: (m) => isSeq(m.seq) && m.proto === 2 && isStr(m.persona_key) && isNum(m.cap_seconds) && m.cap_seconds >= 0 && Array.isArray(m.channels) && m.channels.every(isChannel) && optional(m, "features", isStrArray) && m.resume === null && optional(m, "poster", (v) => isObj(v) && isStr(v.url)),
+  partial: (m) => isSeq(m.seq) && isStr(m.text) && optional(m, "language", isStr),
+  turn: (m) => isSeq(m.seq) && isStr(m.text) && has(m, "reply") && (m.reply === null || isStr(m.reply)) && optional(m, "speech_id", isStr) && optional(m, "request_id", isStr) && optional(m, "language", isStr),
+  speech_start: (m) => isSeq(m.seq) && isStr(m.speech_id),
+  speech_end: (m) => isSeq(m.seq) && isStr(m.speech_id),
+  utterance_start: (m) => isSeq(m.seq) && isStr(m.turn_id) && isStr(m.utterance_id) && isUInt(m.start_pts_us) && isBool(m.text_final) && optional(m, "text", isStr) && optional(m, "language", isStr),
+  utterance_text: (m) => isSeq(m.seq) && isStr(m.turn_id) && isStr(m.utterance_id) && isUInt(m.revision) && isStr(m.text) && isBool(m.final),
+  utterance_end: (m) => isSeq(m.seq) && isStr(m.turn_id) && isStr(m.utterance_id) && isUInt(m.end_pts_us) && oneOf("complete", "interrupted", "replaced", "error")(m.reason),
+  interruption: (m) => {
+    if (!isSeq(m.seq) || !(m.cutoff_pts_us === null || isUInt(m.cutoff_pts_us))) return false;
+    const hasIds = has(m, "utterance_ids");
+    const hasReason = has(m, "reason");
+    if (!hasIds && !hasReason) return true;
+    return m.cutoff_pts_us !== null && hasIds && isStrArray(m.utterance_ids) && hasReason && m.reason === "barge_in";
+  },
+  instruction_set: (m) => isSeq(m.seq) && optional(m, "request_id", isStr),
+  error: (m) => isSeq(m.seq) && isStr(m.code) && optional(m, "message", isStr) && optional(m, "request_id", isStr),
+  session_end: (m) => isSeq(m.seq) && isStr(m.reason),
+  go_away: (m) => isSeq(m.seq) && optional(m, "deadline_s", isNum),
   ping: (m) => isNum(m.t),
   pong: (m) => isNum(m.t)
 };
@@ -664,6 +753,9 @@ var KNOWN = {
     "turn",
     "speech_start",
     "speech_end",
+    "utterance_start",
+    "utterance_text",
+    "utterance_end",
     "interruption",
     "instruction_set",
     "error",
@@ -722,6 +814,7 @@ var Listeners = class {
 function makeConnection(transport, role, parse2, stampSeq) {
   let state = "handshaking";
   let nextSeq = 1;
+  let lastReceivedServerSeq = 0;
   const messages = new Listeners();
   const frames = new Listeners();
   const violations = new Listeners();
@@ -731,6 +824,18 @@ function makeConnection(transport, role, parse2, stampSeq) {
     if (parsed.ok === false) {
       violations.emit({ kind: "illegal_message", detail: parsed.error, state });
       return;
+    }
+    if (role === "client" && parsed.msg.type !== "ping" && parsed.msg.type !== "pong") {
+      const seq = parsed.msg.seq;
+      if (seq <= lastReceivedServerSeq) {
+        violations.emit({
+          kind: "sequence_violation",
+          detail: `server seq ${seq} is not greater than ${lastReceivedServerSeq}`,
+          state
+        });
+        return;
+      }
+      lastReceivedServerSeq = seq;
     }
     const { next, verdict } = onReceive(role, state, parsed.msg.type);
     state = next;
@@ -806,6 +911,12 @@ var MAX_TEXT_CHARS = 2e3;
 var MAX_INSTRUCTION_CHARS = 2e3;
 var MAX_FRAME_PAYLOAD_BYTES = 64 * 1024;
 var HANDSHAKE_TIMEOUT_MS = 5e3;
+
+// src/protocol/negotiation.ts
+var Feature = {
+  UTTERANCE_TIMING_V1: "utterance_timing_v1",
+  MEDIA_UNIT_FLAGS_V1: "media_unit_flags_v1"
+};
 
 // src/protocol/transports/websocket.ts
 var READY_STATE = {
@@ -1089,6 +1200,8 @@ var MsePlayer = class {
     __publicField(this, "sb", null);
     __publicField(this, "mime", null);
     __publicField(this, "pending", []);
+    __publicField(this, "activeAppend", null);
+    __publicField(this, "discarding", false);
     __publicField(this, "sourceOpen", false);
     __publicField(this, "streaming", true);
     __publicField(this, "started", false);
@@ -1101,7 +1214,10 @@ var MsePlayer = class {
     __publicField(this, "resumeAttempts", 0);
     __publicField(this, "watchdogListeners", []);
     __publicField(this, "mediaTimeMap", new ClockMap());
+    __publicField(this, "mediaUnitDurationUs", null);
     __publicField(this, "rvfcHandle", null);
+    __publicField(this, "lastPlayedPtsUs", null);
+    __publicField(this, "advanceHandlers", /* @__PURE__ */ new Set());
   }
   static supported() {
     return getMediaSourceCtor() !== null;
@@ -1157,6 +1273,16 @@ var MsePlayer = class {
     };
     v.addEventListener("playing", onPlaying);
     this.watchdogListeners.push(["pause", onPause], ["playing", onPlaying]);
+    const onAdvance = () => {
+      if (this.video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+        this.lastPlayedPtsUs = Math.max(0, Math.round(this.video.currentTime * 1e6));
+      }
+      this.emitAdvance();
+    };
+    for (const event of ["timeupdate", "seeking", "seeked", "playing", "loadeddata"]) {
+      v.addEventListener(event, onAdvance);
+      this.watchdogListeners.push([event, onAdvance]);
+    }
     const fireFirst = () => this.fireFirstFrame();
     const fireFirstIfPlaying = () => {
       if (this.firstFrameFired) return;
@@ -1176,10 +1302,20 @@ var MsePlayer = class {
     this.trySetup();
   }
   /** Append one fMP4 payload (init segment or media segment, in wire order). */
-  append(bytes) {
+  append(bytes, ptsUs = 0, init = false) {
     if (this.closed) return;
-    this.pending.push(bytes.slice());
+    const copy = new Uint8Array(new ArrayBuffer(bytes.byteLength));
+    copy.set(bytes);
+    this.pending.push({ bytes: copy, ptsUs, init });
     this.drain();
+  }
+  /** Nominal complete-unit duration from the negotiated video channel descriptor. The rollout
+   *  intentionally leaves duration out of the binary header, so this is what lets interruption
+   *  reject a queued unit whose start precedes, but whose tail crosses, the cutoff. */
+  setMediaUnitTiming(fps, segmentFrames) {
+    if (Number.isFinite(fps) && fps > 0 && Number.isInteger(segmentFrames) && segmentFrames > 0) {
+      this.mediaUnitDurationUs = Math.round(segmentFrames / fps * 1e6);
+    }
   }
   /** Re-arms itself each callback (rVFC only fires once per registration) to keep sampling the
    *  mediaTime <-> performanceTime relationship for the life of playback. No-op where unsupported
@@ -1190,6 +1326,8 @@ var MsePlayer = class {
     this.rvfcHandle = this.video.requestVideoFrameCallback((_now, metadata) => {
       if (this.closed) return;
       this.mediaTimeMap.record(metadata.expectedDisplayTime, metadata.mediaTime * 1e3);
+      this.lastPlayedPtsUs = Math.max(0, Math.round(metadata.mediaTime * 1e6));
+      this.emitAdvance();
       this.scheduleFrameCallback();
     });
   }
@@ -1198,6 +1336,69 @@ var MsePlayer = class {
    *  change handling). Returns null before the first displayed frame. */
   mediaTimeAt(performanceTimeMs) {
     return this.mediaTimeMap.at(performanceTimeMs);
+  }
+  playedPtsUs() {
+    if (this.lastPlayedPtsUs !== null) return this.lastPlayedPtsUs;
+    if (this.video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) return null;
+    const current = this.video.currentTime;
+    return Number.isFinite(current) ? Math.max(0, Math.round(current * 1e6)) : null;
+  }
+  bufferedMs() {
+    const buffered = this.video.buffered;
+    if (!buffered.length) return 0;
+    try {
+      return Math.max(
+        0,
+        Math.round((buffered.end(buffered.length - 1) - this.video.currentTime) * 1e3)
+      );
+    } catch {
+      return 0;
+    }
+  }
+  onAdvance(handler) {
+    this.advanceHandlers.add(handler);
+    return () => this.advanceHandlers.delete(handler);
+  }
+  /** Remove queued and MSE-buffered media at/after the server-timeline cutoff. */
+  async discardFrom(cutoffPtsUs) {
+    const retained = (entry) => {
+      if (entry.init) return true;
+      if (this.mediaUnitDurationUs === null) return false;
+      return entry.ptsUs + this.mediaUnitDurationUs <= cutoffPtsUs;
+    };
+    this.pending.splice(0, this.pending.length, ...this.pending.filter(retained));
+    const sb = this.sb;
+    if (!sb) {
+      this.emitAdvance();
+      return;
+    }
+    this.discarding = true;
+    const activeCrossesCutoff = this.activeAppend !== null && !this.activeAppend.init && (this.mediaUnitDurationUs === null || this.activeAppend.ptsUs + this.mediaUnitDurationUs > cutoffPtsUs);
+    if (activeCrossesCutoff && sb.updating) {
+      try {
+        sb.abort();
+      } catch {
+      }
+      this.activeAppend = null;
+    }
+    await this.waitForIdle(sb);
+    const cutoffSec = cutoffPtsUs / 1e6;
+    if (sb.buffered.length) {
+      const end = sb.buffered.end(sb.buffered.length - 1);
+      if (end > cutoffSec) {
+        const start = Math.max(cutoffSec, sb.buffered.start(0));
+        if (end > start) {
+          try {
+            sb.remove(start, end);
+            await this.waitForIdle(sb);
+          } catch {
+          }
+        }
+      }
+    }
+    this.discarding = false;
+    this.drain();
+    this.emitAdvance();
   }
   setAudioBlocked() {
     if (this.audioBlocked) return;
@@ -1225,7 +1426,10 @@ var MsePlayer = class {
     try {
       const sb = this.ms.addSourceBuffer(this.mime);
       sb.mode = "segments";
-      sb.addEventListener("updateend", () => this.drain());
+      sb.addEventListener("updateend", () => {
+        this.activeAppend = null;
+        if (!this.discarding) this.drain();
+      });
       this.sb = sb;
       this.drain();
     } catch (e) {
@@ -1234,14 +1438,15 @@ var MsePlayer = class {
   }
   drain() {
     const sb = this.sb;
-    if (!sb || sb.updating || !this.streaming) return;
+    if (!sb || sb.updating || !this.streaming || this.discarding) return;
     const next = this.pending.shift();
     if (next === void 0) {
       this.housekeep(false);
       return;
     }
     try {
-      sb.appendBuffer(next);
+      this.activeAppend = next;
+      sb.appendBuffer(next.bytes);
       if (!this.started) {
         this.started = true;
         this.video.muted = true;
@@ -1277,6 +1482,7 @@ var MsePlayer = class {
       }
     } catch (e) {
       if (e instanceof DOMException && e.name === "QuotaExceededError") {
+        this.activeAppend = null;
         this.pending.unshift(next);
         this.housekeep(true);
       } else {
@@ -1334,18 +1540,37 @@ var MsePlayer = class {
     } catch {
     }
     this.pending.length = 0;
+    this.activeAppend = null;
     this.sb = null;
     this.ms = null;
     for (const [ev, fn] of this.watchdogListeners) {
       this.video.removeEventListener(ev, fn);
     }
     this.watchdogListeners = [];
+    this.advanceHandlers.clear();
     try {
       this.video.removeAttribute("src");
       this.video.srcObject = null;
       this.video.load();
     } catch {
     }
+  }
+  emitAdvance() {
+    for (const handler of this.advanceHandlers) handler();
+  }
+  waitForIdle(sb) {
+    if (!sb.updating) return Promise.resolve();
+    return new Promise((resolve3) => {
+      const done = () => {
+        sb.removeEventListener("updateend", done);
+        sb.removeEventListener("abort", done);
+        sb.removeEventListener("error", done);
+        resolve3();
+      };
+      sb.addEventListener("updateend", done, { once: true });
+      sb.addEventListener("abort", done, { once: true });
+      sb.addEventListener("error", done, { once: true });
+    });
   }
 };
 
@@ -1385,6 +1610,57 @@ var StateMachine = class {
   }
 };
 
+// src/media-unit-assembler.ts
+var MediaUnitAssembler = class {
+  constructor() {
+    __publicField(this, "partial", /* @__PURE__ */ new Map());
+  }
+  push(frame) {
+    const starts = Boolean(frame.flags & FrameFlags.UNIT_START);
+    const ends = Boolean(frame.flags & FrameFlags.UNIT_END);
+    let unit = this.partial.get(frame.channelId);
+    if (starts) {
+      unit = {
+        frameType: frame.frameType,
+        channelId: frame.channelId,
+        ptsUs: frame.ptsUs,
+        chunks: [],
+        bytes: 0
+      };
+      this.partial.set(frame.channelId, unit);
+    } else if (!unit) {
+      return null;
+    }
+    if (unit.frameType !== frame.frameType || unit.channelId !== frame.channelId || unit.ptsUs !== frame.ptsUs) {
+      this.partial.delete(frame.channelId);
+      return null;
+    }
+    const chunk = frame.payload.slice();
+    unit.chunks.push(chunk);
+    unit.bytes += chunk.byteLength;
+    if (!ends) return null;
+    this.partial.delete(frame.channelId);
+    const payload = new Uint8Array(unit.bytes);
+    let offset = 0;
+    for (const part of unit.chunks) {
+      payload.set(part, offset);
+      offset += part.byteLength;
+    }
+    return {
+      frameType: unit.frameType,
+      channelId: unit.channelId,
+      ptsUs: unit.ptsUs,
+      payload
+    };
+  }
+  discardFrom(cutoffPtsUs) {
+    this.partial.clear();
+  }
+  clear() {
+    this.partial.clear();
+  }
+};
+
 // src/pcm-player.ts
 var PcmPlayer = class {
   constructor(onBlocked) {
@@ -1394,6 +1670,8 @@ var PcmPlayer = class {
     __publicField(this, "scheduled", /* @__PURE__ */ new Set());
     __publicField(this, "lastEndedPtsUs", 0);
     __publicField(this, "blocked", false);
+    __publicField(this, "advanceHandlers", /* @__PURE__ */ new Set());
+    __publicField(this, "advanceTimer", null);
   }
   enqueue(frame) {
     if (frame.pcm.length === 0 || frame.sampleRate <= 0) return;
@@ -1418,10 +1696,12 @@ var PcmPlayer = class {
           entry.ptsUs + entry.durationSec * 1e6
         );
       }
+      this.emitAdvance();
     });
     this.scheduled.add(entry);
     source.start(startAt);
     this.nextStart = startAt + audio.duration;
+    this.emitAdvance();
     if (ctx.state === "suspended") {
       void ctx.resume().catch(() => {
         if (!this.blocked) {
@@ -1431,18 +1711,32 @@ var PcmPlayer = class {
       });
     }
   }
-  /** Stop every scheduled source whose frame starts at/after `cutoffUs` on the session clock
-   *  (the interruption contract: the user has not heard past the cutoff, so drop it). */
+  /** Stop queued frames and trim a source whose samples straddle the exact cutoff. */
   flushFrom(cutoffUs) {
     for (const entry of [...this.scheduled]) {
-      if (entry.ptsUs < cutoffUs) continue;
+      const endPtsUs = entry.ptsUs + entry.durationSec * 1e6;
+      if (endPtsUs <= cutoffUs) continue;
+      if (entry.ptsUs >= cutoffUs) {
+        try {
+          entry.source.stop();
+        } catch {
+        }
+        this.scheduled.delete(entry);
+        continue;
+      }
+      const keptSec = Math.max(0, (cutoffUs - entry.ptsUs) / 1e6);
+      entry.durationSec = keptSec;
+      const stopAt = entry.startCtxTime + keptSec;
       try {
-        entry.source.stop();
+        entry.source.stop(Math.max(this.ctx?.currentTime ?? stopAt, stopAt));
       } catch {
       }
-      this.scheduled.delete(entry);
     }
     this.recomputeNextStart();
+    this.emitAdvance();
+  }
+  async discardFrom(cutoffPtsUs) {
+    this.flushFrom(cutoffPtsUs);
   }
   flush() {
     for (const entry of this.scheduled) {
@@ -1453,18 +1747,21 @@ var PcmPlayer = class {
     }
     this.scheduled.clear();
     this.nextStart = this.ctx?.currentTime ?? 0;
+    this.emitAdvance();
   }
   /** Session-clock position (µs) of what the speaker is emitting right now: interpolated inside
    *  the currently playing source, else the end of the last finished one. */
   playedPtsUs() {
     const now = this.ctx?.currentTime ?? 0;
     let played = this.lastEndedPtsUs;
+    let hasPlayhead = this.lastEndedPtsUs > 0;
     for (const entry of this.scheduled) {
       if (entry.startCtxTime > now) continue;
+      hasPlayhead = true;
       const into = Math.min(now - entry.startCtxTime, entry.durationSec);
       played = Math.max(played, entry.ptsUs + into * 1e6);
     }
-    return Math.round(played);
+    return hasPlayhead ? Math.round(played) : null;
   }
   /** Audio queued ahead of the playhead, in ms. */
   bufferedMs() {
@@ -1480,6 +1777,9 @@ var PcmPlayer = class {
   }
   stop() {
     this.flush();
+    if (this.advanceTimer) clearInterval(this.advanceTimer);
+    this.advanceTimer = null;
+    this.advanceHandlers.clear();
     void this.ctx?.close().catch(() => {
     });
     this.ctx = null;
@@ -1495,6 +1795,138 @@ var PcmPlayer = class {
   ensureContext() {
     if (!this.ctx) this.ctx = new AudioContext();
     return this.ctx;
+  }
+  onAdvance(handler) {
+    this.advanceHandlers.add(handler);
+    if (!this.advanceTimer) {
+      this.advanceTimer = setInterval(() => this.emitAdvance(), 16);
+    }
+    return () => {
+      this.advanceHandlers.delete(handler);
+      if (this.advanceHandlers.size === 0 && this.advanceTimer) {
+        clearInterval(this.advanceTimer);
+        this.advanceTimer = null;
+      }
+    };
+  }
+  emitAdvance() {
+    for (const handler of this.advanceHandlers) handler();
+  }
+};
+
+// src/utterance-scheduler.ts
+var UtteranceScheduler = class {
+  constructor(clock, handlers) {
+    this.clock = clock;
+    this.handlers = handlers;
+    __publicField(this, "entries", /* @__PURE__ */ new Map());
+    __publicField(this, "cancelled", /* @__PURE__ */ new Set());
+    __publicField(this, "activeId", null);
+    __publicField(this, "unsubscribe");
+    __publicField(this, "stopped", false);
+    this.unsubscribe = clock.onAdvance(() => this.advance());
+  }
+  receiveStart(message) {
+    if (this.stopped || this.cancelled.has(message.utterance_id)) return;
+    const previous = this.entries.get(message.utterance_id);
+    if (previous?.status === "active") return;
+    this.entries.set(message.utterance_id, {
+      turnId: message.turn_id,
+      utteranceId: message.utterance_id,
+      startPtsUs: message.start_pts_us,
+      text: message.text,
+      textFinal: message.text_final,
+      language: message.language,
+      revision: previous?.revision ?? -1,
+      endPtsUs: previous?.endPtsUs,
+      reason: previous?.reason,
+      status: "pending"
+    });
+  }
+  receiveText(message) {
+    if (this.stopped || this.cancelled.has(message.utterance_id)) return;
+    const entry = this.entries.get(message.utterance_id);
+    if (!entry || entry.turnId !== message.turn_id || message.revision <= entry.revision) return;
+    entry.revision = message.revision;
+    entry.text = message.text;
+    entry.textFinal = message.final;
+    if (entry.status === "active") this.handlers.onText(this.snapshot(entry));
+  }
+  receiveEnd(message) {
+    if (this.stopped || this.cancelled.has(message.utterance_id)) return;
+    const entry = this.entries.get(message.utterance_id);
+    if (!entry || entry.turnId !== message.turn_id) return;
+    entry.endPtsUs = message.end_pts_us;
+    entry.reason = message.reason;
+  }
+  /** Cancel unheard affected cues and close a visible utterance at the local cutoff playhead. */
+  interrupt(cutoffPtsUs, utteranceIds) {
+    if (this.stopped) return;
+    const affected = new Set(utteranceIds);
+    for (const utteranceId of affected) {
+      this.cancelled.add(utteranceId);
+      const entry = this.entries.get(utteranceId);
+      if (!entry) continue;
+      if (entry.status === "active") {
+        entry.endPtsUs = cutoffPtsUs;
+        entry.reason = "interrupted";
+        continue;
+      }
+      this.entries.delete(utteranceId);
+    }
+    this.advance();
+  }
+  advance() {
+    if (this.stopped) return;
+    const played = this.clock.playedPtsUs();
+    if (played === null) return;
+    const active = this.activeId ? this.entries.get(this.activeId) : void 0;
+    if (active?.endPtsUs !== void 0 && played >= active.endPtsUs) {
+      this.handlers.onEnd(this.snapshot(active));
+      this.entries.delete(active.utteranceId);
+      this.activeId = null;
+    }
+    for (const [id, entry] of this.entries) {
+      if (entry.status === "pending" && entry.endPtsUs !== void 0 && played >= entry.endPtsUs) {
+        this.entries.delete(id);
+      }
+    }
+    const candidates = [...this.entries.values()].filter(
+      (entry) => entry.status === "pending" && played >= entry.startPtsUs && (entry.endPtsUs === void 0 || played < entry.endPtsUs)
+    ).sort((a, b) => a.startPtsUs - b.startPtsUs);
+    const next = candidates.at(-1);
+    if (!next) return;
+    const prior = this.activeId ? this.entries.get(this.activeId) : void 0;
+    if (prior && prior.utteranceId !== next.utteranceId) {
+      prior.reason ?? (prior.reason = "replaced");
+      prior.endPtsUs ?? (prior.endPtsUs = next.startPtsUs);
+      this.handlers.onEnd(this.snapshot(prior));
+      this.entries.delete(prior.utteranceId);
+    }
+    next.status = "active";
+    this.activeId = next.utteranceId;
+    this.handlers.onStart(this.snapshot(next));
+  }
+  stop() {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.unsubscribe();
+    this.entries.clear();
+    this.cancelled.clear();
+    this.activeId = null;
+  }
+  snapshot(entry) {
+    return {
+      turnId: entry.turnId,
+      utteranceId: entry.utteranceId,
+      startPtsUs: entry.startPtsUs,
+      ...entry.endPtsUs === void 0 ? {} : { endPtsUs: entry.endPtsUs },
+      ...entry.text === void 0 ? {} : { text: entry.text },
+      textFinal: entry.textFinal,
+      ...entry.language === void 0 ? {} : { language: entry.language },
+      revision: entry.revision,
+      ...entry.reason === void 0 ? {} : { reason: entry.reason }
+    };
   }
 };
 
@@ -1525,12 +1957,17 @@ var V2Driver = class {
     __publicField(this, "conn", null);
     __publicField(this, "mse", null);
     __publicField(this, "player", null);
+    __publicField(this, "clock", null);
+    __publicField(this, "scheduler", null);
+    __publicField(this, "unitAssembler", new MediaUnitAssembler());
     __publicField(this, "pipeline", null);
     __publicField(this, "accepted", null);
     __publicField(this, "audioCh", null);
     __publicField(this, "micCh", null);
     __publicField(this, "endReason", null);
     __publicField(this, "finished", false);
+    __publicField(this, "timedUtterances", false);
+    __publicField(this, "framedMediaUnits", false);
     __publicField(this, "handshakeTimer", null);
     __publicField(this, "ackTimer", null);
     __publicField(this, "pingTimer", null);
@@ -1569,7 +2006,9 @@ var V2Driver = class {
         },
         ...opts.mic ? { mic: { codec: "pcm16", sample_rate: 16e3 } } : {},
         ...this.langs.length ? { langs: this.langs } : {},
-        ...this.responseLanguage !== void 0 ? { response_language: this.responseLanguage } : {}
+        ...this.responseLanguage !== void 0 ? { response_language: this.responseLanguage } : {},
+        features: [Feature.UTTERANCE_TIMING_V1, Feature.MEDIA_UNIT_FLAGS_V1],
+        resume: null
       });
       this.handshakeTimer = setTimeout(() => {
         this.fail(new Error("handshake timeout: no accept from the box"), "handshake");
@@ -1596,7 +2035,8 @@ var V2Driver = class {
           text: msg.text,
           reply: msg.reply ?? "",
           language: msg.language,
-          speechId: msg.speech_id
+          speechId: msg.speech_id,
+          ...this.timedUtterances ? { timedUtterances: true } : {}
         };
         const waiter = msg.request_id ? this.textWaiters.get(msg.request_id) : void 0;
         if (waiter && msg.request_id) {
@@ -1609,14 +2049,39 @@ var V2Driver = class {
         break;
       }
       case "speech_start":
-        this.opts.handlers.onSpeechStart(msg.speech_id);
+        if (!this.timedUtterances) this.opts.handlers.onSpeechStart(msg.speech_id);
         break;
       case "speech_end":
-        this.opts.handlers.onSpeechEnd(msg.speech_id);
+        if (!this.timedUtterances) this.opts.handlers.onSpeechEnd(msg.speech_id);
+        break;
+      case "utterance_start":
+        if (this.timedUtterances) this.scheduler?.receiveStart(msg);
+        break;
+      case "utterance_text":
+        if (this.timedUtterances) this.scheduler?.receiveText(msg);
+        break;
+      case "utterance_end":
+        if (this.timedUtterances) this.scheduler?.receiveEnd(msg);
         break;
       case "interruption":
-        if (msg.cutoff_pts_us === null) this.player?.flush();
-        else this.player?.flushFrom(msg.cutoff_pts_us);
+        if (msg.cutoff_pts_us === null) {
+          this.player?.flush();
+          const cutoff = this.clock?.playedPtsUs() ?? 0;
+          this.unitAssembler.discardFrom(cutoff);
+          if (this.mse) {
+            void this.mse.discardFrom(cutoff).then(() => this.opts.handlers.onMediaDiscarded(cutoff));
+          } else {
+            this.opts.handlers.onMediaDiscarded(cutoff);
+          }
+        } else {
+          this.unitAssembler.discardFrom(msg.cutoff_pts_us);
+          const cutoff = msg.cutoff_pts_us;
+          const discarded = this.clock?.discardFrom(cutoff) ?? Promise.resolve();
+          void discarded.then(() => this.opts.handlers.onMediaDiscarded(cutoff));
+          if ("utterance_ids" in msg) {
+            this.scheduler?.interrupt(msg.cutoff_pts_us, msg.utterance_ids);
+          }
+        }
         break;
       case "instruction_set":
         break;
@@ -1650,6 +2115,9 @@ var V2Driver = class {
       this.handshakeTimer = null;
     }
     this.accepted = accept;
+    const acceptedFeatures = accept.features ?? [];
+    this.timedUtterances = acceptedFeatures.includes(Feature.UTTERANCE_TIMING_V1);
+    this.framedMediaUnits = acceptedFeatures.includes(Feature.MEDIA_UNIT_FLAGS_V1);
     const { handlers } = this.opts;
     const channels = accept.channels;
     const videoCh = channels.find((c) => c.kind === "video");
@@ -1657,15 +2125,7 @@ var V2Driver = class {
     this.micCh = channels.find((c) => c.kind === "audio" && c.dir === "up") ?? null;
     if (this.audioCh) {
       this.player = new PcmPlayer(() => handlers.onAudioBlocked());
-      this.ackTimer = setInterval(() => {
-        const player = this.player;
-        if (!player) return;
-        this.conn?.send({
-          type: "playout_ack",
-          played_pts_us: player.playedPtsUs(),
-          buffered_ms: player.bufferedMs()
-        });
-      }, PLAYOUT_ACK_INTERVAL_MS);
+      this.clock = this.player;
     }
     this.pingTimer = setInterval(() => {
       this.conn?.send({ type: "ping", t: Date.now() });
@@ -1679,10 +2139,37 @@ var V2Driver = class {
         onAudioBlocked: () => handlers.onAudioBlocked()
       });
       mse.setMime(videoCh.mime);
+      if (videoCh.fps !== void 0 && videoCh.seg_frames !== void 0) {
+        mse.setMediaUnitTiming(videoCh.fps, videoCh.seg_frames);
+      }
+      this.clock = mse;
     } else {
       if (accept.poster?.url) this.opts.videoEl.poster = accept.poster.url;
       handlers.onFirstFrame();
     }
+    if (this.timedUtterances && this.clock) {
+      this.scheduler = new UtteranceScheduler(this.clock, {
+        onStart: (utterance) => {
+          handlers.onUtteranceStart(utterance);
+          handlers.onSpeechStart(utterance.utteranceId);
+        },
+        onText: (utterance) => handlers.onUtteranceText(utterance),
+        onEnd: (utterance) => {
+          handlers.onUtteranceEnd(utterance);
+          handlers.onSpeechEnd(utterance.utteranceId);
+        }
+      });
+    }
+    this.ackTimer = setInterval(() => {
+      const clock = this.clock;
+      const playedPtsUs = clock?.playedPtsUs() ?? null;
+      if (!clock || playedPtsUs === null) return;
+      this.conn?.send({
+        type: "playout_ack",
+        played_pts_us: playedPtsUs,
+        buffered_ms: clock.bufferedMs()
+      });
+    }, PLAYOUT_ACK_INTERVAL_MS);
     if (this.opts.mic && this.micCh) this.startMic(this.micCh);
     handlers.onAccept({
       capSeconds: accept.cap_seconds,
@@ -1723,19 +2210,29 @@ var V2Driver = class {
   onMediaFrame(frame) {
     if (this.finished) return;
     if (frame.frameType !== FrameType.MEDIA_INIT && frame.frameType !== FrameType.MEDIA) return;
-    if (this.audioCh && frame.channelId === this.audioCh.id) {
-      if (frame.payload.byteLength === 0 || frame.payload.byteLength % 2 !== 0) return;
+    const unit = this.framedMediaUnits ? this.unitAssembler.push(frame) : {
+      frameType: frame.frameType,
+      channelId: frame.channelId,
+      ptsUs: frame.ptsUs,
+      payload: frame.payload
+    };
+    if (!unit) return;
+    this.onMediaUnit(unit);
+  }
+  onMediaUnit(unit) {
+    if (this.audioCh && unit.channelId === this.audioCh.id) {
+      if (unit.payload.byteLength === 0 || unit.payload.byteLength % 2 !== 0) return;
       const pcm = new Int16Array(
-        frame.payload.buffer.slice(
-          frame.payload.byteOffset,
-          frame.payload.byteOffset + frame.payload.byteLength
+        unit.payload.buffer.slice(
+          unit.payload.byteOffset,
+          unit.payload.byteOffset + unit.payload.byteLength
         )
       );
-      this.player?.enqueue({ pcm, sampleRate: this.audioCh.sample_rate, ptsUs: frame.ptsUs });
+      this.player?.enqueue({ pcm, sampleRate: this.audioCh.sample_rate, ptsUs: unit.ptsUs });
       return;
     }
-    if (this.mse && this.accepted?.channels.some((c) => c.kind === "video" && c.id === frame.channelId)) {
-      this.mse.append(frame.payload);
+    if (this.mse && this.accepted?.channels.some((c) => c.kind === "video" && c.id === unit.channelId)) {
+      this.mse.append(unit.payload, unit.ptsUs, unit.frameType === FrameType.MEDIA_INIT);
     }
   }
   onSocketClose(code) {
@@ -1821,6 +2318,16 @@ var V2Driver = class {
     const pcm = this.player?.unmute() ?? true;
     return mse && pcm;
   }
+  /** Avatar voice queued ahead of the playhead, in ms — how much is still to be heard. `null`
+   *  when this session has no playout clock to ask: a video session, whose audio is muxed into
+   *  the fMP4 and never reaches a `PcmPlayer`, or a session that has not accepted yet. `null`
+   *  means "unknown", never "nothing left", so a caller must not read it as zero. */
+  bufferedVoiceMs() {
+    return this.clock?.bufferedMs() ?? null;
+  }
+  playedPtsUs() {
+    return this.clock?.playedPtsUs() ?? null;
+  }
   /** Deliberate local end: say goodbye, close, release resources. Fires no handler — the
    *  caller (AvatarSession) already decided the outcome. */
   stop() {
@@ -1858,6 +2365,10 @@ var V2Driver = class {
     this.player = null;
     this.mse?.stop();
     this.mse = null;
+    this.scheduler?.stop();
+    this.scheduler = null;
+    this.clock = null;
+    this.unitAssembler.clear();
   }
 };
 
@@ -1935,6 +2446,18 @@ var AvatarSession = class {
           break;
         case "speechEnd":
           cb?.onSpeechEnd?.(...args);
+          break;
+        case "utteranceStart":
+          cb?.onUtteranceStart?.(...args);
+          break;
+        case "utteranceText":
+          cb?.onUtteranceText?.(...args);
+          break;
+        case "utteranceEnd":
+          cb?.onUtteranceEnd?.(...args);
+          break;
+        case "mediaDiscarded":
+          cb?.onMediaDiscarded?.(...args);
           break;
         case "audioFrameSent":
           cb?.onAudioFrameSent?.(...args);
@@ -2092,6 +2615,18 @@ var AvatarSession = class {
         onSpeechEnd: (id) => {
           if (!this.done) this.emit("speechEnd", id);
         },
+        onUtteranceStart: (utterance) => {
+          if (!this.done) this.emit("utteranceStart", utterance);
+        },
+        onUtteranceText: (utterance) => {
+          if (!this.done) this.emit("utteranceText", utterance);
+        },
+        onUtteranceEnd: (utterance) => {
+          if (!this.done) this.emit("utteranceEnd", utterance);
+        },
+        onMediaDiscarded: (cutoffPtsUs) => {
+          if (!this.done) this.emit("mediaDiscarded", cutoffPtsUs);
+        },
         onAudioFrameSent: (info) => {
           if (!this.done) this.emit("audioFrameSent", info);
         },
@@ -2165,6 +2700,18 @@ var AvatarSession = class {
    *  audio is now unblocked. Pair with callbacks.onAudioBlocked. */
   unmuteAudio() {
     return this.driver?.unmuteAudio() ?? true;
+  }
+  /** Avatar voice still queued to play, in ms, or `null` when this session has no playout clock
+   *  to ask — a video session or one that has not accepted yet. `null` is "unknown", not "none".
+   *
+   *  Intended for `attachCaptions`'s `remainingVoiceMs`, which needs to know how much voice is
+   *  left when an utterance ends so it can time the words it has not revealed yet. */
+  bufferedVoiceMs() {
+    return this.driver?.bufferedVoiceMs() ?? null;
+  }
+  /** Current local playout position on the server media timeline. Null before playback starts. */
+  playedPtsUs() {
+    return this.driver?.playedPtsUs() ?? null;
   }
   /** Call synchronously inside the click/tap handler that starts a call, BEFORE any await:
    *  a user-gestured play()/load() clears WebKit's per-element gesture restrictions so the
@@ -2545,6 +3092,7 @@ export {
   CloseCode,
   SESSION_UI_CSS,
   SUBPROTOCOL,
+  UtteranceScheduler,
   adoptSessionUIStyles,
   attachCaptions,
   attachDisclosure,

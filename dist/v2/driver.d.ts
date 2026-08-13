@@ -1,12 +1,15 @@
 import { AvatarError } from '../errors';
 import { type MicFrameInfo } from '../mic-pipeline';
 import { type WebSocketLike } from '../protocol';
+import { type TimedUtterance } from '../utterance-scheduler';
 export type EndReason = 'cap' | 'edge_disconnect' | 'kicked' | 'expired' | 'dropped' | 'generic';
 export interface Turn {
     text: string;
     reply: string;
     language?: string;
     speechId?: string;
+    /** True when assistant caption visibility comes from timed utterance callbacks, not turn.reply. */
+    timedUtterances?: boolean;
 }
 /** The socket the driver opens. Browser `WebSocket` satisfies this; tests inject a fake. */
 export interface DriverSocket extends WebSocketLike {
@@ -26,6 +29,10 @@ export interface V2DriverHandlers {
     onTurn(turn: Turn): void;
     onSpeechStart(speechId: string): void;
     onSpeechEnd(speechId: string): void;
+    onUtteranceStart(utterance: TimedUtterance): void;
+    onUtteranceText(utterance: TimedUtterance): void;
+    onUtteranceEnd(utterance: TimedUtterance): void;
+    onMediaDiscarded(cutoffPtsUs: number): void;
     onAudioFrameSent(info: MicFrameInfo): void;
     onAudioBlocked(): void;
     /** The session is over after a successful handshake — server end or transport loss. */
@@ -59,12 +66,17 @@ export declare class V2Driver {
     private conn;
     private mse;
     private player;
+    private clock;
+    private scheduler;
+    private readonly unitAssembler;
     private pipeline;
     private accepted;
     private audioCh;
     private micCh;
     private endReason;
     private finished;
+    private timedUtterances;
+    private framedMediaUnits;
     private handshakeTimer;
     private ackTimer;
     private pingTimer;
@@ -79,6 +91,7 @@ export declare class V2Driver {
     private startMic;
     private sendMicFrame;
     private onMediaFrame;
+    private onMediaUnit;
     private onSocketClose;
     private fail;
     sendText(text: string): Promise<Turn>;
@@ -90,6 +103,12 @@ export declare class V2Driver {
     setRuntimeInstruction(instruction: string): void;
     setMuted(muted: boolean): void;
     unmuteAudio(): boolean;
+    /** Avatar voice queued ahead of the playhead, in ms — how much is still to be heard. `null`
+     *  when this session has no playout clock to ask: a video session, whose audio is muxed into
+     *  the fMP4 and never reaches a `PcmPlayer`, or a session that has not accepted yet. `null`
+     *  means "unknown", never "nothing left", so a caller must not read it as zero. */
+    bufferedVoiceMs(): number | null;
+    playedPtsUs(): number | null;
     /** Deliberate local end: say goodbye, close, release resources. Fires no handler — the
      *  caller (AvatarSession) already decided the outcome. */
     stop(): void;

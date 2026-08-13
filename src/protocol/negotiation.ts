@@ -5,6 +5,11 @@ import { Channel } from './channels';
 import { ErrorCode } from './codes';
 import type { AcceptMessage, HelloMessage } from './messages';
 
+export const Feature = {
+  UTTERANCE_TIMING_V1: 'utterance_timing_v1',
+  MEDIA_UNIT_FLAGS_V1: 'media_unit_flags_v1',
+} as const;
+
 /**
  * hello → accept negotiation, server side. Pure: the caller supplies what the session can offer
  * (from the JWT + its own capabilities) and gets back either the accept body (minus `seq`, which
@@ -33,7 +38,7 @@ export function negotiateAccept(hello: HelloMessage, offer: SessionOffer): Negot
   const acceptsAudio = hello.accept.audio?.includes('pcm16') ?? false;
   const acceptsVideo = hello.accept.video?.includes('fmp4') ?? false;
 
-  if (offer.audio && !acceptsAudio) {
+  if (offer.audio && !acceptsAudio && !(offer.video && acceptsVideo)) {
     return {
       ok: false,
       code: ErrorCode.UNSUPPORTED_CODEC,
@@ -42,7 +47,20 @@ export function negotiateAccept(hello: HelloMessage, offer: SessionOffer): Negot
   }
 
   const channels: ChannelDescriptor[] = [];
-  if (offer.mic) {
+  if (hello.mic) {
+    if (
+      hello.mic.codec !== 'pcm16' ||
+      !Number.isSafeInteger(hello.mic.sample_rate) ||
+      hello.mic.sample_rate <= 0 ||
+      !offer.mic ||
+      hello.mic.sample_rate !== offer.mic.sampleRate
+    ) {
+      return {
+        ok: false,
+        code: ErrorCode.UNSUPPORTED_CODEC,
+        message: 'unsupported microphone format',
+      };
+    }
     const mic: AudioChannelDescriptor = {
       id: Channel.MIC_UPLINK,
       dir: 'up',
@@ -96,7 +114,9 @@ export function negotiateAccept(hello: HelloMessage, offer: SessionOffer): Negot
       cap_seconds: offer.capSeconds,
       channels,
       ...(!videoOffered && offer.poster ? { poster: { url: offer.poster.url } } : {}),
-      features: offer.features ?? [],
+      features: [...new Set(offer.features ?? [])].filter((feature) =>
+        (hello.features ?? []).includes(feature)
+      ),
       resume: null,
     },
   };

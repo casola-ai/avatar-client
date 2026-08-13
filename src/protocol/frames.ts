@@ -26,6 +26,10 @@ export const FRAME_TYPE_EXPERIMENTAL_MIN = 0x80;
 export const FrameFlags = {
   /** Payload starts a keyframe-aligned group (video). */
   KEYFRAME: 0x0001,
+  /** Payload begins a complete codec unit (init segment, fMP4 segment, or PCM unit). */
+  UNIT_START: 0x0002,
+  /** Payload ends a complete codec unit. A one-frame unit carries UNIT_START | UNIT_END. */
+  UNIT_END: 0x0004,
 } as const;
 
 export const MAX_SEQ = 0xffff_ffff;

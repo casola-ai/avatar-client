@@ -16,6 +16,7 @@ export type { DisclosureController, DisclosureOptions } from './disclosure';
 export { attachDisclosure } from './disclosure';
 export type { AvatarErrorKind } from './errors';
 export { AvatarError, classifyMicError, isMicError } from './errors';
+export type { PlayoutClock } from './playout-clock';
 // Wire identifiers, for advanced integrations (custom ConnectStrategy / diagnostics).
 export { CloseCode, SUBPROTOCOL } from './protocol';
 export type {
@@ -35,3 +36,5 @@ export type { SessionUIController, SessionUIOptions, SessionUIPart } from './ses
 export { attachSessionUI } from './session-ui';
 export type { Listener, WidgetState } from './state';
 export { adoptSessionUIStyles, SESSION_UI_CSS } from './styles';
+export type { TimedUtterance, UtteranceSchedulerHandlers } from './utterance-scheduler';
+export { UtteranceScheduler } from './utterance-scheduler';

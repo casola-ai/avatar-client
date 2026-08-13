@@ -14,8 +14,10 @@
  *  - reply held for its `speech_start` — the real audio onset — when the box marks utterances,
  *    with `startTimeoutMs` as the backstop for a marker that never lands;
  *  - never held at all when the box has sent no marker this session (nothing to wait for);
- *  - `speech_end` retimes the remaining words to finish inside `tailMs`, so the text cannot
- *    keep crawling after the voice has stopped;
+ *  - `speech_end` retimes the remaining words to finish inside the voice that is left, so the
+ *    text cannot keep crawling after the speaker has stopped. That marker means the box stopped
+ *    *producing* audio, not that the user stopped hearing it, so the budget is the player's own
+ *    buffered voice via `remainingVoiceMs`, falling back to the fixed `tailMs` guess;
  *  - a reply committed for an already-ended utterance opens straight into that tail pace.
  *
  * The SDK owns DOM construction, safe text rendering, the live-region behavior and the schedule.
@@ -25,6 +27,7 @@
  *
  * Text is always written with `textContent`, never markup — every string here is remote input.
  */
+import type { TimedUtterance } from './utterance-scheduler';
 /** A committed turn, shaped like the SDK's `Turn` so a callback can be forwarded verbatim. */
 export interface CaptionTurn {
     /** Final transcript of what the user said. */
@@ -35,6 +38,8 @@ export interface CaptionTurn {
     speechId?: string;
     /** BCP-47 tag for the turn; sets `lang` on the rendered lines. */
     language?: string;
+    /** Assistant text is delivered by timed utterance callbacks; keep reply transcript-only. */
+    timedUtterances?: boolean;
 }
 /** Options for the streaming caption surface. */
 export interface CaptionsOptions {
@@ -51,9 +56,19 @@ export interface CaptionsOptions {
     wordsPerMinute?: number;
     /** How long a reply waits for its `speech_start` before revealing anyway. Defaults to 2000. */
     startTimeoutMs?: number;
-    /** Window the remaining words are compressed into once the utterance has ended. Defaults
-     *  to 1000. */
+    /** Fallback window the remaining words are compressed into once the utterance has ended, used
+     *  when `remainingVoiceMs` is absent or cannot answer. Defaults to 1000. */
     tailMs?: number;
+    /** How much avatar voice is still queued to play, in ms — `AvatarSession.bufferedVoiceMs`.
+     *
+     *  `speech_end` means the box has stopped *producing* audio, not that the speaker has stopped:
+     *  what is buffered is still to be heard. Supplying this spends exactly that much time on the
+     *  words not yet revealed, instead of the fixed `tailMs` guess. Return `null` when the answer
+     *  is unknown (no playout clock) and `tailMs` is used for that utterance.
+     *
+     *  Captions are usually attached before the session exists, so close over a mutable reference:
+     *  `remainingVoiceMs: () => session?.bufferedVoiceMs() ?? null`. Pass `null` to unset. */
+    remainingVoiceMs?: (() => number | null) | null;
 }
 /** A line the application authored, rather than one that came off the wire. */
 export interface CaptionLineInput {
@@ -85,6 +100,11 @@ export interface CaptionsController {
     speechStart(speechId: string): void;
     /** The box finished an utterance (`onSpeechEnd`). */
     speechEnd(speechId: string): void;
+    /** Show a timed assistant utterance. The SDK scheduler calls this only at its media PTS. */
+    utteranceStart(utterance: TimedUtterance): void;
+    /** Update the currently visible text without exposing a pending utterance. */
+    utteranceText(utterance: TimedUtterance): void;
+    utteranceEnd(utterance: TimedUtterance): void;
     /** Drop every line and cancel pending reveals, keeping the attachment. */
     clear(): void;
     /** Update any subset of the options. */
@@ -100,8 +120,12 @@ export interface CaptionsController {
  * Calling this again for the same target replaces the previous attachment.
  *
  * ```ts
- * const captions = attachCaptions(document.querySelector('#captions'), { holdMs: 2000 });
- * new AvatarSession({
+ * let session: AvatarSession | null = null;
+ * const captions = attachCaptions(document.querySelector('#captions'), {
+ *   holdMs: 2000,
+ *   remainingVoiceMs: () => session?.bufferedVoiceMs() ?? null,
+ * });
+ * session = new AvatarSession({
  *   callbacks: {
  *     onPartial: (text) => captions.partial(text),
  *     onTurn: (turn) => captions.turn(turn),

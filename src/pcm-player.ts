@@ -9,6 +9,8 @@
  * can report what is actually playing.
  */
 
+import type { PlayoutClock } from './playout-clock';
+
 interface Scheduled {
   source: AudioBufferSourceNode;
   startCtxTime: number;
@@ -22,12 +24,14 @@ export interface PcmFrame {
   ptsUs: number;
 }
 
-export class PcmPlayer {
+export class PcmPlayer implements PlayoutClock {
   private ctx: AudioContext | null = null;
   private nextStart = 0;
   private readonly scheduled = new Set<Scheduled>();
   private lastEndedPtsUs = 0;
   private blocked = false;
+  private readonly advanceHandlers = new Set<() => void>();
+  private advanceTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(private readonly onBlocked?: () => void) {}
 
@@ -56,10 +60,12 @@ export class PcmPlayer {
           entry.ptsUs + entry.durationSec * 1_000_000
         );
       }
+      this.emitAdvance();
     });
     this.scheduled.add(entry);
     source.start(startAt);
     this.nextStart = startAt + audio.duration;
+    this.emitAdvance();
     if (ctx.state === 'suspended') {
       void ctx.resume().catch(() => {
         if (!this.blocked) {
@@ -70,19 +76,37 @@ export class PcmPlayer {
     }
   }
 
-  /** Stop every scheduled source whose frame starts at/after `cutoffUs` on the session clock
-   *  (the interruption contract: the user has not heard past the cutoff, so drop it). */
+  /** Stop queued frames and trim a source whose samples straddle the exact cutoff. */
   flushFrom(cutoffUs: number): void {
     for (const entry of [...this.scheduled]) {
-      if (entry.ptsUs < cutoffUs) continue;
+      const endPtsUs = entry.ptsUs + entry.durationSec * 1_000_000;
+      if (endPtsUs <= cutoffUs) continue;
+      if (entry.ptsUs >= cutoffUs) {
+        try {
+          entry.source.stop();
+        } catch {
+          /* already ended */
+        }
+        this.scheduled.delete(entry);
+        continue;
+      }
+      // The cutoff is inside this AudioBufferSourceNode. Web Audio stop(when) is sample-accurate;
+      // cap the tracked duration too so ack/buffering never reports the discarded tail.
+      const keptSec = Math.max(0, (cutoffUs - entry.ptsUs) / 1_000_000);
+      entry.durationSec = keptSec;
+      const stopAt = entry.startCtxTime + keptSec;
       try {
-        entry.source.stop();
+        entry.source.stop(Math.max(this.ctx?.currentTime ?? stopAt, stopAt));
       } catch {
         /* already ended */
       }
-      this.scheduled.delete(entry);
     }
     this.recomputeNextStart();
+    this.emitAdvance();
+  }
+
+  async discardFrom(cutoffPtsUs: number): Promise<void> {
+    this.flushFrom(cutoffPtsUs);
   }
 
   flush(): void {
@@ -95,19 +119,22 @@ export class PcmPlayer {
     }
     this.scheduled.clear();
     this.nextStart = this.ctx?.currentTime ?? 0;
+    this.emitAdvance();
   }
 
   /** Session-clock position (µs) of what the speaker is emitting right now: interpolated inside
    *  the currently playing source, else the end of the last finished one. */
-  playedPtsUs(): number {
+  playedPtsUs(): number | null {
     const now = this.ctx?.currentTime ?? 0;
     let played = this.lastEndedPtsUs;
+    let hasPlayhead = this.lastEndedPtsUs > 0;
     for (const entry of this.scheduled) {
       if (entry.startCtxTime > now) continue;
+      hasPlayhead = true;
       const into = Math.min(now - entry.startCtxTime, entry.durationSec);
       played = Math.max(played, entry.ptsUs + into * 1_000_000);
     }
-    return Math.round(played);
+    return hasPlayhead ? Math.round(played) : null;
   }
 
   /** Audio queued ahead of the playhead, in ms. */
@@ -125,6 +152,9 @@ export class PcmPlayer {
 
   stop(): void {
     this.flush();
+    if (this.advanceTimer) clearInterval(this.advanceTimer);
+    this.advanceTimer = null;
+    this.advanceHandlers.clear();
     void this.ctx?.close().catch(() => {});
     this.ctx = null;
   }
@@ -141,5 +171,23 @@ export class PcmPlayer {
   private ensureContext(): AudioContext {
     if (!this.ctx) this.ctx = new AudioContext();
     return this.ctx;
+  }
+
+  onAdvance(handler: () => void): () => void {
+    this.advanceHandlers.add(handler);
+    if (!this.advanceTimer) {
+      this.advanceTimer = setInterval(() => this.emitAdvance(), 16);
+    }
+    return () => {
+      this.advanceHandlers.delete(handler);
+      if (this.advanceHandlers.size === 0 && this.advanceTimer) {
+        clearInterval(this.advanceTimer);
+        this.advanceTimer = null;
+      }
+    };
+  }
+
+  private emitAdvance(): void {
+    for (const handler of this.advanceHandlers) handler();
   }
 }

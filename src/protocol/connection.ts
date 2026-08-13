@@ -20,7 +20,7 @@ import { Listeners } from './transport';
  */
 
 export interface ProtocolViolation {
-  kind: 'illegal_message' | 'illegal_frame' | 'bad_frame';
+  kind: 'illegal_message' | 'illegal_frame' | 'bad_frame' | 'sequence_violation';
   detail: string;
   state: ProtocolState;
 }
@@ -63,6 +63,7 @@ function makeConnection(
 } {
   let state: ProtocolState = 'handshaking';
   let nextSeq = 1;
+  let lastReceivedServerSeq = 0;
   const messages = new Listeners<ClientMessage | ServerMessage>();
   const frames = new Listeners<MediaFrame>();
   const violations = new Listeners<ProtocolViolation>();
@@ -73,6 +74,18 @@ function makeConnection(
     if (parsed.ok === false) {
       violations.emit({ kind: 'illegal_message', detail: parsed.error, state });
       return;
+    }
+    if (role === 'client' && parsed.msg.type !== 'ping' && parsed.msg.type !== 'pong') {
+      const seq = (parsed.msg as { seq: number }).seq;
+      if (seq <= lastReceivedServerSeq) {
+        violations.emit({
+          kind: 'sequence_violation',
+          detail: `server seq ${seq} is not greater than ${lastReceivedServerSeq}`,
+          state,
+        });
+        return;
+      }
+      lastReceivedServerSeq = seq;
     }
     const { next, verdict } = onReceive(role, state, parsed.msg.type);
     state = next;

@@ -6,6 +6,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-12
+
+Additive and opt-in. A host that calls neither addition behaves exactly as on 0.2.1.
+
+### Added
+- `AvatarSession.bufferedVoiceMs()` — avatar voice still queued to play, in ms, or `null` when
+  this session has no playout clock to ask (a video session, or one that has not accepted yet).
+  `null` means "unknown", never "nothing left".
+- `attachCaptions`'s `remainingVoiceMs` option — a supplier for the above. `speech_end` means the
+  box stopped *producing* audio, not that the speaker stopped, so the words a reply has not
+  revealed yet should be spent over the voice that is actually left. Supplying it replaces the
+  fixed `tailMs` guess for that utterance; `tailMs` remains the fallback when the supplier is
+  absent or answers `null`. Wire it as
+  `remainingVoiceMs: () => session?.bufferedVoiceMs() ?? null` — captions are usually attached
+  before the session they pace against exists.
+
+### Fixed
+- A reply whose utterance had ended could keep crawling well past the voice, or dump early,
+  because the tail spent a constant instead of the audio remaining.
+
 ## [0.2.1] - 2026-08-12
 
 Everything here is additive and opt-in. A host that calls none of it behaves exactly as on 0.2.0,

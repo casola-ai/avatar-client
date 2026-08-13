@@ -83,6 +83,7 @@ new AvatarSession(opts: AvatarSessionOpts)
 | `.setResponseLanguage(lang)` | Preferred reply language (BCP-47; `''` returns the choice to the model). |
 | `.setRuntimeInstruction(text)` | Replace hidden system-level guidance for subsequent turns without generating a reply or transcript entry; an empty string clears it. |
 | `.unmuteAudio()` | Unmute avatar audio after `onAudioBlocked`; call from a tap/click handler. |
+| `.bufferedVoiceMs()` | Avatar voice still queued to play, in ms, or `null` when there is no playout clock to ask (a video session, or one that has not accepted). `null` is "unknown", not "none". Feeds `attachCaptions`'s `remainingVoiceMs`. |
 | `.state` | Current `WidgetState`. |
 | `.sessionCapSeconds` | The session cap — the box's authoritative `cap_seconds` once connected. |
 | `.personaKey` | The avatar version the box bound, echoed in the handshake (the persona-pinning ack). |
@@ -152,8 +153,11 @@ provides — `speech_start` / `speech_end` and the `speechId` they share with th
 - a reply waits for its `speech_start`, the real audio onset, when the box marks utterances
   (`startTimeoutMs` is the backstop if that marker never lands);
 - it does not wait at all when the box has sent no marker this session;
-- `speech_end` retimes the words still queued to finish inside `tailMs`, so the text cannot keep
-  crawling after the voice has stopped;
+- `speech_end` retimes the words still queued to finish inside the voice that is left, so the text
+  cannot keep crawling after the speaker has stopped. That marker means the box stopped
+  *producing* audio, not that the user stopped hearing it, so the budget is the player's own
+  buffered voice via `remainingVoiceMs` — falling back to the fixed `tailMs` guess when no
+  supplier is given or it answers `null`;
 - a reply for an utterance that already ended opens straight into that tail pace.
 
 Style hooks are `casola-captions` on the target and `casola-captions__line` on each line, with
@@ -161,13 +165,17 @@ Style hooks are `casola-captions` on the target and `casola-captions__line` on e
 (`role="log"`); a line still arriving is `aria-hidden` and announces once, whole, when it settles.
 
 ```typescript
+let session: AvatarSession | null = null;
+
 const captions = attachCaptions(document.querySelector('#captions'), {
   maxLines: 6,
   holdMs: 2000, // 0 keeps lines until they are trimmed
   fadeMs: 600,
+  // Read late: the ribbon is attached before the session it paces against exists.
+  remainingVoiceMs: () => session?.bufferedVoiceMs() ?? null,
 });
 
-new AvatarSession({
+session = new AvatarSession({
   callbacks: {
     onPartial: (text) => captions.partial(text),
     onTurn: (turn) => captions.turn(turn),

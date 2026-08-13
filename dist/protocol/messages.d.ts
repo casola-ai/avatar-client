@@ -10,8 +10,8 @@ export interface HelloMessage {
     proto: 2;
     /** Payload codecs the client can play, per kind. Absent kind = cannot play it. */
     accept: {
-        audio?: 'pcm16'[];
-        video?: 'fmp4'[];
+        audio?: string[];
+        video?: string[];
     };
     /** Uplink microphone format the client will send. Absent = no mic uplink. */
     mic?: {
@@ -22,11 +22,8 @@ export interface HelloMessage {
     response_language?: string;
     /** Optional feature names (unknown entries ignored) — minor evolution without a v3. */
     features?: string[];
-    /** RESERVED for resume; servers ignore it this protocol revision. */
-    resume?: {
-        token: string;
-        last_seq: number;
-    };
+    /** RESERVED for resume; always null when present in this protocol revision. */
+    resume?: null;
 }
 export type ClientMessage = HelloMessage | {
     type: 'text';
@@ -69,9 +66,51 @@ export interface AcceptMessage {
     poster?: {
         url: string;
     };
-    features: string[];
+    /** Absent on pre-feature protocol-v2 boxes; clients treat absence as an empty set. */
+    features?: string[];
     /** RESERVED: always null this protocol revision. */
     resume: null;
+}
+export interface UtteranceStartMessage {
+    type: 'utterance_start';
+    seq: number;
+    turn_id: string;
+    utterance_id: string;
+    start_pts_us: number;
+    text?: string;
+    text_final: boolean;
+    language?: string;
+}
+export interface UtteranceTextMessage {
+    type: 'utterance_text';
+    seq: number;
+    turn_id: string;
+    utterance_id: string;
+    revision: number;
+    text: string;
+    final: boolean;
+}
+export type UtteranceEndReason = 'complete' | 'interrupted' | 'replaced' | 'error';
+export interface UtteranceEndMessage {
+    type: 'utterance_end';
+    seq: number;
+    turn_id: string;
+    utterance_id: string;
+    end_pts_us: number;
+    reason: UtteranceEndReason;
+}
+/** Legacy interruption shape, retained for peers that did not negotiate timed utterances. */
+export interface LegacyInterruptionMessage {
+    type: 'interruption';
+    seq: number;
+    cutoff_pts_us: number | null;
+}
+export interface InterruptionMessage {
+    type: 'interruption';
+    seq: number;
+    cutoff_pts_us: number;
+    utterance_ids: string[];
+    reason: 'barge_in';
 }
 export type ServerMessage = AcceptMessage | {
     type: 'partial';
@@ -94,11 +133,7 @@ export type ServerMessage = AcceptMessage | {
     type: 'speech_end';
     seq: number;
     speech_id: string;
-} | {
-    type: 'interruption';
-    seq: number;
-    cutoff_pts_us: number | null;
-} | {
+} | UtteranceStartMessage | UtteranceTextMessage | UtteranceEndMessage | LegacyInterruptionMessage | InterruptionMessage | {
     type: 'instruction_set';
     seq: number;
     request_id?: string;
