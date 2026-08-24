@@ -34,11 +34,34 @@ export type NegotiationResult =
   | { ok: true; accept: Omit<AcceptMessage, 'seq'> }
   | { ok: false; code: string; message: string };
 
-export function negotiateAccept(hello: HelloMessage, offer: SessionOffer): NegotiationResult {
+export interface NegotiateOptions {
+  /**
+   * `false` is a TEXT-ONLY (brain-only) session: the server answers with control messages alone
+   * — a `turn` carrying a `brain` payload — and never opens a downlink. Defaults to `true`, which
+   * is byte-for-byte today's behaviour.
+   */
+  render?: boolean;
+}
+
+/**
+ * With `render: false` the displayable-output requirement below is skipped — it exists to refuse a
+ * session that can neither show nor say anything, which is precisely what a text-only session is
+ * *for* — and no video, PCM or poster is offered even when the offer has them and the client
+ * accepts them. The channel map is then `[mic]` when the client asked for a microphone, else `[]`.
+ *
+ * The mic contract is unchanged either way: a malformed or mismatched mic request is still refused
+ * with `unsupported_codec`, because ASR still runs.
+ */
+export function negotiateAccept(
+  hello: HelloMessage,
+  offer: SessionOffer,
+  options: NegotiateOptions = {}
+): NegotiationResult {
+  const render = options.render ?? true;
   const acceptsAudio = hello.accept.audio?.includes('pcm16') ?? false;
   const acceptsVideo = hello.accept.video?.includes('fmp4') ?? false;
 
-  if (offer.audio && !acceptsAudio && !(offer.video && acceptsVideo)) {
+  if (render && offer.audio && !acceptsAudio && !(offer.video && acceptsVideo)) {
     return {
       ok: false,
       code: ErrorCode.UNSUPPORTED_CODEC,
@@ -71,7 +94,8 @@ export function negotiateAccept(hello: HelloMessage, offer: SessionOffer): Negot
     };
     channels.push(mic);
   }
-  if (offer.audio) {
+  // Everything from here to the accept body is downlink, which a text-only session does not have.
+  if (render && offer.audio) {
     const audio: AudioChannelDescriptor = {
       id: Channel.AVATAR_AUDIO,
       dir: 'down',
@@ -82,7 +106,7 @@ export function negotiateAccept(hello: HelloMessage, offer: SessionOffer): Negot
     };
     channels.push(audio);
   }
-  const videoOffered = offer.video && acceptsVideo;
+  const videoOffered = render && offer.video && acceptsVideo;
   if (videoOffered && offer.video) {
     const video: VideoChannelDescriptor = {
       id: Channel.AVATAR_VIDEO,
@@ -97,7 +121,7 @@ export function negotiateAccept(hello: HelloMessage, offer: SessionOffer): Negot
   }
 
   // No way to show anything: no video the client can play and no poster to fall back to.
-  if (!videoOffered && !offer.poster) {
+  if (render && !videoOffered && !offer.poster) {
     return {
       ok: false,
       code: ErrorCode.UNSUPPORTED_CODEC,
@@ -113,7 +137,7 @@ export function negotiateAccept(hello: HelloMessage, offer: SessionOffer): Negot
       persona_key: offer.personaKey,
       cap_seconds: offer.capSeconds,
       channels,
-      ...(!videoOffered && offer.poster ? { poster: { url: offer.poster.url } } : {}),
+      ...(render && !videoOffered && offer.poster ? { poster: { url: offer.poster.url } } : {}),
       features: [...new Set(offer.features ?? [])].filter((feature) =>
         (hello.features ?? []).includes(feature)
       ),

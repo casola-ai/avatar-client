@@ -125,6 +125,8 @@ export type ServerMessage = AcceptMessage | {
     speech_id?: string;
     request_id?: string;
     language?: string;
+    /** Opaque orchestrator payload for a brain-only session — see the `turn` check below. */
+    brain?: Record<string, unknown>;
 } | {
     type: 'speech_start';
     seq: number;

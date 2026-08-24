@@ -685,7 +685,13 @@ var isChannel = (v) => {
 var SERVER_CHECKS = {
   accept: (m) => isSeq(m.seq) && m.proto === 2 && isStr(m.persona_key) && isNum(m.cap_seconds) && m.cap_seconds >= 0 && Array.isArray(m.channels) && m.channels.every(isChannel) && optional(m, "features", isStrArray) && m.resume === null && optional(m, "poster", (v) => isObj(v) && isStr(v.url)),
   partial: (m) => isSeq(m.seq) && isStr(m.text) && optional(m, "language", isStr),
-  turn: (m) => isSeq(m.seq) && isStr(m.text) && has(m, "reply") && (m.reply === null || isStr(m.reply)) && optional(m, "speech_id", isStr) && optional(m, "request_id", isStr) && optional(m, "language", isStr),
+  turn: (m) => isSeq(m.seq) && isStr(m.text) && has(m, "reply") && (m.reply === null || isStr(m.reply)) && optional(m, "speech_id", isStr) && optional(m, "request_id", isStr) && optional(m, "language", isStr) && // `brain`: the orchestrator's own view of this reply — what the renderer WOULD have produced
+  // (parsed markers, segmentation, the LTX motion prompts), carried instead of video by a
+  // brain-only session. Type-checked as an object and NOTHING MORE, on purpose: its contents
+  // are an orchestrator concern that will keep growing, and pinning them here would make every
+  // new key a protocol revision on both sides of the wire. The unknown-field tolerance at the
+  // top of this file is what makes that safe.
+  optional(m, "brain", isObj),
   speech_start: (m) => isSeq(m.seq) && isStr(m.speech_id),
   speech_end: (m) => isSeq(m.seq) && isStr(m.speech_id),
   utterance_start: (m) => isSeq(m.seq) && isStr(m.turn_id) && isStr(m.utterance_id) && isUInt(m.start_pts_us) && isBool(m.text_final) && optional(m, "text", isStr) && optional(m, "language", isStr),

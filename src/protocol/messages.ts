@@ -116,6 +116,8 @@ export type ServerMessage =
       speech_id?: string;
       request_id?: string;
       language?: string;
+      /** Opaque orchestrator payload for a brain-only session — see the `turn` check below. */
+      brain?: Record<string, unknown>;
     }
   | { type: 'speech_start'; seq: number; speech_id: string }
   | { type: 'speech_end'; seq: number; speech_id: string }
@@ -221,7 +223,14 @@ const SERVER_CHECKS: Record<string, FieldCheck> = {
     (m.reply === null || isStr(m.reply)) &&
     optional(m, 'speech_id', isStr) &&
     optional(m, 'request_id', isStr) &&
-    optional(m, 'language', isStr),
+    optional(m, 'language', isStr) &&
+    // `brain`: the orchestrator's own view of this reply — what the renderer WOULD have produced
+    // (parsed markers, segmentation, the LTX motion prompts), carried instead of video by a
+    // brain-only session. Type-checked as an object and NOTHING MORE, on purpose: its contents
+    // are an orchestrator concern that will keep growing, and pinning them here would make every
+    // new key a protocol revision on both sides of the wire. The unknown-field tolerance at the
+    // top of this file is what makes that safe.
+    optional(m, 'brain', isObj),
   speech_start: (m) => isSeq(m.seq) && isStr(m.speech_id),
   speech_end: (m) => isSeq(m.seq) && isStr(m.speech_id),
   utterance_start: (m) =>

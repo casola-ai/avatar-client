@@ -39,4 +39,21 @@ export type NegotiationResult = {
     code: string;
     message: string;
 };
-export declare function negotiateAccept(hello: HelloMessage, offer: SessionOffer): NegotiationResult;
+export interface NegotiateOptions {
+    /**
+     * `false` is a TEXT-ONLY (brain-only) session: the server answers with control messages alone
+     * — a `turn` carrying a `brain` payload — and never opens a downlink. Defaults to `true`, which
+     * is byte-for-byte today's behaviour.
+     */
+    render?: boolean;
+}
+/**
+ * With `render: false` the displayable-output requirement below is skipped — it exists to refuse a
+ * session that can neither show nor say anything, which is precisely what a text-only session is
+ * *for* — and no video, PCM or poster is offered even when the offer has them and the client
+ * accepts them. The channel map is then `[mic]` when the client asked for a microphone, else `[]`.
+ *
+ * The mic contract is unchanged either way: a malformed or mismatched mic request is still refused
+ * with `unsupported_codec`, because ASR still runs.
+ */
+export declare function negotiateAccept(hello: HelloMessage, offer: SessionOffer, options?: NegotiateOptions): NegotiationResult;

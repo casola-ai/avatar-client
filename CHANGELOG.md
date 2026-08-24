@@ -6,6 +6,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-12
+
+### Added
+- Negotiated timed utterances (`utterance_timing_v1`): lifecycle callbacks are scheduled against
+  the local audio/video playout clock rather than socket arrival, pending text revisions remain
+  hidden until their start PTS, and interruption cancels the unheard caption and media tail.
+- Explicit media-unit boundaries (`media_unit_flags_v1`) so fragmented MP4 units can be reassembled
+  before append and discarded atomically when an interruption cuts through a unit.
+- `onUtteranceStart`, `onUtteranceText`, and `onUtteranceEnd` callbacks, with matching caption
+  controller methods for hosts that render the negotiated lifecycle.
+
+### Fixed
+- The public 0.3.0 package contained the timed-utterance implementation, but its release notes only
+  described the earlier caption-tail fix. This release makes the shipped API and changelog agree.
+
 ## [0.3.0] - 2026-08-12
 
 Additive and opt-in. A host that calls neither addition behaves exactly as on 0.2.1.
