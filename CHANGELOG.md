@@ -6,6 +6,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-31
+
+Additive. A host that passes nothing new behaves as on 0.3.1 except that, where the browser and the
+box both support it, the microphone now goes up as Opus instead of raw PCM.
+
+### Added
+- Opus mic uplink: the hello carries `mic.codecs: ['opus', 'pcm16']` when this browser's WebCodecs
+  `AudioEncoder` can produce the wire's 100 ms Opus packets, and a box that accepts `opus` on
+  channel 1 receives one 32 kbit/s packet per mic frame (~400 B) instead of 3200 B of PCM16 — an
+  ~8× smaller uplink. Frame cadence, `seq`, `pts_us`, mute-as-silence and `onAudioFrameSent` are
+  unchanged. A box or browser without Opus support lands on pcm16 with no host involvement.
+- `AvatarSessionOpts.micCodec` (`'auto'` | `'pcm16'`) — `'pcm16'` never offers Opus.
+- `AvatarError` kind `mic-failed` now also covers a WebCodecs encoder failure mid-session.
+
 ## [0.3.1] - 2026-08-12
 
 ### Added

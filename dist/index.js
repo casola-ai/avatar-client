@@ -589,6 +589,9 @@ function toAvatarError(error, kind, options = {}) {
   return new AvatarError(kind, message, { terminal: options.terminal, cause: error });
 }
 
+// src/protocol/channels.ts
+var AUDIO_CODECS = ["pcm16", "opus"];
+
 // src/protocol/codes.ts
 var SUBPROTOCOL = "casola.avatar.v2";
 var CloseCode = {
@@ -671,11 +674,12 @@ var isSeq = (v) => Number.isSafeInteger(v) && Number(v) >= 1;
 var has = (m, key) => Object.hasOwn(m, key);
 var optional = (m, key, check) => !has(m, key) || check(m[key]);
 var oneOf = (...values) => (v) => isStr(v) && values.includes(v);
+var isAudioCodec = (v) => isStr(v) && AUDIO_CODECS.includes(v);
 var isChannel = (v) => {
   if (!isObj(v) || !isUInt(v.id) || v.id > 255) return false;
   if (v.dir !== "up" && v.dir !== "down") return false;
   if (v.kind === "audio") {
-    return v.codec === "pcm16" && isUInt(v.sample_rate) && v.sample_rate > 0 && v.channels === 1;
+    return isAudioCodec(v.codec) && isUInt(v.sample_rate) && v.sample_rate > 0 && v.channels === 1;
   }
   if (v.kind === "video") {
     return v.dir === "down" && v.codec === "fmp4" && isStr(v.mime) && optional(v, "fps", (x) => isNum(x) && Number(x) > 0) && optional(v, "seg_frames", (x) => isUInt(x) && Number(x) > 0);
@@ -1010,7 +1014,8 @@ var ClockMap = class {
 };
 
 // src/mic-pipeline.ts
-var TARGET_RATE = 16e3;
+var MIC_SAMPLE_RATE = 16e3;
+var TARGET_RATE = MIC_SAMPLE_RATE;
 var MIC_FRAME_SAMPLES = 1600;
 var VIDEO_MEDIA_TIME_UNKNOWN = 4294967295;
 function clamp16(x) {
@@ -1189,6 +1194,104 @@ var MicPipeline = class {
     void this.ctx?.close().catch(() => {
     });
     this.ctx = null;
+  }
+};
+
+// src/mic-encoder.ts
+var OPUS_MIC_BITRATE = 32e3;
+var FRAME_DURATION_US = Math.round(MIC_FRAME_SAMPLES / MIC_SAMPLE_RATE * 1e6);
+function opusMicEncoderConfig() {
+  return {
+    codec: "opus",
+    sampleRate: MIC_SAMPLE_RATE,
+    numberOfChannels: 1,
+    bitrate: OPUS_MIC_BITRATE,
+    opus: { frameDuration: FRAME_DURATION_US, usedtx: false }
+  };
+}
+var OpusMicEncoder = class {
+  constructor(opts) {
+    this.opts = opts;
+    __publicField(this, "encoder", null);
+    __publicField(this, "pending", []);
+    __publicField(this, "closed", false);
+    const encoder = new AudioEncoder({
+      output: (chunk) => this.onChunk(chunk),
+      error: (err) => this.fail(err)
+    });
+    encoder.configure(opusMicEncoderConfig());
+    this.encoder = encoder;
+  }
+  /** Whether this browser can produce the wire's Opus packets. Asked once per session before the
+   *  hello goes out (the driver sends it synchronously on socket open, and this is async). */
+  static async supported(dev = false) {
+    if (typeof AudioEncoder === "undefined" || typeof AudioData === "undefined") {
+      if (dev) console.log("[mic] WebCodecs AudioEncoder unavailable; uplink stays pcm16");
+      return false;
+    }
+    try {
+      const result = await AudioEncoder.isConfigSupported(opusMicEncoderConfig());
+      if (dev) console.log("[mic] opus AudioEncoder supported=", result.supported);
+      return result.supported === true;
+    } catch (err) {
+      if (dev) console.warn("[mic] opus AudioEncoder probe failed; uplink stays pcm16", err);
+      return false;
+    }
+  }
+  /** Encode one pipeline frame. `info` comes back out of `onPacket` with the packet. */
+  encode(pcm, info) {
+    const encoder = this.encoder;
+    if (!encoder || this.closed) return;
+    const data = new AudioData({
+      format: "s16",
+      sampleRate: MIC_SAMPLE_RATE,
+      numberOfFrames: pcm.length,
+      numberOfChannels: 1,
+      timestamp: (info.micSeq - 1) * FRAME_DURATION_US,
+      // The pipeline's frames are plain ArrayBuffer-backed copies; the cast only narrows the
+      // `ArrayBufferLike` that TypedArray typings carry (AudioData copies the bytes anyway).
+      data: pcm
+    });
+    this.pending.push(info);
+    try {
+      encoder.encode(data);
+    } catch (err) {
+      this.pending.pop();
+      this.fail(err);
+    } finally {
+      data.close();
+    }
+  }
+  onChunk(chunk) {
+    if (this.closed) return;
+    const info = this.pending.shift();
+    if (!info) {
+      if (this.opts.dev) console.warn("[mic] opus chunk with no pending frame; dropped");
+      return;
+    }
+    if (this.opts.dev && chunk.timestamp !== (info.micSeq - 1) * FRAME_DURATION_US) {
+      console.warn("[mic] opus chunk timestamp drift", chunk.timestamp, info.micSeq);
+    }
+    const packet = new Uint8Array(chunk.byteLength);
+    chunk.copyTo(packet);
+    this.opts.onPacket(packet, info);
+  }
+  fail(err) {
+    if (this.closed) return;
+    this.stop();
+    this.opts.onError(err);
+  }
+  /** Idempotent. Pending output is discarded — nothing may go out after the session stops. */
+  stop() {
+    this.closed = true;
+    this.pending.length = 0;
+    const encoder = this.encoder;
+    this.encoder = null;
+    if (!encoder) return;
+    try {
+      if (encoder.state !== "closed") encoder.close();
+    } catch {
+    }
   }
 };
 
@@ -1967,6 +2070,7 @@ var V2Driver = class {
     __publicField(this, "scheduler", null);
     __publicField(this, "unitAssembler", new MediaUnitAssembler());
     __publicField(this, "pipeline", null);
+    __publicField(this, "encoder", null);
     __publicField(this, "accepted", null);
     __publicField(this, "audioCh", null);
     __publicField(this, "micCh", null);
@@ -2010,7 +2114,13 @@ var V2Driver = class {
           audio: ["pcm16"],
           ...MsePlayer.supported() ? { video: ["fmp4"] } : {}
         },
-        ...opts.mic ? { mic: { codec: "pcm16", sample_rate: 16e3 } } : {},
+        ...opts.mic ? {
+          mic: {
+            codec: "pcm16",
+            sample_rate: MIC_SAMPLE_RATE,
+            ...opts.micCodecs?.length ? { codecs: opts.micCodecs } : {}
+          }
+        } : {},
         ...this.langs.length ? { langs: this.langs } : {},
         ...this.responseLanguage !== void 0 ? { response_language: this.responseLanguage } : {},
         features: [Feature.UTTERANCE_TIMING_V1, Feature.MEDIA_UNIT_FLAGS_V1],
@@ -2185,6 +2295,23 @@ var V2Driver = class {
     });
   }
   startMic(micCh) {
+    let onFrame = (pcm, info) => this.sendMicFrame(micCh.id, new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength), info);
+    if (micCh.codec === "opus") {
+      let encoder;
+      try {
+        encoder = new OpusMicEncoder({
+          dev: this.opts.dev,
+          onPacket: (packet, info) => this.sendMicFrame(micCh.id, packet, info),
+          // A dead encoder is a dead mic: terminal, like a worklet that failed to load.
+          onError: (err) => this.fail(err, "mic-failed")
+        });
+      } catch (err) {
+        this.fail(err, "mic-failed");
+        return;
+      }
+      this.encoder = encoder;
+      onFrame = (pcm, info) => encoder.encode(pcm, info);
+    }
     const pipeline = new MicPipeline();
     this.pipeline = pipeline;
     pipeline.start({
@@ -2192,14 +2319,14 @@ var V2Driver = class {
       stream: this.opts.permittedStream,
       dev: this.opts.dev,
       getVideoMediaTimeMs: this.mse ? (t) => this.mse?.mediaTimeAt(t) ?? null : void 0,
-      onFrame: (pcm, info) => this.sendMicFrame(micCh.id, pcm, info)
+      onFrame
     }).then(() => {
       if (!this.finished) this.opts.handlers.onMicReady();
     }).catch((err) => {
       this.fail(err, classifyMicError(err));
     });
   }
-  sendMicFrame(channelId, pcm, info) {
+  sendMicFrame(channelId, payload, info) {
     const conn = this.conn;
     if (this.finished || !conn || conn.protocolState !== "active") return;
     const ptsUs = info.videoMediaTimeMs === VIDEO_MEDIA_TIME_UNKNOWN ? 0 : info.videoMediaTimeMs * 1e3;
@@ -2209,7 +2336,7 @@ var V2Driver = class {
       flags: 0,
       seq: info.micSeq % (MAX_SEQ + 1),
       ptsUs,
-      payload: new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength)
+      payload
     });
     this.opts.handlers.onAudioFrameSent(info);
   }
@@ -2366,6 +2493,8 @@ var V2Driver = class {
     }
     this.textWaiters.clear();
     this.pipeline?.stop();
+    this.encoder?.stop();
+    this.encoder = null;
     this.pipeline = null;
     this.player?.stop();
     this.player = null;
@@ -2578,6 +2707,9 @@ var AvatarSession = class {
     }
     if (this.done) return;
     const dev = this.opts.dev ?? false;
+    const wantsOpus = this.opts.mic !== false && (this.opts.micCodec ?? "auto") === "auto";
+    const micCodecs = wantsOpus && await OpusMicEncoder.supported(dev) ? ["opus", "pcm16"] : [];
+    if (this.done) return;
     const streamForMic = this.permittedStream;
     this.permittedStream = null;
     this.driver = new V2Driver({
@@ -2588,6 +2720,7 @@ var AvatarSession = class {
       responseLanguage: this._responseLanguage,
       workletUrl: this.opts.workletUrl ?? "/mic-worklet.js",
       permittedStream: streamForMic ?? void 0,
+      micCodecs,
       dev,
       createSocket: this.opts.createSocket,
       handlers: {

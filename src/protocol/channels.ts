@@ -17,11 +17,17 @@ export const CHANNEL_EXPERIMENTAL_MIN = 0xf0;
 
 export type ChannelDir = 'up' | 'down';
 
+/** Payload codecs an audio channel may carry. `pcm16` (PCM16-LE) is the baseline every peer
+ *  supports; `opus` is negotiated for the mic uplink through `hello.mic.codecs` and carries exactly
+ *  one Opus packet per media frame. */
+export const AUDIO_CODECS = ['pcm16', 'opus'] as const;
+export type AudioCodec = (typeof AUDIO_CODECS)[number];
+
 export interface AudioChannelDescriptor {
   id: number;
   dir: ChannelDir;
   kind: 'audio';
-  codec: 'pcm16';
+  codec: AudioCodec;
   sample_rate: number;
   channels: 1;
 }

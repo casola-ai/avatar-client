@@ -50,6 +50,10 @@ export interface V2DriverOpts {
     responseLanguage?: string;
     workletUrl: string;
     permittedStream?: MediaStream;
+    /** Uplink codec preference list for `hello.mic.codecs`, e.g. `['opus', 'pcm16']`. Empty or
+     *  omitted = the field is left out and the box answers pcm16. The accept's ch1 descriptor
+     *  says what was chosen; the driver encodes accordingly. */
+    micCodecs?: string[];
     dev: boolean;
     handlers: V2DriverHandlers;
     /** Test seam — defaults to `new WebSocket(url, protocols)`. */
@@ -70,6 +74,7 @@ export declare class V2Driver {
     private scheduler;
     private readonly unitAssembler;
     private pipeline;
+    private encoder;
     private accepted;
     private audioCh;
     private micCh;

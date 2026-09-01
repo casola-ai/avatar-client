@@ -1,6 +1,8 @@
 import { ClockMap } from './clock-map';
 
-const TARGET_RATE = 16000;
+/** The uplink sample rate, whichever codec ch1 negotiated (spec §4). */
+export const MIC_SAMPLE_RATE = 16000;
+const TARGET_RATE = MIC_SAMPLE_RATE;
 export const MIC_FRAME_SAMPLES = 1600; // 100 ms at 16 kHz
 
 /** The v1 wire's "video media time unknown" sentinel, kept for the onAudioFrameSent callback's

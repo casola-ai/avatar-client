@@ -1,6 +1,6 @@
 // GENERATED from packages/avatar-protocol/src/messages.ts — do not edit.
 // Re-sync with: pnpm --filter @casola/avatar-client sync-protocol
-import type { ChannelDescriptor } from './channels';
+import { AUDIO_CODECS, type ChannelDescriptor } from './channels';
 
 /**
  * JSON control messages. The extensibility contract lives in the parsers below, once:
@@ -17,8 +17,11 @@ export interface HelloMessage {
   proto: 2;
   /** Payload codecs the client can play, per kind. Absent kind = cannot play it. */
   accept: { audio?: string[]; video?: string[] };
-  /** Uplink microphone format the client will send. Absent = no mic uplink. */
-  mic?: { codec: 'pcm16'; sample_rate: number };
+  /** Uplink microphone format the client will send. Absent = no mic uplink. `codec` is the
+   *  baseline the client can always send (`pcm16`); `codecs` is an optional preference-ordered
+   *  list the server picks from (e.g. `['opus', 'pcm16']`), the pick being reported in the
+   *  accept's ch1 descriptor. A server that predates `codecs` ignores it and answers `codec`. */
+  mic?: { codec: 'pcm16'; sample_rate: number; codecs?: string[] };
   langs?: string[];
   response_language?: string;
   /** Optional feature names (unknown entries ignored) — minor evolution without a v3. */
@@ -163,13 +166,20 @@ const isAcceptCodecs = (v: unknown): boolean =>
   isObj(v) && optional(v, 'audio', isStrArray) && optional(v, 'video', isStrArray);
 
 const isMic = (v: unknown): boolean =>
-  isObj(v) && v.codec === 'pcm16' && isUInt(v.sample_rate) && v.sample_rate > 0;
+  isObj(v) &&
+  v.codec === 'pcm16' &&
+  isUInt(v.sample_rate) &&
+  v.sample_rate > 0 &&
+  optional(v, 'codecs', isStrArray);
+
+const isAudioCodec = (v: unknown): boolean =>
+  isStr(v) && (AUDIO_CODECS as readonly string[]).includes(v);
 
 const isChannel = (v: unknown): boolean => {
   if (!isObj(v) || !isUInt(v.id) || v.id > 0xff) return false;
   if (v.dir !== 'up' && v.dir !== 'down') return false;
   if (v.kind === 'audio') {
-    return v.codec === 'pcm16' && isUInt(v.sample_rate) && v.sample_rate > 0 && v.channels === 1;
+    return isAudioCodec(v.codec) && isUInt(v.sample_rate) && v.sample_rate > 0 && v.channels === 1;
   }
   if (v.kind === 'video') {
     return (

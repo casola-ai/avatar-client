@@ -25,9 +25,11 @@ export interface SessionOffer {
     poster?: {
         url: string;
     } | null;
-    /** Uplink mic format the server expects. Omitted = no mic channel. */
+    /** Uplink mic format the server expects. Omitted = no mic channel. `codecs` is what this
+     *  server can decode, in its own order of preference; omitted = `['pcm16']`. */
     mic?: {
         sampleRate: number;
+        codecs?: readonly string[];
     } | null;
     features?: string[];
 }

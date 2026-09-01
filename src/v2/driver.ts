@@ -1,6 +1,12 @@
 import { AvatarError, type AvatarErrorKind, classifyMicError, toAvatarError } from '../errors';
 import { type MediaUnit, MediaUnitAssembler } from '../media-unit-assembler';
-import { type MicFrameInfo, MicPipeline, VIDEO_MEDIA_TIME_UNKNOWN } from '../mic-pipeline';
+import { OpusMicEncoder } from '../mic-encoder';
+import {
+  MIC_SAMPLE_RATE,
+  type MicFrameInfo,
+  MicPipeline,
+  VIDEO_MEDIA_TIME_UNKNOWN,
+} from '../mic-pipeline';
 import { MsePlayer } from '../mse-player';
 import { PcmPlayer } from '../pcm-player';
 import type { PlayoutClock } from '../playout-clock';
@@ -83,6 +89,10 @@ export interface V2DriverOpts {
   responseLanguage?: string;
   workletUrl: string;
   permittedStream?: MediaStream;
+  /** Uplink codec preference list for `hello.mic.codecs`, e.g. `['opus', 'pcm16']`. Empty or
+   *  omitted = the field is left out and the box answers pcm16. The accept's ch1 descriptor
+   *  says what was chosen; the driver encodes accordingly. */
+  micCodecs?: string[];
   dev: boolean;
   handlers: V2DriverHandlers;
   /** Test seam — defaults to `new WebSocket(url, protocols)`. */
@@ -127,6 +137,7 @@ export class V2Driver {
   private scheduler: UtteranceScheduler | null = null;
   private readonly unitAssembler = new MediaUnitAssembler();
   private pipeline: MicPipeline | null = null;
+  private encoder: OpusMicEncoder | null = null;
 
   private accepted: AcceptMessage | null = null;
   private audioCh: AudioChannelDescriptor | null = null;
@@ -181,7 +192,15 @@ export class V2Driver {
           audio: ['pcm16'],
           ...(MsePlayer.supported() ? { video: ['fmp4'] } : {}),
         },
-        ...(opts.mic ? { mic: { codec: 'pcm16', sample_rate: 16000 } } : {}),
+        ...(opts.mic
+          ? {
+              mic: {
+                codec: 'pcm16',
+                sample_rate: MIC_SAMPLE_RATE,
+                ...(opts.micCodecs?.length ? { codecs: opts.micCodecs } : {}),
+              },
+            }
+          : {}),
         ...(this.langs.length ? { langs: this.langs } : {}),
         ...(this.responseLanguage !== undefined
           ? { response_language: this.responseLanguage }
@@ -379,6 +398,26 @@ export class V2Driver {
   }
 
   private startMic(micCh: AudioChannelDescriptor): void {
+    // The box chose the uplink codec from our hello.mic.codecs; its ch1 descriptor is the answer.
+    // pcm16: the pipeline's Int16 frames go out as-is. opus: one WebCodecs packet per frame.
+    let onFrame = (pcm: Int16Array, info: MicFrameInfo): void =>
+      this.sendMicFrame(micCh.id, new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength), info);
+    if (micCh.codec === 'opus') {
+      let encoder: OpusMicEncoder;
+      try {
+        encoder = new OpusMicEncoder({
+          dev: this.opts.dev,
+          onPacket: (packet, info) => this.sendMicFrame(micCh.id, packet, info),
+          // A dead encoder is a dead mic: terminal, like a worklet that failed to load.
+          onError: (err) => this.fail(err, 'mic-failed'),
+        });
+      } catch (err) {
+        this.fail(err, 'mic-failed');
+        return;
+      }
+      this.encoder = encoder;
+      onFrame = (pcm, info) => encoder.encode(pcm, info);
+    }
     const pipeline = new MicPipeline();
     this.pipeline = pipeline;
     pipeline
@@ -387,7 +426,7 @@ export class V2Driver {
         stream: this.opts.permittedStream,
         dev: this.opts.dev,
         getVideoMediaTimeMs: this.mse ? (t) => this.mse?.mediaTimeAt(t) ?? null : undefined,
-        onFrame: (pcm, info) => this.sendMicFrame(micCh.id, pcm, info),
+        onFrame,
       })
       .then(() => {
         if (!this.finished) this.opts.handlers.onMicReady();
@@ -399,7 +438,7 @@ export class V2Driver {
       });
   }
 
-  private sendMicFrame(channelId: number, pcm: Int16Array, info: MicFrameInfo): void {
+  private sendMicFrame(channelId: number, payload: Uint8Array, info: MicFrameInfo): void {
     const conn = this.conn;
     if (this.finished || !conn || conn.protocolState !== 'active') return;
     // Spec: mic-uplink pts is the displayed media time at capture; 0 when it cannot be
@@ -412,7 +451,7 @@ export class V2Driver {
       flags: 0,
       seq: info.micSeq % (MAX_SEQ + 1),
       ptsUs,
-      payload: new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength),
+      payload,
     });
     this.opts.handlers.onAudioFrameSent(info);
   }
@@ -594,6 +633,8 @@ export class V2Driver {
     }
     this.textWaiters.clear();
     this.pipeline?.stop();
+    this.encoder?.stop();
+    this.encoder = null;
     this.pipeline = null;
     this.player?.stop();
     this.player = null;

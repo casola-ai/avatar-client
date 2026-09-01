@@ -1,4 +1,4 @@
-import type { ChannelDescriptor } from './channels';
+import { type ChannelDescriptor } from './channels';
 /**
  * JSON control messages. The extensibility contract lives in the parsers below, once:
  * an unknown `type` parses as {ok:'unknown'} (receivers MUST ignore it), and unknown fields on a
@@ -13,10 +13,14 @@ export interface HelloMessage {
         audio?: string[];
         video?: string[];
     };
-    /** Uplink microphone format the client will send. Absent = no mic uplink. */
+    /** Uplink microphone format the client will send. Absent = no mic uplink. `codec` is the
+     *  baseline the client can always send (`pcm16`); `codecs` is an optional preference-ordered
+     *  list the server picks from (e.g. `['opus', 'pcm16']`), the pick being reported in the
+     *  accept's ch1 descriptor. A server that predates `codecs` ignores it and answers `codec`. */
     mic?: {
         codec: 'pcm16';
         sample_rate: number;
+        codecs?: string[];
     };
     langs?: string[];
     response_language?: string;

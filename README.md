@@ -299,6 +299,7 @@ Theme with custom properties on the container rather than overriding rules — `
   workletUrl?: string;        // default '/mic-worklet.js'
   mic?: boolean;              // default true; false = receive-only (no getUserMedia, text via sendText)
   permittedStream?: MediaStream; // from ensureMicPermission(), avoids a second prompt
+  micCodec?: 'auto' | 'pcm16'; // default 'auto': Opus when WebCodecs + the box allow it, else pcm16
   prewarm?: () => Promise<void> | void;
   dev?: boolean;              // log unexpected state transitions + protocol violations
   callbacks?: { ... };        // see AvatarSessionOpts for the full set, incl.

@@ -1,7 +1,7 @@
 // GENERATED from packages/avatar-protocol/src/negotiation.ts — do not edit.
 // Re-sync with: pnpm --filter @casola/avatar-client sync-protocol
 import type { AudioChannelDescriptor, ChannelDescriptor, VideoChannelDescriptor } from './channels';
-import { Channel } from './channels';
+import { AUDIO_CODECS, type AudioCodec, Channel } from './channels';
 import { ErrorCode } from './codes';
 import type { AcceptMessage, HelloMessage } from './messages';
 
@@ -25,14 +25,26 @@ export interface SessionOffer {
   /** Downlink video the server can send, if any. Omitted/null with `poster` = poster mode. */
   video?: { mime: string; fps?: number; segFrames?: number } | null;
   poster?: { url: string } | null;
-  /** Uplink mic format the server expects. Omitted = no mic channel. */
-  mic?: { sampleRate: number } | null;
+  /** Uplink mic format the server expects. Omitted = no mic channel. `codecs` is what this
+   *  server can decode, in its own order of preference; omitted = `['pcm16']`. */
+  mic?: { sampleRate: number; codecs?: readonly string[] } | null;
   features?: string[];
 }
 
 export type NegotiationResult =
   | { ok: true; accept: Omit<AcceptMessage, 'seq'> }
   | { ok: false; code: string; message: string };
+
+function selectMicCodec(
+  mic: NonNullable<HelloMessage['mic']>,
+  offered: readonly string[] = ['pcm16']
+): AudioCodec | null {
+  const wanted = [...(mic.codecs ?? []), mic.codec];
+  const pick = wanted.find(
+    (codec) => (AUDIO_CODECS as readonly string[]).includes(codec) && offered.includes(codec)
+  );
+  return (pick as AudioCodec | undefined) ?? null;
+}
 
 export interface NegotiateOptions {
   /**
@@ -71,12 +83,17 @@ export function negotiateAccept(
 
   const channels: ChannelDescriptor[] = [];
   if (hello.mic) {
+    // The mic codec is the first entry of the client's preference list that this server offers,
+    // falling back to the baseline `codec` (always pcm16). Either side omitting `codecs` lands on
+    // pcm16, which is what keeps a new client compatible with an old box and vice versa.
+    const micCodec = selectMicCodec(hello.mic, offer.mic?.codecs);
     if (
       hello.mic.codec !== 'pcm16' ||
       !Number.isSafeInteger(hello.mic.sample_rate) ||
       hello.mic.sample_rate <= 0 ||
       !offer.mic ||
-      hello.mic.sample_rate !== offer.mic.sampleRate
+      hello.mic.sample_rate !== offer.mic.sampleRate ||
+      micCodec === null
     ) {
       return {
         ok: false,
@@ -88,7 +105,7 @@ export function negotiateAccept(
       id: Channel.MIC_UPLINK,
       dir: 'up',
       kind: 'audio',
-      codec: 'pcm16',
+      codec: micCodec,
       sample_rate: offer.mic.sampleRate,
       channels: 1,
     };

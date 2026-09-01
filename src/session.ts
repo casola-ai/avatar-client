@@ -1,4 +1,5 @@
 import { AvatarError, classifyMicError, toAvatarError } from './errors';
+import { OpusMicEncoder } from './mic-encoder';
 import { MicPipeline } from './mic-pipeline';
 import { MsePlayer } from './mse-player';
 import type { WidgetState } from './state';
@@ -96,6 +97,11 @@ export interface AvatarSessionOpts {
   mic?: boolean;
   /** Pre-fetched MediaStream from ensureMicPermission() — avoids a second getUserMedia call. */
   permittedStream?: MediaStream;
+  /** Mic uplink codec. Default `'auto'`: Opus (32 kbit/s, one packet per 100 ms frame) whenever
+   *  this browser's WebCodecs `AudioEncoder` supports it and the box accepts it, else raw pcm16 —
+   *  the box's accept decides, so an older box silently gets pcm16. `'pcm16'` never offers Opus:
+   *  the opt-out if an encoder misbehaves somewhere. */
+  micCodec?: 'auto' | 'pcm16';
   /** Test seam for the session WebSocket — see V2Driver. */
   createSocket?: (url: string, protocols: string[]) => DriverSocket;
   callbacks?: {
@@ -354,6 +360,13 @@ export class AvatarSession {
     if (this.done) return;
 
     const dev = this.opts.dev ?? false;
+    // The uplink codec preference goes in the hello, which the driver sends synchronously on
+    // socket open — so the (async) WebCodecs probe has to happen here, before the driver exists.
+    // Nothing else may run between the probe and the driver taking permittedStream below: an
+    // end() during the await must still find the stream for teardown() to stop.
+    const wantsOpus = this.opts.mic !== false && (this.opts.micCodec ?? 'auto') === 'auto';
+    const micCodecs = wantsOpus && (await OpusMicEncoder.supported(dev)) ? ['opus', 'pcm16'] : [];
+    if (this.done) return;
     // Transfer permittedStream ownership to the driver; clear here so teardown()
     // doesn't double-stop after the mic pipeline takes it over.
     const streamForMic = this.permittedStream;
@@ -367,6 +380,7 @@ export class AvatarSession {
       responseLanguage: this._responseLanguage,
       workletUrl: this.opts.workletUrl ?? '/mic-worklet.js',
       permittedStream: streamForMic ?? undefined,
+      micCodecs,
       dev,
       createSocket: this.opts.createSocket,
       handlers: {
