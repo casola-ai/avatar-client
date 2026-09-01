@@ -73,7 +73,11 @@ export interface ConnectStrategy {
 export interface AvatarSessionOpts {
     videoEl: HTMLVideoElement;
     connect: ConnectStrategy;
-    /** Initial ASR language pin (box language names, e.g. ['English']). [] / omitted = auto-detect. */
+    /** Initial ASR language pin as BCP-47 primary subtags, e.g. ['en'] or ['zh', 'en'].
+     *  ONE entry forces the recogniser to that language; SEVERAL name the likely set and leave
+     *  auto-detect on. [] / omitted = the session JWT's `spoken_languages` claim (if any), else
+     *  auto-detect hinted by `response_language`. Language NAMES ('English') are also accepted by
+     *  current boxes, but were silently DROPPED by every box before 2026-09-01 — send tags. */
     langs?: string[];
     /** Preferred REPLY language (BCP-47, e.g. 'zh-CN'): the avatar is instructed to strongly prefer
      *  answering in it. Omitted = the session JWT's `response_language` claim (if any), else the
