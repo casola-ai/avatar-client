@@ -1200,20 +1200,36 @@ var MicPipeline = class {
 // src/mic-encoder.ts
 var OPUS_MIC_BITRATE = 32e3;
 var FRAME_DURATION_US = Math.round(MIC_FRAME_SAMPLES / MIC_SAMPLE_RATE * 1e6);
+var OPUS_PACKET_US = 2e4;
 function opusMicEncoderConfig() {
   return {
     codec: "opus",
     sampleRate: MIC_SAMPLE_RATE,
     numberOfChannels: 1,
     bitrate: OPUS_MIC_BITRATE,
-    opus: { frameDuration: FRAME_DURATION_US, usedtx: false }
+    opus: { frameDuration: OPUS_PACKET_US, usedtx: false }
   };
+}
+function frameOpusPayload(packets) {
+  const total = packets.reduce((n, p) => n + 2 + p.byteLength, 0);
+  const out = new Uint8Array(total);
+  const view = new DataView(out.buffer);
+  let offset = 0;
+  for (const packet of packets) {
+    view.setUint16(offset, packet.byteLength, false);
+    out.set(packet, offset + 2);
+    offset += 2 + packet.byteLength;
+  }
+  return out;
 }
 var OpusMicEncoder = class {
   constructor(opts) {
     this.opts = opts;
     __publicField(this, "encoder", null);
     __publicField(this, "pending", []);
+    /** Packets of the wire frame being assembled, and the duration they cover so far. */
+    __publicField(this, "parts", []);
+    __publicField(this, "partsUs", 0);
     __publicField(this, "closed", false);
     const encoder = new AudioEncoder({
       output: (chunk) => this.onChunk(chunk),
@@ -1264,17 +1280,20 @@ var OpusMicEncoder = class {
   }
   onChunk(chunk) {
     if (this.closed) return;
-    const info = this.pending.shift();
-    if (!info) {
-      if (this.opts.dev) console.warn("[mic] opus chunk with no pending frame; dropped");
-      return;
-    }
-    if (this.opts.dev && chunk.timestamp !== (info.micSeq - 1) * FRAME_DURATION_US) {
-      console.warn("[mic] opus chunk timestamp drift", chunk.timestamp, info.micSeq);
-    }
     const packet = new Uint8Array(chunk.byteLength);
     chunk.copyTo(packet);
-    this.opts.onPacket(packet, info);
+    this.parts.push(packet);
+    this.partsUs += chunk.duration ?? OPUS_PACKET_US;
+    if (this.partsUs < FRAME_DURATION_US) return;
+    const parts = this.parts;
+    this.parts = [];
+    this.partsUs = 0;
+    const info = this.pending.shift();
+    if (!info) {
+      if (this.opts.dev) console.warn("[mic] opus frame with no pending calibration; dropped");
+      return;
+    }
+    this.opts.onPacket(frameOpusPayload(parts), info);
   }
   fail(err) {
     if (this.closed) return;
@@ -1285,6 +1304,8 @@ var OpusMicEncoder = class {
   stop() {
     this.closed = true;
     this.pending.length = 0;
+    this.parts = [];
+    this.partsUs = 0;
     const encoder = this.encoder;
     this.encoder = null;
     if (!encoder) return;

@@ -4,9 +4,15 @@ import { MIC_FRAME_SAMPLES, MIC_SAMPLE_RATE, type MicFrameInfo } from './mic-pip
  *  against 3200 B of raw PCM16 — the point of the codec. */
 export const OPUS_MIC_BITRATE = 32_000;
 
-/** One Opus packet per mic frame, so the packet duration IS the frame duration (100 ms). The wire
- *  (spec §4) keeps one frame = one 100 ms unit whichever codec ch1 negotiated. */
+/** The wire's frame unit (spec §4): one ch1 media frame = 100 ms, whichever codec negotiated. */
 const FRAME_DURATION_US = Math.round((MIC_FRAME_SAMPLES / MIC_SAMPLE_RATE) * 1_000_000);
+
+/** Opus packet duration. 20 ms — a single native Opus frame — and NOT the wire's 100 ms: WebCodecs
+ *  implementations build >60 ms packets by concatenating 20 ms frames in a repacketizer, and
+ *  Chromium's fails on the first encode ("Failed to add to Repacketizer", Chromium 151, any sample
+ *  rate) while `isConfigSupported` still answers true for it. So a 100 ms wire frame carries five
+ *  of these, length-prefixed (see `frameOpusPayload`). */
+export const OPUS_PACKET_US = 20_000;
 
 /** The exact configuration probed with `isConfigSupported` and later `configure`d — one function
  *  so the probe can never answer for a different config than the one used. DTX stays OFF: the
@@ -18,8 +24,23 @@ export function opusMicEncoderConfig(): AudioEncoderConfig {
     sampleRate: MIC_SAMPLE_RATE,
     numberOfChannels: 1,
     bitrate: OPUS_MIC_BITRATE,
-    opus: { frameDuration: FRAME_DURATION_US, usedtx: false },
+    opus: { frameDuration: OPUS_PACKET_US, usedtx: false },
   };
+}
+
+/** The payload of one `opus` ch1 media frame (spec §4): each packet prefixed by its byte length
+ *  as a big-endian u16, packets in capture order, durations summing to the frame's 100 ms. */
+export function frameOpusPayload(packets: readonly Uint8Array[]): Uint8Array {
+  const total = packets.reduce((n, p) => n + 2 + p.byteLength, 0);
+  const out = new Uint8Array(total);
+  const view = new DataView(out.buffer);
+  let offset = 0;
+  for (const packet of packets) {
+    view.setUint16(offset, packet.byteLength, false);
+    out.set(packet, offset + 2);
+    offset += 2 + packet.byteLength;
+  }
+  return out;
 }
 
 export interface OpusMicEncoderOpts {
@@ -35,14 +56,20 @@ export interface OpusMicEncoderOpts {
  * the driver's channel-1 media frames when the box's accept declared `codec: 'opus'`; the pipeline
  * itself (capture, resample, mute-as-zeros, capture calibration) is untouched.
  *
- * Output-to-input correlation is a FIFO of the pending frames' calibration, not the chunk
- * timestamp: WebCodecs emits chunks in input order, and Chromium derives chunk timestamps from the
- * first input plus accumulated frames rather than echoing each AudioData's own, so a
- * timestamp-keyed lookup would desync for good on any discontinuity.
+ * Each 100 ms pipeline frame becomes five 20 ms Opus packets (see OPUS_PACKET_US), which are
+ * gathered back into ONE wire frame by accumulated chunk duration, so the wire keeps its 100 ms
+ * cadence, `seq` and `pts_us` exactly as with pcm16. Output-to-input correlation is a FIFO of the
+ * pending frames' calibration, not the chunk timestamp: WebCodecs emits chunks in input order
+ * (asynchronously — the last packet of a frame may only surface once the next frame is fed), and
+ * Chromium derives chunk timestamps from the first input plus accumulated frames rather than
+ * echoing each AudioData's own, so a timestamp-keyed lookup would desync for good.
  */
 export class OpusMicEncoder {
   private encoder: AudioEncoder | null = null;
   private readonly pending: MicFrameInfo[] = [];
+  /** Packets of the wire frame being assembled, and the duration they cover so far. */
+  private parts: Uint8Array[] = [];
+  private partsUs = 0;
   private closed = false;
 
   /** Whether this browser can produce the wire's Opus packets. Asked once per session before the
@@ -100,17 +127,21 @@ export class OpusMicEncoder {
 
   private onChunk(chunk: EncodedAudioChunk): void {
     if (this.closed) return;
-    const info = this.pending.shift();
-    if (!info) {
-      if (this.opts.dev) console.warn('[mic] opus chunk with no pending frame; dropped');
-      return;
-    }
-    if (this.opts.dev && chunk.timestamp !== (info.micSeq - 1) * FRAME_DURATION_US) {
-      console.warn('[mic] opus chunk timestamp drift', chunk.timestamp, info.micSeq);
-    }
     const packet = new Uint8Array(chunk.byteLength);
     chunk.copyTo(packet);
-    this.opts.onPacket(packet, info);
+    this.parts.push(packet);
+    // `duration` is optional in the spec; every packet is OPUS_PACKET_US by configuration.
+    this.partsUs += chunk.duration ?? OPUS_PACKET_US;
+    if (this.partsUs < FRAME_DURATION_US) return;
+    const parts = this.parts;
+    this.parts = [];
+    this.partsUs = 0;
+    const info = this.pending.shift();
+    if (!info) {
+      if (this.opts.dev) console.warn('[mic] opus frame with no pending calibration; dropped');
+      return;
+    }
+    this.opts.onPacket(frameOpusPayload(parts), info);
   }
 
   private fail(err: unknown): void {
@@ -123,6 +154,8 @@ export class OpusMicEncoder {
   stop(): void {
     this.closed = true;
     this.pending.length = 0;
+    this.parts = [];
+    this.partsUs = 0;
     const encoder = this.encoder;
     this.encoder = null;
     if (!encoder) return;

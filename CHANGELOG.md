@@ -6,6 +6,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-01
+
+### Fixed
+- **0.4.0's Opus uplink failed on every WebCodecs browser.** It encoded one 100 ms Opus packet per
+  mic frame; Chromium (151 verified) answers `isConfigSupported: true` for that and then fails the
+  first `encode()` with `EncodingError: Failed to add to Repacketizer`, which hosts saw as a
+  terminal `mic-failed` right after the accept. The encoder now produces native 20 ms packets and
+  each wire frame carries five of them, each prefixed by a big-endian u16 length (spec §4). Wire
+  cadence, `seq`, `pts_us` and `onAudioFrameSent` are unchanged. Boxes need the matching decoder
+  (casola-ai/avatar #459 as updated); they keep accepting 0.4.0's bare single packet as well.
+
 ## [0.4.0] - 2026-08-31
 
 Additive. A host that passes nothing new behaves as on 0.3.1 except that, where the browser and the
