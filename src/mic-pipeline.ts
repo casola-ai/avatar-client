@@ -97,9 +97,20 @@ export class MicPipeline {
     // echoCancellation MUST stay ON (desktop + mobile): the browser/OS hardware AEC cancels the
     // avatar's speaker output at the acoustic source — the dominant echo path, and the only one that
     // works without headphones. Any box-side server AEC is a backstop, not a replacement. Do NOT set
-    // false. noiseSuppression/autoGainControl stay OFF (AGC pumps mic levels and hurts ASR).
+    // false.
+    //
+    // noiseSuppression (0.4.2) and autoGainControl (0.5.0) are both ON. Both were off because this
+    // capture once fed a box-side LINEAR echo canceller (SERVER_AEC), for which a nonlinear
+    // time-varying gain ahead of it breaks the echo-path model (avatar web/.legacy/main.js:437).
+    // That canceller was retired in casola-ai/avatar#227 — browser AEC3 is now the sole echo
+    // handler — so both constraints outlived their reason, while the box's own debug UI
+    // (avatar ui/index.html:773) has run all three on ever since.
+    //
+    // AGC matters because nothing else in the chain normalizes level: the worklet, the resampler
+    // and the box are all unity gain, so without it the box compares a RAW hardware capture level
+    // against its absolute VAD bars and a quiet mic is simply never heard (#687).
     return navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false },
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       video: false,
     });
   }
@@ -111,7 +122,7 @@ export class MicPipeline {
       this.stream = opts.stream;
     } else {
       this.stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false },
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
         video: false,
       });
     }

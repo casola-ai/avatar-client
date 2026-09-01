@@ -6,6 +6,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-01
+
+### Changed
+- **Microphone capture now requests `autoGainControl: true`**, completing the pair started in
+  0.4.2. Nothing else in the chain normalizes level — the worklet, the resampler and the box are
+  all unity gain — so without AGC the box compares a raw hardware capture level against absolute
+  VAD bars, and a user with low input gain has no path to being heard. Minor rather than patch:
+  the box's `MIC_ONSET_RMS`/`MIC_OFFSET_RMS` are calibrated for AGC-off capture and may need
+  re-tuning alongside this. See #687.
+
+## [0.4.2] - 2026-09-01
+
+### Changed
+- **Microphone capture now requests `noiseSuppression: true`.** It was off because this capture
+  once fed a box-side *linear* echo canceller (`SERVER_AEC`), for which a nonlinear time-varying
+  gain ahead of it breaks the echo-path model. That canceller was retired in `casola-ai/avatar`
+  #227 — the browser's AEC3 has been the sole echo handler since — so the constraint had outlived
+  its reason, while the box's own debug UI has run noise suppression on throughout. Hosts need no
+  change; `echoCancellation` stays on and `autoGainControl` stays off (tracked in #687, which
+  needs a measured rollout because it rescales the signal the box's absolute VAD bars are
+  calibrated against).
+
 ## [0.4.1] - 2026-09-01
 
 ### Fixed

@@ -1060,7 +1060,7 @@ var MicPipeline = class {
       throw err;
     }
     return navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false },
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       video: false
     });
   }
@@ -1071,7 +1071,7 @@ var MicPipeline = class {
       this.stream = opts.stream;
     } else {
       this.stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false },
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
         video: false
       });
     }
