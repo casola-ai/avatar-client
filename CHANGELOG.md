@@ -6,6 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-06
+
+### Fixed
+- **A re-start of an utterance ignores a stale end that precedes it.** When the box reported
+  "utterance N started", "utterance N ended" and "utterance N started" again before the local
+  playhead had reached the first start, `UtteranceScheduler.receiveStart` merged the re-start
+  with the dropped interval and kept its old end; an interval that ends before it begins never
+  fires, and the caption stopped at the first sentence. An inherited end at or before the new
+  start is now cleared, so the re-start is a fresh interval. See #692.
+
 ## [0.5.0] - 2026-09-01
 
 ### Changed

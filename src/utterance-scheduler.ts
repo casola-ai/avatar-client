@@ -50,6 +50,11 @@ export class UtteranceScheduler {
     if (this.stopped || this.cancelled.has(message.utterance_id)) return;
     const previous = this.entries.get(message.utterance_id);
     if (previous?.status === 'active') return;
+    // A re-start of a known id after its end (the box read a hole inside the utterance and
+    // re-announced it) is a NEW interval: an end at or before the new start is stale, and
+    // keeping it would leave the entry with end <= start -- never startable, dropped on the
+    // next advance, the utterance gone from the transcript (live 2026-09-05).
+    const stale = previous?.endPtsUs !== undefined && previous.endPtsUs <= message.start_pts_us;
     this.entries.set(message.utterance_id, {
       turnId: message.turn_id,
       utteranceId: message.utterance_id,
@@ -58,8 +63,8 @@ export class UtteranceScheduler {
       textFinal: message.text_final,
       language: message.language,
       revision: previous?.revision ?? -1,
-      endPtsUs: previous?.endPtsUs,
-      reason: previous?.reason,
+      endPtsUs: stale ? undefined : previous?.endPtsUs,
+      reason: stale ? undefined : previous?.reason,
       status: 'pending',
     });
   }

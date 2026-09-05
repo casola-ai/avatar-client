@@ -1960,6 +1960,7 @@ var UtteranceScheduler = class {
     if (this.stopped || this.cancelled.has(message.utterance_id)) return;
     const previous = this.entries.get(message.utterance_id);
     if (previous?.status === "active") return;
+    const stale = previous?.endPtsUs !== void 0 && previous.endPtsUs <= message.start_pts_us;
     this.entries.set(message.utterance_id, {
       turnId: message.turn_id,
       utteranceId: message.utterance_id,
@@ -1968,8 +1969,8 @@ var UtteranceScheduler = class {
       textFinal: message.text_final,
       language: message.language,
       revision: previous?.revision ?? -1,
-      endPtsUs: previous?.endPtsUs,
-      reason: previous?.reason,
+      endPtsUs: stale ? void 0 : previous?.endPtsUs,
+      reason: stale ? void 0 : previous?.reason,
       status: "pending"
     });
   }
