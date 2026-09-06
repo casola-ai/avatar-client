@@ -14,7 +14,7 @@ export type {
 export { attachSessionControls } from './controls';
 export type { DisclosureController, DisclosureOptions } from './disclosure';
 export { attachDisclosure } from './disclosure';
-export type { AvatarErrorKind } from './errors';
+export type { AvatarErrorKind, AvatarErrorStage } from './errors';
 export { AvatarError, classifyMicError, isMicError } from './errors';
 export type { PlayoutClock } from './playout-clock';
 // Wire identifiers, for advanced integrations (custom ConnectStrategy / diagnostics).

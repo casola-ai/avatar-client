@@ -9,6 +9,9 @@ import { type DriverSocket, type EndReason, type Turn, V2Driver } from './v2/dri
 
 export type { EndReason, Turn, WidgetState };
 
+/** How long `opts.prewarm` may hold the connect before the session proceeds without it. */
+const PREWARM_TIMEOUT_MS = 5_000;
+
 /** What {@link AvatarSession.preflight} found. `ok: false` carries the classified reason, so a
  *  host picks copy from `error.kind` instead of sniffing DOMException names itself. */
 export type PreflightResult =
@@ -356,10 +359,34 @@ export class AvatarSession {
     if (this.done) return;
     this.sm.set('connecting');
 
-    try {
-      await this.opts.prewarm?.();
-    } catch {
-      /* best-effort */
+    // Best-effort, and BOUNDED: a prewarm that hangs used to hold the whole connect hostage
+    // before the session socket was even created (avatar#513). Past the deadline the connect
+    // proceeds without it, and the host hears a non-terminal `timeout`/`prewarm` so it can count
+    // how often that happens.
+    if (this.opts.prewarm) {
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      try {
+        await Promise.race([
+          Promise.resolve().then(() => this.opts.prewarm?.()),
+          new Promise<'timeout'>((resolve) => {
+            timer = setTimeout(() => resolve('timeout'), PREWARM_TIMEOUT_MS);
+          }),
+        ]).then((outcome) => {
+          if (outcome === 'timeout' && !this.done) {
+            this.emit(
+              'error',
+              new AvatarError('timeout', `prewarm exceeded ${PREWARM_TIMEOUT_MS / 1000}s`, {
+                terminal: false,
+                stage: 'prewarm',
+              })
+            );
+          }
+        });
+      } catch {
+        /* best-effort */
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
     }
     if (this.done) return;
 

@@ -82,7 +82,9 @@ export declare class V2Driver {
     private finished;
     private timedUtterances;
     private framedMediaUnits;
+    private openTimer;
     private handshakeTimer;
+    private mediaTimer;
     private ackTimer;
     private pingTimer;
     private textSequence;

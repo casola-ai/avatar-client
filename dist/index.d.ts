@@ -5,7 +5,7 @@ export type { SessionControlLabels, SessionControlsController, SessionControlsOp
 export { attachSessionControls } from './controls';
 export type { DisclosureController, DisclosureOptions } from './disclosure';
 export { attachDisclosure } from './disclosure';
-export type { AvatarErrorKind } from './errors';
+export type { AvatarErrorKind, AvatarErrorStage } from './errors';
 export { AvatarError, classifyMicError, isMicError } from './errors';
 export type { PlayoutClock } from './playout-clock';
 export { CloseCode, SUBPROTOCOL } from './protocol';

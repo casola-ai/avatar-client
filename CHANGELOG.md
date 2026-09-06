@@ -6,6 +6,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-06
+
+### Added
+- **Connect watchdogs.** The session socket must `open` within 30 s of being created and, for a
+  video session, show a first frame within 20 s of the box's `accept`; either overrun ends the
+  session with a terminal `AvatarError` of the new kind `'timeout'`. Before this, the only
+  connect-phase timer started on `open`, so a black-holed upgrade left the host at "Connecting…"
+  forever (avatar#513). A `prewarm` that runs past 5 s no longer holds the connect: the session
+  proceeds and emits a non-terminal `timeout` so the host can count it.
+- **`AvatarError.stage`** (`'prewarm' | 'open' | 'handshake' | 'first-media'`) on the errors a
+  watchdog produced, and the exported `AvatarErrorStage` type. The existing handshake timeout keeps
+  its kind (`'handshake'`) and gains `stage: 'handshake'`.
+
 ## [0.5.1] - 2026-09-06
 
 ### Fixed

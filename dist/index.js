@@ -567,9 +567,12 @@ var AvatarError = class extends Error {
     __publicField(this, "kind");
     /** `false` when the session is still running and this is a degradation, not an ending. */
     __publicField(this, "terminal");
+    /** The connect stage a watchdog fired in. Absent unless a timer produced this error. */
+    __publicField(this, "stage");
     this.name = "AvatarError";
     this.kind = kind;
     this.terminal = options.terminal ?? true;
+    if (options.stage !== void 0) this.stage = options.stage;
     if (options.cause !== void 0) this.cause = options.cause;
   }
 };
@@ -586,7 +589,11 @@ function classifyMicError(error) {
 function toAvatarError(error, kind, options = {}) {
   if (error instanceof AvatarError) return error;
   const message = options.message ?? (error instanceof Error ? error.message : typeof error === "string" ? error : String(error));
-  return new AvatarError(kind, message, { terminal: options.terminal, cause: error });
+  return new AvatarError(kind, message, {
+    terminal: options.terminal,
+    cause: error,
+    stage: options.stage
+  });
 }
 
 // src/protocol/channels.ts
@@ -2082,6 +2089,8 @@ var END_REASONS = ["cap", "kicked", "expired", "dropped"];
 var PLAYOUT_ACK_INTERVAL_MS = 300;
 var KEEPALIVE_PING_MS = 15e3;
 var TEXT_TIMEOUT_MS = 3e4;
+var OPEN_TIMEOUT_MS = 3e4;
+var FIRST_MEDIA_TIMEOUT_MS = 2e4;
 var V2Driver = class {
   constructor(opts) {
     this.opts = opts;
@@ -2100,7 +2109,9 @@ var V2Driver = class {
     __publicField(this, "finished", false);
     __publicField(this, "timedUtterances", false);
     __publicField(this, "framedMediaUnits", false);
+    __publicField(this, "openTimer", null);
     __publicField(this, "handshakeTimer", null);
+    __publicField(this, "mediaTimer", null);
     __publicField(this, "ackTimer", null);
     __publicField(this, "pingTimer", null);
     __publicField(this, "textSequence", 0);
@@ -2123,7 +2134,16 @@ var V2Driver = class {
     const transport = webSocketTransport(socket);
     const conn = clientProtocolConnection(transport);
     this.conn = conn;
+    this.openTimer = setTimeout(() => {
+      this.fail(
+        new Error(`socket open timeout: no open within ${OPEN_TIMEOUT_MS / 1e3}s`),
+        "timeout",
+        "open"
+      );
+    }, OPEN_TIMEOUT_MS);
     transport.onOpen(() => {
+      if (this.openTimer) clearTimeout(this.openTimer);
+      this.openTimer = null;
       if (this.finished) return;
       if (socket.protocol !== void 0 && socket.protocol !== SUBPROTOCOL) {
         this.fail(new Error(`server did not echo subprotocol ${SUBPROTOCOL}`), "protocol-mismatch");
@@ -2149,7 +2169,7 @@ var V2Driver = class {
         resume: null
       });
       this.handshakeTimer = setTimeout(() => {
-        this.fail(new Error("handshake timeout: no accept from the box"), "handshake");
+        this.fail(new Error("handshake timeout: no accept from the box"), "handshake", "handshake");
       }, HANDSHAKE_TIMEOUT_MS);
     });
     conn.onMessage((msg) => this.onServerMessage(msg));
@@ -2271,8 +2291,19 @@ var V2Driver = class {
     if (videoCh) {
       const mse = new MsePlayer(this.opts.videoEl, this.opts.dev);
       this.mse = mse;
+      this.mediaTimer = setTimeout(() => {
+        this.fail(
+          new Error(`no first video frame within ${FIRST_MEDIA_TIMEOUT_MS / 1e3}s of accept`),
+          "timeout",
+          "first-media"
+        );
+      }, FIRST_MEDIA_TIMEOUT_MS);
       mse.attach({
-        onFirstFrame: () => handlers.onFirstFrame(),
+        onFirstFrame: () => {
+          if (this.mediaTimer) clearTimeout(this.mediaTimer);
+          this.mediaTimer = null;
+          handlers.onFirstFrame();
+        },
         onError: (err) => handlers.onError(toAvatarError(err, "media", { terminal: false }), false),
         onAudioBlocked: () => handlers.onAudioBlocked()
       });
@@ -2415,7 +2446,7 @@ var V2Driver = class {
       );
     }
   }
-  fail(err, kind = "connect") {
+  fail(err, kind = "connect", stage) {
     if (this.finished) return;
     this.finished = true;
     this.teardown();
@@ -2423,7 +2454,7 @@ var V2Driver = class {
       this.conn?.close(CloseCode.NORMAL);
     } catch {
     }
-    this.opts.handlers.onError(toAvatarError(err, kind), true);
+    this.opts.handlers.onError(toAvatarError(err, kind, { stage }), true);
   }
   async sendText(text) {
     const value = text.trim();
@@ -2503,8 +2534,12 @@ var V2Driver = class {
     this.teardown();
   }
   teardown() {
+    if (this.openTimer) clearTimeout(this.openTimer);
+    this.openTimer = null;
     if (this.handshakeTimer) clearTimeout(this.handshakeTimer);
     this.handshakeTimer = null;
+    if (this.mediaTimer) clearTimeout(this.mediaTimer);
+    this.mediaTimer = null;
     if (this.ackTimer) clearInterval(this.ackTimer);
     this.ackTimer = null;
     if (this.pingTimer) clearInterval(this.pingTimer);
@@ -2530,6 +2565,7 @@ var V2Driver = class {
 };
 
 // src/session.ts
+var PREWARM_TIMEOUT_MS = 5e3;
 var AvatarSession = class {
   constructor(opts) {
     this.opts = opts;
@@ -2723,9 +2759,29 @@ var AvatarSession = class {
   async openSession(target) {
     if (this.done) return;
     this.sm.set("connecting");
-    try {
-      await this.opts.prewarm?.();
-    } catch {
+    if (this.opts.prewarm) {
+      let timer = null;
+      try {
+        await Promise.race([
+          Promise.resolve().then(() => this.opts.prewarm?.()),
+          new Promise((resolve3) => {
+            timer = setTimeout(() => resolve3("timeout"), PREWARM_TIMEOUT_MS);
+          })
+        ]).then((outcome) => {
+          if (outcome === "timeout" && !this.done) {
+            this.emit(
+              "error",
+              new AvatarError("timeout", `prewarm exceeded ${PREWARM_TIMEOUT_MS / 1e3}s`, {
+                terminal: false,
+                stage: "prewarm"
+              })
+            );
+          }
+        });
+      } catch {
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
     }
     if (this.done) return;
     const dev = this.opts.dev ?? false;

@@ -1,4 +1,10 @@
-import { AvatarError, type AvatarErrorKind, classifyMicError, toAvatarError } from '../errors';
+import {
+  AvatarError,
+  type AvatarErrorKind,
+  type AvatarErrorStage,
+  classifyMicError,
+  toAvatarError,
+} from '../errors';
 import { type MediaUnit, MediaUnitAssembler } from '../media-unit-assembler';
 import { OpusMicEncoder } from '../mic-encoder';
 import {
@@ -122,6 +128,15 @@ const END_REASONS: readonly EndReason[] = ['cap', 'kicked', 'expired', 'dropped'
 const PLAYOUT_ACK_INTERVAL_MS = 300;
 const KEEPALIVE_PING_MS = 15_000;
 const TEXT_TIMEOUT_MS = 30_000;
+/**
+ * `new WebSocket` → `open`. Generous on purpose: the box's router completes the upgrade only after
+ * its persona pull (`conv_router.py` accepts after `_ensure_persona`, up to ~22 s on a cold
+ * persona), so a healthy connect can legitimately sit in CONNECTING for 25 s. Anything past this
+ * is a black-holed upgrade, which before this timer was "Connecting…" forever (avatar#513).
+ */
+const OPEN_TIMEOUT_MS = 30_000;
+/** `accept` → first decoded video frame, video sessions only (poster mode has no frame to wait for). */
+const FIRST_MEDIA_TIMEOUT_MS = 20_000;
 
 /**
  * The protocol-v2 session driver: one WebSocket, JSON control + binary media frames
@@ -147,7 +162,9 @@ export class V2Driver {
   private timedUtterances = false;
   private framedMediaUnits = false;
 
+  private openTimer: ReturnType<typeof setTimeout> | null = null;
   private handshakeTimer: ReturnType<typeof setTimeout> | null = null;
+  private mediaTimer: ReturnType<typeof setTimeout> | null = null;
   private ackTimer: ReturnType<typeof setInterval> | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -176,8 +193,19 @@ export class V2Driver {
     const transport = webSocketTransport(socket);
     const conn = clientProtocolConnection(transport);
     this.conn = conn;
+    // Armed from the moment the socket exists. The handshake timer below cannot cover this gap:
+    // it starts on `open`, and the failure here is that `open` never comes.
+    this.openTimer = setTimeout(() => {
+      this.fail(
+        new Error(`socket open timeout: no open within ${OPEN_TIMEOUT_MS / 1000}s`),
+        'timeout',
+        'open'
+      );
+    }, OPEN_TIMEOUT_MS);
 
     transport.onOpen(() => {
+      if (this.openTimer) clearTimeout(this.openTimer);
+      this.openTimer = null;
       if (this.finished) return;
       // Browsers fail the connection themselves when a requested subprotocol is not granted;
       // this guards the non-browser sockets (tests, future runtimes) to the same rule.
@@ -209,7 +237,7 @@ export class V2Driver {
         resume: null,
       });
       this.handshakeTimer = setTimeout(() => {
-        this.fail(new Error('handshake timeout: no accept from the box'), 'handshake');
+        this.fail(new Error('handshake timeout: no accept from the box'), 'handshake', 'handshake');
       }, HANDSHAKE_TIMEOUT_MS);
     });
 
@@ -347,8 +375,21 @@ export class V2Driver {
     if (videoCh) {
       const mse = new MsePlayer(this.opts.videoEl, this.opts.dev);
       this.mse = mse;
+      // Accepted, but nothing ever plays: a box whose render path stalled after the handshake.
+      // Video sessions only — poster mode reports its first frame synchronously just below.
+      this.mediaTimer = setTimeout(() => {
+        this.fail(
+          new Error(`no first video frame within ${FIRST_MEDIA_TIMEOUT_MS / 1000}s of accept`),
+          'timeout',
+          'first-media'
+        );
+      }, FIRST_MEDIA_TIMEOUT_MS);
       mse.attach({
-        onFirstFrame: () => handlers.onFirstFrame(),
+        onFirstFrame: () => {
+          if (this.mediaTimer) clearTimeout(this.mediaTimer);
+          this.mediaTimer = null;
+          handlers.onFirstFrame();
+        },
         onError: (err) => handlers.onError(toAvatarError(err, 'media', { terminal: false }), false),
         onAudioBlocked: () => handlers.onAudioBlocked(),
       });
@@ -520,7 +561,7 @@ export class V2Driver {
     }
   }
 
-  private fail(err: unknown, kind: AvatarErrorKind = 'connect'): void {
+  private fail(err: unknown, kind: AvatarErrorKind = 'connect', stage?: AvatarErrorStage): void {
     if (this.finished) return;
     this.finished = true;
     this.teardown();
@@ -529,7 +570,7 @@ export class V2Driver {
     } catch {
       /* */
     }
-    this.opts.handlers.onError(toAvatarError(err, kind), true);
+    this.opts.handlers.onError(toAvatarError(err, kind, { stage }), true);
   }
 
   async sendText(text: string): Promise<Turn> {
@@ -621,8 +662,12 @@ export class V2Driver {
   }
 
   private teardown(): void {
+    if (this.openTimer) clearTimeout(this.openTimer);
+    this.openTimer = null;
     if (this.handshakeTimer) clearTimeout(this.handshakeTimer);
     this.handshakeTimer = null;
+    if (this.mediaTimer) clearTimeout(this.mediaTimer);
+    this.mediaTimer = null;
     if (this.ackTimer) clearInterval(this.ackTimer);
     this.ackTimer = null;
     if (this.pingTimer) clearInterval(this.pingTimer);

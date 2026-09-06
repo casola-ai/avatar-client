@@ -40,23 +40,39 @@ export type AvatarErrorKind =
   | 'server'
   /** Playback trouble — MSE append failure, decode hiccup. Usually non-terminal. */
   | 'media'
+  /**
+   * A connect-phase watchdog fired: the socket never opened, or the box accepted and then never
+   * sent a first video frame. `stage` says which. Distinct from `connect` (refused or closed) and
+   * `handshake` (opened, no accept): nothing went wrong that the wire reported — it went quiet,
+   * which is the failure a stalled edge or a black-holed upgrade produces (avatar#513).
+   */
+  | 'timeout'
   | 'unknown';
+
+/**
+ * Where in the connect sequence a watchdog fired. Only present on the errors a timer produced;
+ * a host picks copy from `kind` and uses this for its analytics/support line.
+ */
+export type AvatarErrorStage = 'prewarm' | 'open' | 'handshake' | 'first-media';
 
 /** A classified session error. Always an `Error`; `kind` and `terminal` are the useful parts. */
 export class AvatarError extends Error {
   readonly kind: AvatarErrorKind;
   /** `false` when the session is still running and this is a degradation, not an ending. */
   readonly terminal: boolean;
+  /** The connect stage a watchdog fired in. Absent unless a timer produced this error. */
+  readonly stage?: AvatarErrorStage;
 
   constructor(
     kind: AvatarErrorKind,
     message: string,
-    options: { terminal?: boolean; cause?: unknown } = {}
+    options: { terminal?: boolean; cause?: unknown; stage?: AvatarErrorStage } = {}
   ) {
     super(message);
     this.name = 'AvatarError';
     this.kind = kind;
     this.terminal = options.terminal ?? true;
+    if (options.stage !== undefined) this.stage = options.stage;
     if (options.cause !== undefined) this.cause = options.cause;
   }
 }
@@ -92,11 +108,15 @@ export function classifyMicError(error: unknown): AvatarErrorKind {
 export function toAvatarError(
   error: unknown,
   kind: AvatarErrorKind,
-  options: { terminal?: boolean; message?: string } = {}
+  options: { terminal?: boolean; message?: string; stage?: AvatarErrorStage } = {}
 ): AvatarError {
   if (error instanceof AvatarError) return error;
   const message =
     options.message ??
     (error instanceof Error ? error.message : typeof error === 'string' ? error : String(error));
-  return new AvatarError(kind, message, { terminal: options.terminal, cause: error });
+  return new AvatarError(kind, message, {
+    terminal: options.terminal,
+    cause: error,
+    stage: options.stage,
+  });
 }

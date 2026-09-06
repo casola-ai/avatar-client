@@ -252,11 +252,14 @@ and a `terminal` flag. Branch on `kind` instead of sniffing `DOMException` names
 |---|---|
 | `mic-permission`, `mic-unavailable`, `mic-failed` | the microphone — the only kinds "check your mic" is correct for (`isMicError`) |
 | `unsupported-browser` | this browser cannot do what the session needs |
-| `connect`, `handshake` | the socket never opened, or the box never completed the handshake |
+| `connect`, `handshake` | the socket was refused or closed before accept, or the box never completed the handshake |
+| `timeout` | a connect watchdog fired: the socket never opened (30 s), or the box accepted and never sent a first video frame (20 s). `stage` says which (`'open'`, `'first-media'`; a slow `prewarm` is a non-terminal `'prewarm'`) |
 | `unauthorized`, `protocol-mismatch`, `persona-unavailable`, `capacity`, `policy` | the box refused: close 4001 / 4002 / 4003 / 4004 / 4008 |
 | `server`, `media` | in-band error or a playback hiccup — usually `terminal: false` |
 
-Treat an unrecognized kind as `unknown`; the list grows.
+Treat an unrecognized kind as `unknown`; the list grows. Errors a timer produced also carry
+`stage` (`AvatarErrorStage`): where in the connect sequence it fired, for your analytics and the
+support line you show the user.
 
 ### Muting: user choice vs application suppression
 
