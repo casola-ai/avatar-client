@@ -87,8 +87,10 @@ new AvatarSession(opts: AvatarSessionOpts)
 | `.state` | Current `WidgetState`. |
 | `.sessionCapSeconds` | The session cap — the box's authoritative `cap_seconds` once connected. |
 | `.personaKey` | The avatar version the box bound, echoed in the handshake (the persona-pinning ack). |
+| `.videoCodec` | The downlink video codec the box negotiated — `'h264'`, `'hevc'` or `'av1'`; `undefined` before the handshake and in poster mode. A box that does not negotiate reports `'h264'`. |
 | `AvatarSession.ensureMicPermission()` | Request mic permission before `start()`. |
 | `AvatarSession.primeVideoElement(video)` | Call synchronously in the call-button tap handler, before any `await`: clears WebKit's per-element gesture restrictions so iOS Safari honors the SDK's unmute (otherwise the first call in a fresh browsing context plays muted, and pre-fix rendered as a slideshow). |
+| `AvatarSession.decodableVideoCodecs()` | The downlink codecs this browser can decode, which is what `videoCodec: 'auto'` offers the box. Diagnostics — report it next to `.videoCodec` to explain where a session landed. `[]` without MSE. |
 | `AvatarSession.mediaSupported()` | `false` on browsers without MSE. Poster-mode sessions (poster + audio) work regardless — the SDK simply doesn't offer video in the handshake. |
 
 ### `attachDisclosure(target, options)`
@@ -303,6 +305,8 @@ Theme with custom properties on the container rather than overriding rules — `
   mic?: boolean;              // default true; false = receive-only (no getUserMedia, text via sendText)
   permittedStream?: MediaStream; // from ensureMicPermission(), avoids a second prompt
   micCodec?: 'auto' | 'pcm16'; // default 'auto': Opus when WebCodecs + the box allow it, else pcm16
+  videoCodec?: 'auto' | 'h264'; // default 'auto': offer every codec this browser decodes (AV1 /
+                              // HEVC / H.264) and let the box pick; 'h264' offers none
   prewarm?: () => Promise<void> | void;
   dev?: boolean;              // log unexpected state transitions + protocol violations
   callbacks?: { ... };        // see AvatarSessionOpts for the full set, incl.

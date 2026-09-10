@@ -1,5 +1,6 @@
 import { ClockMap } from './clock-map';
 import type { PlayoutClock } from './playout-clock';
+import type { VideoCodec } from './protocol';
 
 export interface MseHandlers {
   onFirstFrame?: () => void;
@@ -10,7 +11,19 @@ export interface MseHandlers {
   onAudioBlocked?: () => void;
 }
 
-type MediaSourceCtor = { new (): MediaSource };
+type MediaSourceCtor = { new (): MediaSource; isTypeSupported?(mime: string): boolean };
+
+/**
+ * What to probe for `hello.video.codecs`. The mime of each candidate is the string the GPU box
+ * actually produces for that codec (hevc is muxed as `hvc1`, not `hev1` — what MSE and Safari
+ * require), so a positive probe here means this browser can play that box's stream. Audio rides
+ * muxed in the same container, which is why `mp4a.40.2` is part of every probe.
+ */
+const VIDEO_CODEC_PROBES: ReadonlyArray<{ codec: VideoCodec; mime: string }> = [
+  { codec: 'av1', mime: 'video/mp4; codecs="av01.0.05M.08,mp4a.40.2"' },
+  { codec: 'hevc', mime: 'video/mp4; codecs="hvc1.1.6.L93.90,mp4a.40.2"' },
+  { codec: 'h264', mime: 'video/mp4; codecs="avc1.4d401f,mp4a.40.2"' },
+];
 
 interface PendingAppend {
   bytes: Uint8Array<ArrayBuffer>;
@@ -36,6 +49,28 @@ function getMediaSourceCtor(): MediaSourceCtor | null {
 export class MsePlayer implements PlayoutClock {
   static supported(): boolean {
     return getMediaSourceCtor() !== null;
+  }
+
+  /**
+   * The downlink video codecs this browser can DECODE, for `hello.video.codecs`. Probed against
+   * the same MediaSource implementation the player will use (`ManagedMediaSource` on iOS), because
+   * the two disagree: Safari's ManagedMediaSource plays HEVC the plain one does not offer. The
+   * order is this list's, not a preference — the box owns the choice. `[]` where MSE is absent
+   * (poster mode), so the hello simply omits the field and the box serves h264.
+   */
+  static decodableVideoCodecs(): VideoCodec[] {
+    const Ctor = getMediaSourceCtor();
+    if (!Ctor || typeof Ctor.isTypeSupported !== 'function') return [];
+    const supported = Ctor.isTypeSupported.bind(Ctor);
+    const out: VideoCodec[] = [];
+    for (const probe of VIDEO_CODEC_PROBES) {
+      try {
+        if (supported(probe.mime)) out.push(probe.codec);
+      } catch {
+        /* a throwing isTypeSupported is a "no" */
+      }
+    }
+    return out;
   }
 
   private ms: MediaSource | null = null;

@@ -1,4 +1,5 @@
 import type { PlayoutClock } from './playout-clock';
+import type { VideoCodec } from './protocol';
 export interface MseHandlers {
     onFirstFrame?: () => void;
     onError?: (err: unknown) => void;
@@ -17,6 +18,14 @@ export declare class MsePlayer implements PlayoutClock {
     private readonly video;
     private readonly dev;
     static supported(): boolean;
+    /**
+     * The downlink video codecs this browser can DECODE, for `hello.video.codecs`. Probed against
+     * the same MediaSource implementation the player will use (`ManagedMediaSource` on iOS), because
+     * the two disagree: Safari's ManagedMediaSource plays HEVC the plain one does not offer. The
+     * order is this list's, not a preference — the box owns the choice. `[]` where MSE is absent
+     * (poster mode), so the hello simply omits the field and the box serves h264.
+     */
+    static decodableVideoCodecs(): VideoCodec[];
     private ms;
     private sb;
     private mime;

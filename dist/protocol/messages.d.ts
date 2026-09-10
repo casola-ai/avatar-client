@@ -22,6 +22,13 @@ export interface HelloMessage {
         sample_rate: number;
         codecs?: string[];
     };
+    /** The client's DECODE capability for the fMP4 downlink, e.g. `{ codecs: ['av1','hevc','h264'] }`
+     *  — what the browser can play, in no meaningful order (the server holds the preference). Absent
+     *  or empty means h264 only. The server's pick lands in the accept's ch3 descriptor as
+     *  `video_codec`, with the matching `mime`. */
+    video?: {
+        codecs?: string[];
+    };
     langs?: string[];
     response_language?: string;
     /** Optional feature names (unknown entries ignored) — minor evolution without a v3. */

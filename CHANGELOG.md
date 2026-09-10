@@ -6,6 +6,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-10
+
+### Added
+- **Negotiable downlink video codec.** The hello now carries `video.codecs` — every codec this
+  browser can decode, probed with `MediaSource.isTypeSupported` against the same implementation the
+  player uses (`ManagedMediaSource` on iOS) — and the box answers with the one it will serve in the
+  ch3 descriptor's new `video_codec`, alongside that stream's own `mime`. The list is a
+  **capability, not a preference**: the box walks its own order (av1 → hevc → h264, by measured
+  bits-per-quality) and serves the first entry the client named, because it is the side holding the
+  numbers. On the GPU box av1 ships the same quality as h264 for ~20–40 % fewer bits.
+  Compatibility is total in both directions: a box that predates the feature ignores `hello.video`
+  and sends no `video_codec`, which means h264 — today's stream, byte for byte — and a client that
+  offers nothing gets the same.
+- **`AvatarSessionOpts.videoCodec`** (`'auto' | 'h264'`, default `'auto'`), mirroring `micCodec`.
+  `'h264'` offers nothing and is the opt-out if a platform's hardware decode misbehaves.
+- **`AvatarSession.videoCodec`** — the codec the box negotiated for this session (`'h264'` from a
+  box that does not negotiate), `undefined` before the accept and in poster mode — and
+  **`AvatarSession.decodableVideoCodecs()`** / `MsePlayer.decodableVideoCodecs()`, what the hello
+  offers. Report the pair to explain where a given session landed.
+- The `VideoCodec` type and `VIDEO_CODECS` are exported.
+
 ## [0.6.0] - 2026-09-06
 
 ### Added

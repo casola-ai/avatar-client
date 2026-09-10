@@ -1,7 +1,7 @@
 // GENERATED from packages/avatar-protocol/src/negotiation.ts — do not edit.
 // Re-sync with: pnpm --filter @casola/avatar-client sync-protocol
 import type { AudioChannelDescriptor, ChannelDescriptor, VideoChannelDescriptor } from './channels';
-import { AUDIO_CODECS, type AudioCodec, Channel } from './channels';
+import { AUDIO_CODECS, type AudioCodec, Channel, VIDEO_CODECS, type VideoCodec } from './channels';
 import { ErrorCode } from './codes';
 import type { AcceptMessage, HelloMessage } from './messages';
 
@@ -22,8 +22,17 @@ export interface SessionOffer {
   capSeconds: number;
   /** Downlink audio the server will send, if any. */
   audio?: { sampleRate: number } | null;
-  /** Downlink video the server can send, if any. Omitted/null with `poster` = poster mode. */
-  video?: { mime: string; fps?: number; segFrames?: number } | null;
+  /** Downlink video the server can send, if any. Omitted/null with `poster` = poster mode.
+   *  `codecs` is the server's OWN preference order (e.g. `['av1','hevc','h264']`, ordered by
+   *  measured bits-per-quality) and `mimes` the mime string of each; a server that leaves `codecs`
+   *  out does not negotiate and serves `mime` as-is, which is the pre-negotiation wire. */
+  video?: {
+    mime: string;
+    fps?: number;
+    segFrames?: number;
+    codecs?: readonly string[];
+    mimes?: Record<string, string>;
+  } | null;
   poster?: { url: string } | null;
   /** Uplink mic format the server expects. Omitted = no mic channel. `codecs` is what this
    *  server can decode, in its own order of preference; omitted = `['pcm16']`. */
@@ -44,6 +53,28 @@ function selectMicCodec(
     (codec) => (AUDIO_CODECS as readonly string[]).includes(codec) && offered.includes(codec)
   );
   return (pick as AudioCodec | undefined) ?? null;
+}
+
+/**
+ * The downlink codec for this session: the first entry of the SERVER's preference list
+ * (`offer.video.codecs`) that the client lists in `hello.video.codecs`. The client's list is a
+ * capability, not a preference — it says what the browser decodes, and the server holds the numbers
+ * that say which of those is cheapest to ship. An absent/empty client list, or a server offering
+ * nothing beyond the baseline, lands on `h264`, which keeps every pre-negotiation client on exactly
+ * today's stream. Unknown codec names on either side are ignored rather than refused.
+ */
+export function selectVideoCodec(
+  hello: HelloMessage,
+  offerVideo: NonNullable<SessionOffer['video']>
+): VideoCodec {
+  const offered = offerVideo.codecs;
+  if (!offered?.length) return 'h264';
+  const wanted = hello.video?.codecs;
+  if (!Array.isArray(wanted) || wanted.length === 0) return 'h264';
+  const pick = offered.find(
+    (codec) => (VIDEO_CODECS as readonly string[]).includes(codec) && wanted.includes(codec)
+  );
+  return (pick as VideoCodec | undefined) ?? 'h264';
 }
 
 export interface NegotiateOptions {
@@ -125,14 +156,19 @@ export function negotiateAccept(
   }
   const videoOffered = render && offer.video && acceptsVideo;
   if (videoOffered && offer.video) {
+    // Spelled out only when this server negotiates codecs at all; one that offers just the
+    // baseline emits the descriptor byte-for-byte as before (the golden vectors).
+    const negotiable = Boolean(offer.video.codecs?.length);
+    const videoCodec = selectVideoCodec(hello, offer.video);
     const video: VideoChannelDescriptor = {
       id: Channel.AVATAR_VIDEO,
       dir: 'down',
       kind: 'video',
       codec: 'fmp4',
-      mime: offer.video.mime,
+      mime: offer.video.mimes?.[videoCodec] ?? offer.video.mime,
       ...(offer.video.fps !== undefined ? { fps: offer.video.fps } : {}),
       ...(offer.video.segFrames !== undefined ? { seg_frames: offer.video.segFrames } : {}),
+      ...(negotiable ? { video_codec: videoCodec } : {}),
     };
     channels.push(video);
   }

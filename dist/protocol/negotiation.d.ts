@@ -1,3 +1,4 @@
+import { type VideoCodec } from './channels';
 import type { AcceptMessage, HelloMessage } from './messages';
 export declare const Feature: {
     readonly UTTERANCE_TIMING_V1: "utterance_timing_v1";
@@ -16,11 +17,16 @@ export interface SessionOffer {
     audio?: {
         sampleRate: number;
     } | null;
-    /** Downlink video the server can send, if any. Omitted/null with `poster` = poster mode. */
+    /** Downlink video the server can send, if any. Omitted/null with `poster` = poster mode.
+     *  `codecs` is the server's OWN preference order (e.g. `['av1','hevc','h264']`, ordered by
+     *  measured bits-per-quality) and `mimes` the mime string of each; a server that leaves `codecs`
+     *  out does not negotiate and serves `mime` as-is, which is the pre-negotiation wire. */
     video?: {
         mime: string;
         fps?: number;
         segFrames?: number;
+        codecs?: readonly string[];
+        mimes?: Record<string, string>;
     } | null;
     poster?: {
         url: string;
@@ -41,6 +47,15 @@ export type NegotiationResult = {
     code: string;
     message: string;
 };
+/**
+ * The downlink codec for this session: the first entry of the SERVER's preference list
+ * (`offer.video.codecs`) that the client lists in `hello.video.codecs`. The client's list is a
+ * capability, not a preference — it says what the browser decodes, and the server holds the numbers
+ * that say which of those is cheapest to ship. An absent/empty client list, or a server offering
+ * nothing beyond the baseline, lands on `h264`, which keeps every pre-negotiation client on exactly
+ * today's stream. Unknown codec names on either side are ignored rather than refused.
+ */
+export declare function selectVideoCodec(hello: HelloMessage, offerVideo: NonNullable<SessionOffer['video']>): VideoCodec;
 export interface NegotiateOptions {
     /**
      * `false` is a TEXT-ONLY (brain-only) session: the server answers with control messages alone

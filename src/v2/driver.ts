@@ -32,6 +32,7 @@ import {
   type ServerMessage,
   SUBPROTOCOL,
   type VideoChannelDescriptor,
+  type VideoCodec,
   type WebSocketLike,
   webSocketTransport,
 } from '../protocol';
@@ -66,6 +67,9 @@ export interface V2DriverHandlers {
     personaKey: string;
     posterUrl: string | null;
     hasVideo: boolean;
+    /** The negotiated downlink video codec, `null` in poster mode. A box that does not negotiate
+     *  sends no `video_codec`, which means `'h264'` — the only stream there has ever been. */
+    videoCodec: VideoCodec | null;
   }): void;
   onFirstFrame(): void;
   onMicReady(): void;
@@ -99,6 +103,11 @@ export interface V2DriverOpts {
    *  omitted = the field is left out and the box answers pcm16. The accept's ch1 descriptor
    *  says what was chosen; the driver encodes accordingly. */
   micCodecs?: string[];
+  /** Downlink codecs this browser can decode, for `hello.video.codecs` (see
+   *  `MsePlayer.decodableVideoCodecs`). A capability list, not a preference: the box picks from it
+   *  in its own order. Empty/omitted, or a session that offers no video at all, leaves the field
+   *  out and the box serves h264. */
+  videoCodecs?: string[];
   dev: boolean;
   handlers: V2DriverHandlers;
   /** Test seam — defaults to `new WebSocket(url, protocols)`. */
@@ -213,13 +222,18 @@ export class V2Driver {
         this.fail(new Error(`server did not echo subprotocol ${SUBPROTOCOL}`), 'protocol-mismatch');
         return;
       }
+      const acceptsVideo = MsePlayer.supported();
       conn.send({
         type: 'hello',
         proto: 2,
         accept: {
           audio: ['pcm16'],
-          ...(MsePlayer.supported() ? { video: ['fmp4'] } : {}),
+          ...(acceptsVideo ? { video: ['fmp4'] } : {}),
         },
+        // Only meaningful alongside `accept.video`: a poster-mode client decodes nothing.
+        ...(acceptsVideo && opts.videoCodecs?.length
+          ? { video: { codecs: opts.videoCodecs } }
+          : {}),
         ...(opts.mic
           ? {
               mic: {
@@ -435,6 +449,8 @@ export class V2Driver {
       personaKey: accept.persona_key,
       posterUrl: accept.poster?.url ?? null,
       hasVideo: Boolean(videoCh),
+      // Absent `video_codec` = h264: a box that serves only the baseline says nothing at all.
+      videoCodec: videoCh ? (videoCh.video_codec ?? 'h264') : null,
     });
   }
 

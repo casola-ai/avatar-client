@@ -2,6 +2,7 @@ import { AvatarError, classifyMicError, toAvatarError } from './errors';
 import { OpusMicEncoder } from './mic-encoder';
 import { MicPipeline } from './mic-pipeline';
 import { MsePlayer } from './mse-player';
+import type { VideoCodec } from './protocol';
 import type { WidgetState } from './state';
 import { StateMachine } from './state';
 import type { TimedUtterance } from './utterance-scheduler';
@@ -109,6 +110,11 @@ export interface AvatarSessionOpts {
    *  the box's accept decides, so an older box silently gets pcm16. `'pcm16'` never offers Opus:
    *  the opt-out if an encoder misbehaves somewhere. */
   micCodec?: 'auto' | 'pcm16';
+  /** Downlink video codec. Default `'auto'`: the hello offers every codec this browser can decode
+   *  (AV1 / HEVC / H.264) and the box picks the cheapest of those to ship — av1 is ~20–40 % fewer
+   *  bits than h264 at equal quality. The box decides, so an older box silently serves h264.
+   *  `'h264'` offers nothing: the opt-out if a platform's hardware decode misbehaves. */
+  videoCodec?: 'auto' | 'h264';
   /** Test seam for the session WebSocket — see V2Driver. */
   createSocket?: (url: string, protocols: string[]) => DriverSocket;
   callbacks?: {
@@ -156,6 +162,7 @@ export class AvatarSession {
   private done = false;
   private _sessionCapSeconds: number | undefined;
   private _personaKey: string | undefined;
+  private _videoCodec: VideoCodec | undefined;
   private permittedStream: MediaStream | null;
   private langs: string[];
   private _responseLanguage: string | undefined;
@@ -284,6 +291,12 @@ export class AvatarSession {
     return this._personaKey;
   }
 
+  /** The downlink video codec the box negotiated for this session (`'h264'` when it does not
+   *  negotiate). `undefined` before the accept, and in poster mode, where there is no video. */
+  get videoCodec(): VideoCodec | undefined {
+    return this._videoCodec;
+  }
+
   // Returns the live stream so callers can pass it back via opts.permittedStream,
   // avoiding a second getUserMedia call (and second permission prompt on Firefox).
   static ensureMicPermission(): Promise<MediaStream> {
@@ -294,6 +307,13 @@ export class AvatarSession {
    *  work regardless — the hello simply doesn't offer video. */
   static mediaSupported(): boolean {
     return MsePlayer.supported();
+  }
+
+  /** The downlink video codecs this browser can decode, as offered in the hello under
+   *  `videoCodec: 'auto'`. Diagnostics: what a host would report next to `session.videoCodec` to
+   *  explain why a given session landed where it did. `[]` without MSE. */
+  static decodableVideoCodecs(): VideoCodec[] {
+    return MsePlayer.decodableVideoCodecs();
   }
 
   /**
@@ -397,6 +417,11 @@ export class AvatarSession {
     // end() during the await must still find the stream for teardown() to stop.
     const wantsOpus = this.opts.mic !== false && (this.opts.micCodec ?? 'auto') === 'auto';
     const micCodecs = wantsOpus && (await OpusMicEncoder.supported(dev)) ? ['opus', 'pcm16'] : [];
+    // Synchronous, unlike the Opus probe, but computed here for the same reason: the hello goes
+    // out the moment the socket opens. `'h264'` offers nothing, which is what the box assumes of
+    // any client that says nothing.
+    const videoCodecs =
+      (this.opts.videoCodec ?? 'auto') === 'auto' ? MsePlayer.decodableVideoCodecs() : [];
     if (this.done) return;
     // Transfer permittedStream ownership to the driver; clear here so teardown()
     // doesn't double-stop after the mic pipeline takes it over.
@@ -412,6 +437,7 @@ export class AvatarSession {
       workletUrl: this.opts.workletUrl ?? '/mic-worklet.js',
       permittedStream: streamForMic ?? undefined,
       micCodecs,
+      videoCodecs,
       dev,
       createSocket: this.opts.createSocket,
       handlers: {
@@ -419,6 +445,7 @@ export class AvatarSession {
           if (this.done) return;
           this._sessionCapSeconds = info.capSeconds;
           this._personaKey = info.personaKey;
+          this._videoCodec = info.videoCodec ?? undefined;
         },
         onFirstFrame: () => {
           if (this.done) return;

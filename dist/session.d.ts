@@ -1,4 +1,5 @@
 import { AvatarError } from './errors';
+import type { VideoCodec } from './protocol';
 import type { WidgetState } from './state';
 import type { TimedUtterance } from './utterance-scheduler';
 import { type DriverSocket, type EndReason, type Turn } from './v2/driver';
@@ -97,6 +98,11 @@ export interface AvatarSessionOpts {
      *  the box's accept decides, so an older box silently gets pcm16. `'pcm16'` never offers Opus:
      *  the opt-out if an encoder misbehaves somewhere. */
     micCodec?: 'auto' | 'pcm16';
+    /** Downlink video codec. Default `'auto'`: the hello offers every codec this browser can decode
+     *  (AV1 / HEVC / H.264) and the box picks the cheapest of those to ship — av1 is ~20–40 % fewer
+     *  bits than h264 at equal quality. The box decides, so an older box silently serves h264.
+     *  `'h264'` offers nothing: the opt-out if a platform's hardware decode misbehaves. */
+    videoCodec?: 'auto' | 'h264';
     /** Test seam for the session WebSocket — see V2Driver. */
     createSocket?: (url: string, protocols: string[]) => DriverSocket;
     callbacks?: {
@@ -144,6 +150,7 @@ export declare class AvatarSession {
     private done;
     private _sessionCapSeconds;
     private _personaKey;
+    private _videoCodec;
     private permittedStream;
     private langs;
     private _responseLanguage;
@@ -172,10 +179,17 @@ export declare class AvatarSession {
     get sessionCapSeconds(): number | undefined;
     /** The avatar_versions.id the box bound, echoed in the accept (the persona-pinning ack). */
     get personaKey(): string | undefined;
+    /** The downlink video codec the box negotiated for this session (`'h264'` when it does not
+     *  negotiate). `undefined` before the accept, and in poster mode, where there is no video. */
+    get videoCodec(): VideoCodec | undefined;
     static ensureMicPermission(): Promise<MediaStream>;
     /** Whether this browser can play the fMP4 video channel. Poster-mode sessions (audio + still)
      *  work regardless — the hello simply doesn't offer video. */
     static mediaSupported(): boolean;
+    /** The downlink video codecs this browser can decode, as offered in the hello under
+     *  `videoCodec: 'auto'`. Diagnostics: what a host would report next to `session.videoCodec` to
+     *  explain why a given session landed where it did. `[]` without MSE. */
+    static decodableVideoCodecs(): VideoCodec[];
     /**
      * Everything that must be true before spending a fleet seat, in one call: microphone permission,
      * MSE support, and the browser gate — returning a classified result instead of a raw

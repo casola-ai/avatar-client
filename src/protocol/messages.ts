@@ -1,6 +1,6 @@
 // GENERATED from packages/avatar-protocol/src/messages.ts — do not edit.
 // Re-sync with: pnpm --filter @casola/avatar-client sync-protocol
-import { AUDIO_CODECS, type ChannelDescriptor } from './channels';
+import { AUDIO_CODECS, type ChannelDescriptor, VIDEO_CODECS } from './channels';
 
 /**
  * JSON control messages. The extensibility contract lives in the parsers below, once:
@@ -22,6 +22,11 @@ export interface HelloMessage {
    *  list the server picks from (e.g. `['opus', 'pcm16']`), the pick being reported in the
    *  accept's ch1 descriptor. A server that predates `codecs` ignores it and answers `codec`. */
   mic?: { codec: 'pcm16'; sample_rate: number; codecs?: string[] };
+  /** The client's DECODE capability for the fMP4 downlink, e.g. `{ codecs: ['av1','hevc','h264'] }`
+   *  — what the browser can play, in no meaningful order (the server holds the preference). Absent
+   *  or empty means h264 only. The server's pick lands in the accept's ch3 descriptor as
+   *  `video_codec`, with the matching `mime`. */
+  video?: { codecs?: string[] };
   langs?: string[];
   response_language?: string;
   /** Optional feature names (unknown entries ignored) — minor evolution without a v3. */
@@ -172,8 +177,15 @@ const isMic = (v: unknown): boolean =>
   v.sample_rate > 0 &&
   optional(v, 'codecs', isStrArray);
 
+/** `hello.video` — the client's downlink decode capability. Unknown keys are tolerated and unknown
+ *  codec names are ignored at selection time, not refused here (evolution rule). */
+const isVideoReq = (v: unknown): boolean => isObj(v) && optional(v, 'codecs', isStrArray);
+
 const isAudioCodec = (v: unknown): boolean =>
   isStr(v) && (AUDIO_CODECS as readonly string[]).includes(v);
+
+const isVideoCodec = (v: unknown): boolean =>
+  isStr(v) && (VIDEO_CODECS as readonly string[]).includes(v);
 
 const isChannel = (v: unknown): boolean => {
   if (!isObj(v) || !isUInt(v.id) || v.id > 0xff) return false;
@@ -187,7 +199,8 @@ const isChannel = (v: unknown): boolean => {
       v.codec === 'fmp4' &&
       isStr(v.mime) &&
       optional(v, 'fps', (x) => isNum(x) && Number(x) > 0) &&
-      optional(v, 'seg_frames', (x) => isUInt(x) && Number(x) > 0)
+      optional(v, 'seg_frames', (x) => isUInt(x) && Number(x) > 0) &&
+      optional(v, 'video_codec', isVideoCodec)
     );
   }
   return v.kind === 'data' && v.codec === 'binary';
@@ -199,6 +212,7 @@ const CLIENT_CHECKS: Record<string, FieldCheck> = {
     m.proto === 2 &&
     isAcceptCodecs(m.accept) &&
     optional(m, 'mic', isMic) &&
+    optional(m, 'video', isVideoReq) &&
     optional(m, 'langs', isStrArray) &&
     optional(m, 'response_language', isStr) &&
     optional(m, 'features', isStrArray) &&

@@ -18,7 +18,8 @@ export type { AvatarErrorKind, AvatarErrorStage } from './errors';
 export { AvatarError, classifyMicError, isMicError } from './errors';
 export type { PlayoutClock } from './playout-clock';
 // Wire identifiers, for advanced integrations (custom ConnectStrategy / diagnostics).
-export { CloseCode, SUBPROTOCOL } from './protocol';
+export type { VideoCodec } from './protocol';
+export { CloseCode, SUBPROTOCOL, VIDEO_CODECS } from './protocol';
 export type {
   AvatarSessionEvents,
   AvatarSessionOpts,

@@ -25,6 +25,13 @@ export interface AudioChannelDescriptor {
     sample_rate: number;
     channels: 1;
 }
+/** Video codecs an fMP4 downlink may carry. `h264` is the baseline every MSE client decodes and
+ *  what an absent/empty `hello.video.codecs` lands on; `hevc` (H.265) and `av1` are negotiated the
+ *  way `opus` is for the mic uplink. The channel's `codec` stays `fmp4` — this is the CONTENT of
+ *  the container, spelled out in the descriptor's `video_codec` and in its `mime`
+ *  (`avc1…` / `hvc1…` / `av01…`). */
+export declare const VIDEO_CODECS: readonly ["h264", "hevc", "av1"];
+export type VideoCodec = (typeof VIDEO_CODECS)[number];
 export interface VideoChannelDescriptor {
     id: number;
     dir: 'down';
@@ -34,6 +41,9 @@ export interface VideoChannelDescriptor {
     mime: string;
     fps?: number;
     seg_frames?: number;
+    /** The negotiated content codec inside the container. Present only when the server negotiates
+     *  codecs at all; absent means `h264`, which is what every pre-negotiation box emits. */
+    video_codec?: VideoCodec;
 }
 export interface DataChannelDescriptor {
     id: number;

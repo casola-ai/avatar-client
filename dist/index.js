@@ -598,6 +598,7 @@ function toAvatarError(error, kind, options = {}) {
 
 // src/protocol/channels.ts
 var AUDIO_CODECS = ["pcm16", "opus"];
+var VIDEO_CODECS = ["h264", "hevc", "av1"];
 
 // src/protocol/codes.ts
 var SUBPROTOCOL = "casola.avatar.v2";
@@ -682,6 +683,7 @@ var has = (m, key) => Object.hasOwn(m, key);
 var optional = (m, key, check) => !has(m, key) || check(m[key]);
 var oneOf = (...values) => (v) => isStr(v) && values.includes(v);
 var isAudioCodec = (v) => isStr(v) && AUDIO_CODECS.includes(v);
+var isVideoCodec = (v) => isStr(v) && VIDEO_CODECS.includes(v);
 var isChannel = (v) => {
   if (!isObj(v) || !isUInt(v.id) || v.id > 255) return false;
   if (v.dir !== "up" && v.dir !== "down") return false;
@@ -689,7 +691,7 @@ var isChannel = (v) => {
     return isAudioCodec(v.codec) && isUInt(v.sample_rate) && v.sample_rate > 0 && v.channels === 1;
   }
   if (v.kind === "video") {
-    return v.dir === "down" && v.codec === "fmp4" && isStr(v.mime) && optional(v, "fps", (x) => isNum(x) && Number(x) > 0) && optional(v, "seg_frames", (x) => isUInt(x) && Number(x) > 0);
+    return v.dir === "down" && v.codec === "fmp4" && isStr(v.mime) && optional(v, "fps", (x) => isNum(x) && Number(x) > 0) && optional(v, "seg_frames", (x) => isUInt(x) && Number(x) > 0) && optional(v, "video_codec", isVideoCodec);
   }
   return v.kind === "data" && v.codec === "binary";
 };
@@ -1324,6 +1326,11 @@ var OpusMicEncoder = class {
 };
 
 // src/mse-player.ts
+var VIDEO_CODEC_PROBES = [
+  { codec: "av1", mime: 'video/mp4; codecs="av01.0.05M.08,mp4a.40.2"' },
+  { codec: "hevc", mime: 'video/mp4; codecs="hvc1.1.6.L93.90,mp4a.40.2"' },
+  { codec: "h264", mime: 'video/mp4; codecs="avc1.4d401f,mp4a.40.2"' }
+];
 function getMediaSourceCtor() {
   if (typeof window === "undefined") return null;
   const w = window;
@@ -1358,6 +1365,26 @@ var MsePlayer = class {
   }
   static supported() {
     return getMediaSourceCtor() !== null;
+  }
+  /**
+   * The downlink video codecs this browser can DECODE, for `hello.video.codecs`. Probed against
+   * the same MediaSource implementation the player will use (`ManagedMediaSource` on iOS), because
+   * the two disagree: Safari's ManagedMediaSource plays HEVC the plain one does not offer. The
+   * order is this list's, not a preference — the box owns the choice. `[]` where MSE is absent
+   * (poster mode), so the hello simply omits the field and the box serves h264.
+   */
+  static decodableVideoCodecs() {
+    const Ctor = getMediaSourceCtor();
+    if (!Ctor || typeof Ctor.isTypeSupported !== "function") return [];
+    const supported = Ctor.isTypeSupported.bind(Ctor);
+    const out = [];
+    for (const probe of VIDEO_CODEC_PROBES) {
+      try {
+        if (supported(probe.mime)) out.push(probe.codec);
+      } catch {
+      }
+    }
+    return out;
   }
   fireFirstFrame() {
     if (this.firstFrameFired) return;
@@ -2149,13 +2176,16 @@ var V2Driver = class {
         this.fail(new Error(`server did not echo subprotocol ${SUBPROTOCOL}`), "protocol-mismatch");
         return;
       }
+      const acceptsVideo = MsePlayer.supported();
       conn.send({
         type: "hello",
         proto: 2,
         accept: {
           audio: ["pcm16"],
-          ...MsePlayer.supported() ? { video: ["fmp4"] } : {}
+          ...acceptsVideo ? { video: ["fmp4"] } : {}
         },
+        // Only meaningful alongside `accept.video`: a poster-mode client decodes nothing.
+        ...acceptsVideo && opts.videoCodecs?.length ? { video: { codecs: opts.videoCodecs } } : {},
         ...opts.mic ? {
           mic: {
             codec: "pcm16",
@@ -2344,7 +2374,9 @@ var V2Driver = class {
       capSeconds: accept.cap_seconds,
       personaKey: accept.persona_key,
       posterUrl: accept.poster?.url ?? null,
-      hasVideo: Boolean(videoCh)
+      hasVideo: Boolean(videoCh),
+      // Absent `video_codec` = h264: a box that serves only the baseline says nothing at all.
+      videoCodec: videoCh ? videoCh.video_codec ?? "h264" : null
     });
   }
   startMic(micCh) {
@@ -2574,6 +2606,7 @@ var AvatarSession = class {
     __publicField(this, "done", false);
     __publicField(this, "_sessionCapSeconds");
     __publicField(this, "_personaKey");
+    __publicField(this, "_videoCodec");
     __publicField(this, "permittedStream");
     __publicField(this, "langs");
     __publicField(this, "_responseLanguage");
@@ -2690,6 +2723,11 @@ var AvatarSession = class {
   get personaKey() {
     return this._personaKey;
   }
+  /** The downlink video codec the box negotiated for this session (`'h264'` when it does not
+   *  negotiate). `undefined` before the accept, and in poster mode, where there is no video. */
+  get videoCodec() {
+    return this._videoCodec;
+  }
   // Returns the live stream so callers can pass it back via opts.permittedStream,
   // avoiding a second getUserMedia call (and second permission prompt on Firefox).
   static ensureMicPermission() {
@@ -2699,6 +2737,12 @@ var AvatarSession = class {
    *  work regardless — the hello simply doesn't offer video. */
   static mediaSupported() {
     return MsePlayer.supported();
+  }
+  /** The downlink video codecs this browser can decode, as offered in the hello under
+   *  `videoCodec: 'auto'`. Diagnostics: what a host would report next to `session.videoCodec` to
+   *  explain why a given session landed where it did. `[]` without MSE. */
+  static decodableVideoCodecs() {
+    return MsePlayer.decodableVideoCodecs();
   }
   /**
    * Everything that must be true before spending a fleet seat, in one call: microphone permission,
@@ -2787,6 +2831,7 @@ var AvatarSession = class {
     const dev = this.opts.dev ?? false;
     const wantsOpus = this.opts.mic !== false && (this.opts.micCodec ?? "auto") === "auto";
     const micCodecs = wantsOpus && await OpusMicEncoder.supported(dev) ? ["opus", "pcm16"] : [];
+    const videoCodecs = (this.opts.videoCodec ?? "auto") === "auto" ? MsePlayer.decodableVideoCodecs() : [];
     if (this.done) return;
     const streamForMic = this.permittedStream;
     this.permittedStream = null;
@@ -2799,6 +2844,7 @@ var AvatarSession = class {
       workletUrl: this.opts.workletUrl ?? "/mic-worklet.js",
       permittedStream: streamForMic ?? void 0,
       micCodecs,
+      videoCodecs,
       dev,
       createSocket: this.opts.createSocket,
       handlers: {
@@ -2806,6 +2852,7 @@ var AvatarSession = class {
           if (this.done) return;
           this._sessionCapSeconds = info.capSeconds;
           this._personaKey = info.personaKey;
+          this._videoCodec = info.videoCodec ?? void 0;
         },
         onFirstFrame: () => {
           if (this.done) return;
@@ -3310,6 +3357,7 @@ export {
   SESSION_UI_CSS,
   SUBPROTOCOL,
   UtteranceScheduler,
+  VIDEO_CODECS,
   adoptSessionUIStyles,
   attachCaptions,
   attachDisclosure,

@@ -1,6 +1,6 @@
 import { AvatarError } from '../errors';
 import { type MicFrameInfo } from '../mic-pipeline';
-import { type WebSocketLike } from '../protocol';
+import { type VideoCodec, type WebSocketLike } from '../protocol';
 import { type TimedUtterance } from '../utterance-scheduler';
 export type EndReason = 'cap' | 'edge_disconnect' | 'kicked' | 'expired' | 'dropped' | 'generic';
 export interface Turn {
@@ -22,6 +22,9 @@ export interface V2DriverHandlers {
         personaKey: string;
         posterUrl: string | null;
         hasVideo: boolean;
+        /** The negotiated downlink video codec, `null` in poster mode. A box that does not negotiate
+         *  sends no `video_codec`, which means `'h264'` — the only stream there has ever been. */
+        videoCodec: VideoCodec | null;
     }): void;
     onFirstFrame(): void;
     onMicReady(): void;
@@ -54,6 +57,11 @@ export interface V2DriverOpts {
      *  omitted = the field is left out and the box answers pcm16. The accept's ch1 descriptor
      *  says what was chosen; the driver encodes accordingly. */
     micCodecs?: string[];
+    /** Downlink codecs this browser can decode, for `hello.video.codecs` (see
+     *  `MsePlayer.decodableVideoCodecs`). A capability list, not a preference: the box picks from it
+     *  in its own order. Empty/omitted, or a session that offers no video at all, leaves the field
+     *  out and the box serves h264. */
+    videoCodecs?: string[];
     dev: boolean;
     handlers: V2DriverHandlers;
     /** Test seam — defaults to `new WebSocket(url, protocols)`. */
