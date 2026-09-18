@@ -1,4 +1,6 @@
+import { type AvatarDiagnostic, type AvatarSessionStats, type NegotiatedInfo } from './diagnostics';
 import { AvatarError } from './errors';
+import { type Logger } from './logger';
 import type { VideoCodec } from './protocol';
 import type { WidgetState } from './state';
 import type { TimedUtterance } from './utterance-scheduler';
@@ -52,6 +54,10 @@ export interface AvatarSessionEvents {
     audioBlocked: () => void;
     /** The microphone's mute state changed — from the user, or from `suppressMic`. */
     muteChange: (state: MicMuteState) => void;
+    /** A bounded operational fact about the session — see `AvatarDiagnostic`. Fires unguarded by the
+     *  session's `done` flag, so `socket_closed` (which lands in the same tick as `close`) is not
+     *  dropped. */
+    diagnostic: (d: AvatarDiagnostic) => void;
     close: (r: EndReason) => void;
     error: (e: AvatarError) => void;
 }
@@ -103,6 +109,13 @@ export interface AvatarSessionOpts {
      *  bits than h264 at equal quality. The box decides, so an older box silently serves h264.
      *  `'h264'` offers nothing: the opt-out if a platform's hardware decode misbehaves. */
     videoCodec?: 'auto' | 'h264';
+    /** The mint's session id and a support trace id. Stamped on every `AvatarDiagnostic` so a report
+     *  joins the mint and the support trace; never put on the wire. */
+    sessionId?: string;
+    traceId?: string;
+    /** Where the SDK routes its internal logs (driver, players, pipeline, state). Absent = a
+     *  dev-gated console, exactly the pre-logger behavior. */
+    logger?: Logger;
     /** Test seam for the session WebSocket — see V2Driver. */
     createSocket?: (url: string, protocols: string[]) => DriverSocket;
     callbacks?: {
@@ -141,6 +154,10 @@ export interface AvatarSessionOpts {
          *  arrives here as `persona-unavailable`, not as anything the user's mic can fix.
          *  Pre-flight with AvatarSession.preflight() to catch permission problems before a seat. */
         onError?(e: AvatarError): void;
+        /** A bounded operational fact about the session (`AvatarDiagnostic`). Analytics/support hook,
+         *  never required for normal operation. Branch on `d.type` and default-ignore an unrecognized
+         *  one — the union grows. */
+        onDiagnostic?(d: AvatarDiagnostic): void;
     };
 }
 export declare class AvatarSession {
@@ -156,7 +173,10 @@ export declare class AvatarSession {
     private _responseLanguage;
     private _userMuted;
     private _micSuppressed;
+    private _negotiated;
+    private readonly _stats;
     private readonly listeners;
+    private readonly logger;
     constructor(opts: AvatarSessionOpts);
     /**
      * Subscribe to a session event. Returns an unsubscribe function.
@@ -182,6 +202,21 @@ export declare class AvatarSession {
     /** The downlink video codec the box negotiated for this session (`'h264'` when it does not
      *  negotiate). `undefined` before the accept, and in poster mode, where there is no video. */
     get videoCodec(): VideoCodec | undefined;
+    /** What the box negotiated for this session — the codecs in force, whether video plays. `null`
+     *  before the accept. Diagnostics: the fixed shape a session landed in, beside the running
+     *  counters in {@link stats}. */
+    get negotiated(): NegotiatedInfo | null;
+    /**
+     * A snapshot of everything the diagnostic stream has said about this session so far: the connect
+     * timeline, the close code, the last keepalive RTT, what was negotiated, and running counters.
+     *
+     * Safe to call after the session has ended — it is accumulated on the session as diagnostics
+     * arrive, not read from the driver, which `teardown()` has already nulled by then.
+     */
+    stats(): AvatarSessionStats;
+    /** Fold one diagnostic into the accumulated stats and capture the negotiated shape. Runs
+     *  unguarded by `done` so the terminal `socket_closed` is counted. */
+    private ingestDiagnostic;
     static ensureMicPermission(): Promise<MediaStream>;
     /** Whether this browser can play the fMP4 video channel. Poster-mode sessions (audio + still)
      *  work regardless — the hello simply doesn't offer video. */

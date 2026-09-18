@@ -1,3 +1,5 @@
+import type { DiagnosticData } from './diagnostics';
+import { type Logger } from './logger';
 import type { PlayoutClock } from './playout-clock';
 import type { VideoCodec } from './protocol';
 export interface MseHandlers {
@@ -7,6 +9,9 @@ export interface MseHandlers {
      *  an autoplaying video on a scripted unmute). Surface a tap-for-sound affordance and call
      *  unmuteAudio() from the tap's gesture context. */
     onAudioBlocked?: () => void;
+    /** Bounded playback diagnostics — `playback_rejected`, `media_error`, `buffer_evicted`, `stall`.
+     *  Optional: absent leaves playback behavior unchanged. */
+    onDiagnostic?: (d: DiagnosticData) => void;
 }
 /**
  * MSE playback for the v2 avatar-video channel. Owns no socket: the v2 driver feeds it the
@@ -16,7 +21,6 @@ export interface MseHandlers {
  */
 export declare class MsePlayer implements PlayoutClock {
     private readonly video;
-    private readonly dev;
     static supported(): boolean;
     /**
      * The downlink video codecs this browser can DECODE, for `hello.video.codecs`. Probed against
@@ -48,8 +52,11 @@ export declare class MsePlayer implements PlayoutClock {
     private rvfcHandle;
     private lastPlayedPtsUs;
     private readonly advanceHandlers;
+    private evictionCount;
+    private diag;
     private fireFirstFrame;
-    constructor(video: HTMLVideoElement, dev?: boolean);
+    private readonly log;
+    constructor(video: HTMLVideoElement, logger?: Logger);
     /** Create the MediaSource and arm the element. Call once, then setMime() + append(). */
     attach(handlers?: MseHandlers): void;
     /** Declare the stream's MSE mime (from the accept's video channel descriptor). */

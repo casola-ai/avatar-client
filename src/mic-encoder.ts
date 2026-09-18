@@ -1,3 +1,4 @@
+import { consoleLogger, type Logger } from './logger';
 import { MIC_FRAME_SAMPLES, MIC_SAMPLE_RATE, type MicFrameInfo } from './mic-pipeline';
 
 /** Opus target for the mic uplink: 16 kHz wideband speech, VoIP-grade. ~400 B per 100 ms frame
@@ -48,7 +49,8 @@ export interface OpusMicEncoderOpts {
   onPacket: (packet: Uint8Array, info: MicFrameInfo) => void;
   /** The encoder died. Fires at most once; the encoder accepts nothing afterwards. */
   onError: (err: unknown) => void;
-  dev?: boolean;
+  /** Where the encoder routes its logs. Defaults to a non-dev console (warn only). */
+  logger?: Logger;
 }
 
 /**
@@ -138,7 +140,10 @@ export class OpusMicEncoder {
     this.partsUs = 0;
     const info = this.pending.shift();
     if (!info) {
-      if (this.opts.dev) console.warn('[mic] opus frame with no pending calibration; dropped');
+      (this.opts.logger ?? consoleLogger(false))(
+        'debug',
+        '[mic] opus frame with no pending calibration; dropped'
+      );
       return;
     }
     this.opts.onPacket(frameOpusPayload(parts), info);

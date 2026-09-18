@@ -26,11 +26,17 @@ const ALLOWED: Record<WidgetState, WidgetState[]> = {
 
 export type Listener = (state: WidgetState, prev: WidgetState) => void;
 
+import { consoleLogger, type Logger } from './logger';
+
 export class StateMachine {
   private current: WidgetState = 'idle';
   private readonly listeners = new Set<Listener>();
+  private readonly log: Logger;
 
-  constructor(private readonly dev: boolean = false) {}
+  constructor(logger: Logger | boolean = false) {
+    // Accept a boolean for the historical `dev` call site; resolve it to a console logger.
+    this.log = typeof logger === 'boolean' ? consoleLogger(logger) : logger;
+  }
 
   get state(): WidgetState {
     return this.current;
@@ -39,8 +45,8 @@ export class StateMachine {
   set(next: WidgetState): void {
     const prev = this.current;
     if (prev === next) return;
-    if (this.dev && !ALLOWED[prev].includes(next)) {
-      console.warn(`[avatar] unexpected transition ${prev} → ${next}`);
+    if (!ALLOWED[prev].includes(next)) {
+      this.log('debug', `[avatar] unexpected transition ${prev} → ${next}`);
     }
     this.current = next;
     for (const l of this.listeners) l(next, prev);

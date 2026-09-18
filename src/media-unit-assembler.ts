@@ -19,6 +19,11 @@ interface PartialUnit {
 export class MediaUnitAssembler {
   private readonly partial = new Map<number, PartialUnit>();
 
+  /** `onDrop` is told why a fragment was discarded — a continuation with no start
+   *  (`no_start`), or one whose header disagrees with the unit in progress (`mismatch`). These
+   *  were dropped silently before (charmingly#288, §D). */
+  constructor(private readonly onDrop?: (reason: 'no_start' | 'mismatch') => void) {}
+
   push(frame: MediaFrame): MediaUnit | null {
     const starts = Boolean(frame.flags & FrameFlags.UNIT_START);
     const ends = Boolean(frame.flags & FrameFlags.UNIT_END);
@@ -34,6 +39,7 @@ export class MediaUnitAssembler {
       };
       this.partial.set(frame.channelId, unit);
     } else if (!unit) {
+      this.onDrop?.('no_start');
       return null;
     }
 
@@ -43,6 +49,7 @@ export class MediaUnitAssembler {
       unit.ptsUs !== frame.ptsUs
     ) {
       this.partial.delete(frame.channelId);
+      this.onDrop?.('mismatch');
       return null;
     }
     const chunk = frame.payload.slice();

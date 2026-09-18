@@ -88,6 +88,8 @@ new AvatarSession(opts: AvatarSessionOpts)
 | `.sessionCapSeconds` | The session cap — the box's authoritative `cap_seconds` once connected. |
 | `.personaKey` | The avatar version the box bound, echoed in the handshake (the persona-pinning ack). |
 | `.videoCodec` | The downlink video codec the box negotiated — `'h264'`, `'hevc'` or `'av1'`; `undefined` before the handshake and in poster mode. A box that does not negotiate reports `'h264'`. |
+| `.negotiated` | What the box negotiated for this session — `{ micCodec, videoCodec, hasVideo, posterMode, features }`; `null` before the accept. |
+| `.stats()` | A snapshot of the diagnostic stream: the connect timeline, close code, last keepalive RTT, the negotiated shape and running counters. Safe to call after the session ends. |
 | `AvatarSession.ensureMicPermission()` | Request mic permission before `start()`. |
 | `AvatarSession.primeVideoElement(video)` | Call synchronously in the call-button tap handler, before any `await`: clears WebKit's per-element gesture restrictions so iOS Safari honors the SDK's unmute (otherwise the first call in a fresh browsing context plays muted, and pre-fix rendered as a slideshow). |
 | `AvatarSession.decodableVideoCodecs()` | The downlink codecs this browser can decode, which is what `videoCodec: 'auto'` offers the box. Diagnostics — report it next to `.videoCodec` to explain where a session landed. `[]` without MSE. |
@@ -229,8 +231,8 @@ with `ui.setLive(true)` / `ui.setLive(null)`.
 
 Subscribe after construction; the returned function unsubscribes. The constructor `callbacks` still
 work and fire first. Events: `state`, `partial`, `turn`, `firstFrame`, `micReady`, `speechStart`,
-`speechEnd`, `audioFrameSent`, `audioBlocked`, `muteChange`, `close`, `error`. A throwing handler
-is caught, so one bad subscriber cannot break the session.
+`speechEnd`, `audioFrameSent`, `audioBlocked`, `muteChange`, `diagnostic`, `close`, `error`. A
+throwing handler is caught, so one bad subscriber cannot break the session.
 
 ### `AvatarSession.preflight(options?)`
 
@@ -261,7 +263,57 @@ and a `terminal` flag. Branch on `kind` instead of sniffing `DOMException` names
 
 Treat an unrecognized kind as `unknown`; the list grows. Errors a timer produced also carry
 `stage` (`AvatarErrorStage`): where in the connect sequence it fired, for your analytics and the
-support line you show the user.
+support line you show the user. An error a socket close produced carries `closeCode` (the raw
+WebSocket code behind the kind), and a `server` error carries `serverCode` (the box's in-band error
+`code`) — the number and the wire code the flattened message used to lose.
+
+### Diagnostics
+
+`callbacks.onDiagnostic` and the `diagnostic` event deliver an `AvatarDiagnostic`: a bounded,
+operational view of the session the SDK previously kept to itself. Branch on `d.type` and
+default-ignore an unrecognized one — the union grows. Every diagnostic carries `at` and, when you
+pass `sessionId` / `traceId` in the options, those too; none of it goes on the wire.
+
+| `type` | what it reports |
+|---|---|
+| `connect_phase` | a connect milestone (`socket_open`, `accept`, `first_frame`, `first_audio`, `mic_ready`) and its ms from socket creation |
+| `socket_closed` | the close `code`, whether it was `afterAccept`, and the reason's length (never its text) |
+| `protocol_violation` | a malformed or out-of-sequence server message |
+| `server_error` | an in-band box error `code`, and whether it failed a pending `sendText` (`inFlightRequest`) |
+| `go_away` | the box asked the client to leave, with an optional `deadlineS` |
+| `session_end` | the raw end `reason` and the `EndReason` it mapped to |
+| `negotiated` | the codecs in force, `hasVideo`, `posterMode`, accepted `features` |
+| `rtt` | a keepalive round-trip in ms |
+| `text_failed` | a `sendText` that timed out or hit a dead transport |
+| `playback_rejected` | `video.play()` was rejected — the DOMException `name`, `readyState`, `muted` |
+| `media_error` | a `SourceBuffer`, video-element or codec-support error (`source`) |
+| `buffer_evicted` | MSE evicted buffered media under quota pressure |
+| `stall` | the pause watchdog resumed playback (`resume` / `resume_muted`) |
+| `mic_context` | the mic AudioContext was suspended at start, and whether `resume()` recovered it |
+| `mic_track` | the mic track ended, muted/unmuted, or the device set changed |
+| `frame_dropped` | the unit assembler discarded a fragment |
+
+```typescript
+const session = new AvatarSession({
+  videoEl,
+  connect,
+  sessionId,          // from your mint — joins a diagnostic to the session
+  traceId,            // your support/trace id
+  logger: (level, message, detail) => myLog(level, message, detail),
+  callbacks: {
+    onDiagnostic: (d) => {
+      if (d.type === 'socket_closed') report('socket_closed', { code: d.code });
+    },
+  },
+});
+
+// After the call, one snapshot for your analytics row:
+const stats = session.stats();   // { connect, closeCode, rttMs, negotiated, counters }
+```
+
+`AvatarSessionOpts.logger` routes the SDK's own internal logs (the driver, players, mic pipeline,
+state machine) through one `(level, message, detail?)` sink. Absent, the SDK logs to a dev-gated
+console exactly as before.
 
 ### Muting: user choice vs application suppression
 
@@ -309,8 +361,11 @@ Theme with custom properties on the container rather than overriding rules — `
                               // HEVC / H.264) and let the box pick; 'h264' offers none
   prewarm?: () => Promise<void> | void;
   dev?: boolean;              // log unexpected state transitions + protocol violations
+  sessionId?: string;         // stamped on every diagnostic; never on the wire
+  traceId?: string;           // your support/trace id, stamped on every diagnostic
+  logger?: (level: 'debug' | 'warn', message: string, detail?: object) => void;
   callbacks?: { ... };        // see AvatarSessionOpts for the full set, incl.
-                              // onSpeechStart/onSpeechEnd (assistant utterance markers)
+                              // onSpeechStart/onSpeechEnd and onDiagnostic
 }
 ```
 

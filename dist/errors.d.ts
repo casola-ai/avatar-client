@@ -58,10 +58,19 @@ export declare class AvatarError extends Error {
     readonly terminal: boolean;
     /** The connect stage a watchdog fired in. Absent unless a timer produced this error. */
     readonly stage?: AvatarErrorStage;
+    /** The WebSocket close code, on an error a socket close produced (the `connect`/`unauthorized`/
+     *  `protocol-mismatch`/`persona-unavailable`/`capacity`/`policy` kinds). The raw number behind
+     *  the kind, for a support line that needs to tell 4004 from 4008. */
+    readonly closeCode?: number;
+    /** The box's in-band error `code`, on a `server` error. The wire code the message carried, which
+     *  the flattened `Error(message ?? code)` used to lose. */
+    readonly serverCode?: string;
     constructor(kind: AvatarErrorKind, message: string, options?: {
         terminal?: boolean;
         cause?: unknown;
         stage?: AvatarErrorStage;
+        closeCode?: number;
+        serverCode?: string;
     });
 }
 /** True for a kind the microphone caused — the set a "check your mic" message is correct for. */
@@ -81,4 +90,6 @@ export declare function toAvatarError(error: unknown, kind: AvatarErrorKind, opt
     terminal?: boolean;
     message?: string;
     stage?: AvatarErrorStage;
+    closeCode?: number;
+    serverCode?: string;
 }): AvatarError;

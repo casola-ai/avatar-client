@@ -1,3 +1,4 @@
+import { type Logger } from './logger';
 import { type MicFrameInfo } from './mic-pipeline';
 /** Opus target for the mic uplink: 16 kHz wideband speech, VoIP-grade. ~400 B per 100 ms frame
  *  against 3200 B of raw PCM16 — the point of the codec. */
@@ -21,7 +22,8 @@ export interface OpusMicEncoderOpts {
     onPacket: (packet: Uint8Array, info: MicFrameInfo) => void;
     /** The encoder died. Fires at most once; the encoder accepts nothing afterwards. */
     onError: (err: unknown) => void;
-    dev?: boolean;
+    /** Where the encoder routes its logs. Defaults to a non-dev console (warn only). */
+    logger?: Logger;
 }
 /**
  * WebCodecs Opus encoder for the mic uplink. Sits between MicPipeline's 100 ms Int16 frames and

@@ -1,3 +1,4 @@
+import type { AvatarDiagnostic, ConnectPhase, DiagnosticData } from '../diagnostics';
 import {
   AvatarError,
   type AvatarErrorKind,
@@ -5,6 +6,7 @@ import {
   classifyMicError,
   toAvatarError,
 } from '../errors';
+import { consoleLogger, type Logger } from '../logger';
 import { type MediaUnit, MediaUnitAssembler } from '../media-unit-assembler';
 import { OpusMicEncoder } from '../mic-encoder';
 import {
@@ -89,6 +91,10 @@ export interface V2DriverHandlers {
    *  terminal=false: an in-band server error or media hiccup; the session keeps running.
    *  Always an `AvatarError` — the driver classifies before it hands anything up. */
   onError(err: AvatarError, terminal: boolean): void;
+  /** Bounded operational fact about the session (see `AvatarDiagnostic`). Optional: absent means
+   *  the driver's behavior is unchanged. Fires unguarded, so `socket_closed` reaches the host even
+   *  though it lands in the same tick as `onEnded`. */
+  onDiagnostic?(d: AvatarDiagnostic): void;
 }
 
 export interface V2DriverOpts {
@@ -109,6 +115,12 @@ export interface V2DriverOpts {
    *  out and the box serves h264. */
   videoCodecs?: string[];
   dev: boolean;
+  /** Where the driver and its players route internal logs. Defaults to a dev-gated console. */
+  logger?: Logger;
+  /** Stamped on every diagnostic so a report can be joined to the mint and the support trace.
+   *  The driver never puts them on the wire — they ride diagnostics only. */
+  sessionId?: string;
+  traceId?: string;
   handlers: V2DriverHandlers;
   /** Test seam — defaults to `new WebSocket(url, protocols)`. */
   createSocket?: (url: string, protocols: string[]) => DriverSocket;
@@ -159,7 +171,9 @@ export class V2Driver {
   private player: PcmPlayer | null = null;
   private clock: PlayoutClock | null = null;
   private scheduler: UtteranceScheduler | null = null;
-  private readonly unitAssembler = new MediaUnitAssembler();
+  private readonly unitAssembler = new MediaUnitAssembler((reason) =>
+    this.diag({ type: 'frame_dropped', reason })
+  );
   private pipeline: MicPipeline | null = null;
   private encoder: OpusMicEncoder | null = null;
 
@@ -170,6 +184,10 @@ export class V2Driver {
   private finished = false;
   private timedUtterances = false;
   private framedMediaUnits = false;
+
+  private connectStartedAt = 0;
+  private firstAudioReported = false;
+  private readonly log: Logger;
 
   private openTimer: ReturnType<typeof setTimeout> | null = null;
   private handshakeTimer: ReturnType<typeof setTimeout> | null = null;
@@ -186,12 +204,36 @@ export class V2Driver {
   constructor(private readonly opts: V2DriverOpts) {
     this.langs = opts.langs;
     this.responseLanguage = opts.responseLanguage;
+    this.log = opts.logger ?? consoleLogger(opts.dev);
+  }
+
+  /** Emit one diagnostic, stamped with the wall clock and the ids the host passed. Never throws
+   *  into the driver: a host `onDiagnostic` that blows up must not take the session down. */
+  private diag(d: DiagnosticData): void {
+    const sink = this.opts.handlers.onDiagnostic;
+    if (!sink) return;
+    try {
+      sink({
+        at: Date.now(),
+        ...(this.opts.sessionId !== undefined ? { sessionId: this.opts.sessionId } : {}),
+        ...(this.opts.traceId !== undefined ? { traceId: this.opts.traceId } : {}),
+        ...d,
+      } as AvatarDiagnostic);
+    } catch {
+      /* a diagnostic sink must not affect the session */
+    }
+  }
+
+  /** ms since the socket was created — the basis for every `connect_phase`. */
+  private phase(phase: ConnectPhase): void {
+    this.diag({ type: 'connect_phase', phase, ms: Date.now() - this.connectStartedAt });
   }
 
   connect(): void {
     const { opts } = this;
     const create =
       opts.createSocket ?? ((url: string, protocols: string[]) => new WebSocket(url, protocols));
+    this.connectStartedAt = Date.now();
     let socket: DriverSocket;
     try {
       socket = create(opts.sessionWsUrl, [SUBPROTOCOL]);
@@ -216,6 +258,7 @@ export class V2Driver {
       if (this.openTimer) clearTimeout(this.openTimer);
       this.openTimer = null;
       if (this.finished) return;
+      this.phase('socket_open');
       // Browsers fail the connection themselves when a requested subprotocol is not granted;
       // this guards the non-browser sockets (tests, future runtimes) to the same rule.
       if (socket.protocol !== undefined && socket.protocol !== SUBPROTOCOL) {
@@ -258,9 +301,10 @@ export class V2Driver {
     conn.onMessage((msg) => this.onServerMessage(msg));
     conn.onFrame((frame) => this.onMediaFrame(frame));
     conn.onViolation((v) => {
-      if (opts.dev) console.warn('[v2] protocol violation', v.kind, v.detail);
+      this.log('debug', '[v2] protocol violation', { kind: v.kind, detail: v.detail });
+      this.diag({ type: 'protocol_violation', violation: v.kind, state: v.state });
     });
-    conn.onClose((ev) => this.onSocketClose(ev.code));
+    conn.onClose((ev) => this.onSocketClose(ev.code, ev.reason));
   }
 
   private onServerMessage(msg: ServerMessage): void {
@@ -333,13 +377,18 @@ export class V2Driver {
       case 'error': {
         const error = new Error(msg.message ?? msg.code);
         const waiter = msg.request_id ? this.textWaiters.get(msg.request_id) : undefined;
+        this.diag({ type: 'server_error', code: msg.code, inFlightRequest: Boolean(waiter) });
         if (waiter && msg.request_id) {
           clearTimeout(waiter.timer);
           this.textWaiters.delete(msg.request_id);
           waiter.reject(error);
         } else {
-          // In-band: the box reported a problem but the socket stays up.
-          this.opts.handlers.onError(toAvatarError(error, 'server', { terminal: false }), false);
+          // In-band: the box reported a problem but the socket stays up. Keep the wire `code` on
+          // the error — flattening it into the message used to lose it (charmingly#288, §D.10).
+          this.opts.handlers.onError(
+            toAvatarError(error, 'server', { terminal: false, serverCode: msg.code }),
+            false
+          );
         }
         break;
       }
@@ -347,12 +396,17 @@ export class V2Driver {
         this.endReason = (END_REASONS as readonly string[]).includes(msg.reason)
           ? (msg.reason as EndReason)
           : 'generic';
+        this.diag({ type: 'session_end', reason: msg.reason, mapped: this.endReason });
         break;
       case 'ping':
         this.conn?.send({ type: 'pong', t: msg.t });
         break;
       case 'pong':
-      case 'go_away': // spec-reserved; no client behavior this revision
+        // The keepalive round trip: the box echoed the `t` we stamped when we sent the ping.
+        this.diag({ type: 'rtt', ms: Math.max(0, Date.now() - msg.t) });
+        break;
+      case 'go_away':
+        this.diag({ type: 'go_away', deadlineS: msg.deadline_s ?? null });
         break;
     }
   }
@@ -363,6 +417,7 @@ export class V2Driver {
       clearTimeout(this.handshakeTimer);
       this.handshakeTimer = null;
     }
+    this.phase('accept');
     this.accepted = accept;
     const acceptedFeatures = accept.features ?? [];
     this.timedUtterances = acceptedFeatures.includes(Feature.UTTERANCE_TIMING_V1);
@@ -378,6 +433,15 @@ export class V2Driver {
       channels.find((c): c is AudioChannelDescriptor => c.kind === 'audio' && c.dir === 'up') ??
       null;
 
+    this.diag({
+      type: 'negotiated',
+      micCodec: this.micCh?.codec ?? null,
+      videoCodec: videoCh ? (videoCh.video_codec ?? 'h264') : null,
+      hasVideo: Boolean(videoCh),
+      posterMode: !videoCh,
+      features: acceptedFeatures,
+    });
+
     if (this.audioCh) {
       this.player = new PcmPlayer(() => handlers.onAudioBlocked());
       this.clock = this.player;
@@ -387,7 +451,7 @@ export class V2Driver {
     }, KEEPALIVE_PING_MS);
 
     if (videoCh) {
-      const mse = new MsePlayer(this.opts.videoEl, this.opts.dev);
+      const mse = new MsePlayer(this.opts.videoEl, this.log);
       this.mse = mse;
       // Accepted, but nothing ever plays: a box whose render path stalled after the handshake.
       // Video sessions only — poster mode reports its first frame synchronously just below.
@@ -402,10 +466,12 @@ export class V2Driver {
         onFirstFrame: () => {
           if (this.mediaTimer) clearTimeout(this.mediaTimer);
           this.mediaTimer = null;
+          this.phase('first_frame');
           handlers.onFirstFrame();
         },
         onError: (err) => handlers.onError(toAvatarError(err, 'media', { terminal: false }), false),
         onAudioBlocked: () => handlers.onAudioBlocked(),
+        onDiagnostic: (d) => this.diag(d),
       });
       mse.setMime(videoCh.mime);
       if (videoCh.fps !== undefined && videoCh.seg_frames !== undefined) {
@@ -415,6 +481,7 @@ export class V2Driver {
     } else {
       // Poster mode: no video channel this session; the poster is the visual.
       if (accept.poster?.url) this.opts.videoEl.poster = accept.poster.url;
+      this.phase('first_frame');
       handlers.onFirstFrame();
     }
 
@@ -463,7 +530,7 @@ export class V2Driver {
       let encoder: OpusMicEncoder;
       try {
         encoder = new OpusMicEncoder({
-          dev: this.opts.dev,
+          logger: this.log,
           onPacket: (packet, info) => this.sendMicFrame(micCh.id, packet, info),
           // A dead encoder is a dead mic: terminal, like a worklet that failed to load.
           onError: (err) => this.fail(err, 'mic-failed'),
@@ -481,12 +548,15 @@ export class V2Driver {
       .start({
         workletUrl: this.opts.workletUrl,
         stream: this.opts.permittedStream,
-        dev: this.opts.dev,
+        logger: this.log,
         getVideoMediaTimeMs: this.mse ? (t) => this.mse?.mediaTimeAt(t) ?? null : undefined,
         onFrame,
+        onDiagnostic: (d) => this.diag(d),
       })
       .then(() => {
-        if (!this.finished) this.opts.handlers.onMicReady();
+        if (this.finished) return;
+        this.phase('mic_ready');
+        this.opts.handlers.onMicReady();
       })
       .catch((err: unknown) => {
         // getUserMedia denial / worklet load failure — terminal, matching the v1 contract.
@@ -531,6 +601,10 @@ export class V2Driver {
   private onMediaUnit(unit: MediaUnit): void {
     if (this.audioCh && unit.channelId === this.audioCh.id) {
       if (unit.payload.byteLength === 0 || unit.payload.byteLength % 2 !== 0) return;
+      if (!this.firstAudioReported) {
+        this.firstAudioReported = true;
+        this.phase('first_audio');
+      }
       // Copy: Int16Array needs 2-byte alignment, and a subarray into the frame buffer has
       // arbitrary byteOffset.
       const pcm = new Int16Array(
@@ -551,7 +625,7 @@ export class V2Driver {
     // Frames on undeclared/unknown channels: must-ignore.
   }
 
-  private onSocketClose(code: number): void {
+  private onSocketClose(code: number, reason = ''): void {
     if (this.finished) {
       this.teardown();
       return;
@@ -560,6 +634,10 @@ export class V2Driver {
     const { handlers } = this.opts;
     const accepted = this.accepted !== null;
     const endReason = this.endReason;
+    // Before the teardown that nulls everything: the code and whether we had accepted are exactly
+    // what `edge_disconnect` used to flatten away (charmingly#288, §D.1). Fires before onEnded,
+    // and unguarded, so a host that tears down on `close` still sees it.
+    this.diag({ type: 'socket_closed', code, afterAccept: accepted, reasonLength: reason.length });
     this.teardown();
     if (endReason) {
       handlers.onEnded(endReason);
@@ -570,7 +648,8 @@ export class V2Driver {
       handlers.onError(
         new AvatarError(
           known?.kind ?? 'connect',
-          known?.message ?? `session socket closed before accept (${code})`
+          known?.message ?? `session socket closed before accept (${code})`,
+          { closeCode: code }
         ),
         true
       );
@@ -595,6 +674,7 @@ export class V2Driver {
     if (value.length > MAX_TEXT_CHARS) throw new Error('text is too long');
     const conn = this.conn;
     if (this.finished || !conn || conn.protocolState !== 'active') {
+      this.diag({ type: 'text_failed', reason: 'transport' });
       throw new Error('text transport is unavailable');
     }
     this.textSequence += 1;
@@ -602,6 +682,7 @@ export class V2Driver {
     const result = new Promise<Turn>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.textWaiters.delete(id);
+        this.diag({ type: 'text_failed', reason: 'timeout' });
         reject(new Error('text response timed out'));
       }, TEXT_TIMEOUT_MS);
       this.textWaiters.set(id, { resolve, reject, timer });

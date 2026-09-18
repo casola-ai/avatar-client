@@ -1,4 +1,6 @@
 import { ClockMap } from './clock-map';
+import type { DiagnosticData } from './diagnostics';
+import { consoleLogger, type Logger } from './logger';
 import type { PlayoutClock } from './playout-clock';
 import type { VideoCodec } from './protocol';
 
@@ -9,6 +11,9 @@ export interface MseHandlers {
    *  an autoplaying video on a scripted unmute). Surface a tap-for-sound affordance and call
    *  unmuteAudio() from the tap's gesture context. */
   onAudioBlocked?: () => void;
+  /** Bounded playback diagnostics — `playback_rejected`, `media_error`, `buffer_evicted`, `stall`.
+   *  Optional: absent leaves playback behavior unchanged. */
+  onDiagnostic?: (d: DiagnosticData) => void;
 }
 
 type MediaSourceCtor = { new (): MediaSource; isTypeSupported?(mime: string): boolean };
@@ -95,6 +100,11 @@ export class MsePlayer implements PlayoutClock {
   private rvfcHandle: number | null = null;
   private lastPlayedPtsUs: number | null = null;
   private readonly advanceHandlers = new Set<() => void>();
+  private evictionCount = 0;
+
+  private diag(d: DiagnosticData): void {
+    this.handlers.onDiagnostic?.(d);
+  }
 
   private fireFirstFrame(): void {
     if (this.firstFrameFired) return;
@@ -102,10 +112,14 @@ export class MsePlayer implements PlayoutClock {
     this.handlers.onFirstFrame?.();
   }
 
+  private readonly log: Logger;
+
   constructor(
     private readonly video: HTMLVideoElement,
-    private readonly dev = false
-  ) {}
+    logger?: Logger
+  ) {
+    this.log = logger ?? consoleLogger(false);
+  }
 
   /** Create the MediaSource and arm the element. Call once, then setMime() + append(). */
   attach(handlers: MseHandlers = {}): void {
@@ -145,11 +159,13 @@ export class MsePlayer implements PlayoutClock {
       if (this.closed || !this.started || !v.paused) return;
       if (this.resumeAttempts >= 5) return;
       this.resumeAttempts += 1;
+      this.diag({ type: 'stall', action: 'resume', attempt: this.resumeAttempts });
       void v.play().catch(() => {
         // Unmuted resume refused → fall back to muted playback and surface tap-for-sound.
         if (this.closed) return;
         v.muted = true;
         void v.play().catch(() => {});
+        this.diag({ type: 'stall', action: 'resume_muted', attempt: this.resumeAttempts });
         this.setAudioBlocked();
       });
     };
@@ -158,7 +174,17 @@ export class MsePlayer implements PlayoutClock {
       this.resumeAttempts = 0;
     };
     v.addEventListener('playing', onPlaying);
-    this.watchdogListeners.push(['pause', onPause], ['playing', onPlaying]);
+    // The media element's own error (decode failure, source error) — unobserved before, one of the
+    // MSE blind spots (charmingly#288, §D.8). `MediaError.code` (1–4), never a message.
+    const onElementError: EventListener = () => {
+      this.diag({ type: 'media_error', source: 'element', name: `code_${v.error?.code ?? 0}` });
+    };
+    v.addEventListener('error', onElementError);
+    this.watchdogListeners.push(
+      ['pause', onPause],
+      ['playing', onPlaying],
+      ['error', onElementError]
+    );
 
     const onAdvance: EventListener = () => {
       if (this.video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
@@ -328,8 +354,13 @@ export class MsePlayer implements PlayoutClock {
 
   private trySetup(): void {
     if (this.sb || !this.sourceOpen || !this.mime || !this.ms) return;
-    if (typeof MediaSource !== 'undefined' && !MediaSource.isTypeSupported(this.mime)) {
-      console.warn('[mse] unsupported codec:', this.mime);
+    // Probe the SAME implementation the player uses (ManagedMediaSource on iOS), not the global
+    // `MediaSource` — the two disagree on iOS, where the global would reject a HEVC stream this
+    // player can actually decode (charmingly#288, §D.8). Was `MediaSource.isTypeSupported`.
+    const Ctor = getMediaSourceCtor();
+    if (Ctor && typeof Ctor.isTypeSupported === 'function' && !Ctor.isTypeSupported(this.mime)) {
+      this.log('warn', '[mse] unsupported codec', { mime: this.mime });
+      this.diag({ type: 'media_error', source: 'codec_unsupported', name: 'unsupported' });
       this.handlers.onError?.(new Error(`unsupported codec: ${this.mime}`));
       return;
     }
@@ -339,6 +370,10 @@ export class MsePlayer implements PlayoutClock {
       sb.addEventListener('updateend', () => {
         this.activeAppend = null;
         if (!this.discarding) this.drain();
+      });
+      // A SourceBuffer error aborts appends silently otherwise (charmingly#288, §D.8).
+      sb.addEventListener('error', () => {
+        this.diag({ type: 'media_error', source: 'source_buffer', name: 'error' });
       });
       this.sb = sb;
       this.drain();
@@ -366,42 +401,44 @@ export class MsePlayer implements PlayoutClock {
         this.video
           .play()
           .then(() => {
-            if (this.dev)
-              console.log(
-                '[mse] play() resolved paused=',
-                this.video.paused,
-                'readyState=',
-                this.video.readyState
-              );
+            this.log('debug', '[mse] play() resolved', {
+              paused: this.video.paused,
+              readyState: this.video.readyState,
+            });
             this.video.muted = false;
             // iOS Safari pauses the element synchronously when a scripted unmute isn't backed
             // by a user gesture. Keep VIDEO running (muted) rather than freezing into a
             // slideshow; audio is recovered via unmuteAudio() from a tap.
             if (this.video.paused) {
-              if (this.dev) console.warn('[mse] unmute paused playback — resuming muted');
+              this.log('debug', '[mse] unmute paused playback — resuming muted');
               this.video.muted = true;
               void this.video.play().catch(() => {});
               this.setAudioBlocked();
             }
           })
           .catch((err: unknown) => {
-            console.warn(
-              '[mse] play() rejected',
-              (err as { name?: string })?.name,
-              (err as { message?: string })?.message,
-              'paused=',
-              this.video.paused,
-              'readyState=',
-              this.video.readyState,
-              'muted=',
-              this.video.muted
-            );
+            const name = (err as { name?: string })?.name ?? 'Error';
+            this.log('warn', '[mse] play() rejected', {
+              name,
+              paused: this.video.paused,
+              readyState: this.video.readyState,
+              muted: this.video.muted,
+            });
+            // Was console-only (charmingly#288, §D.3): the DOMException name, never its message.
+            this.diag({
+              type: 'playback_rejected',
+              name,
+              readyState: this.video.readyState,
+              muted: this.video.muted,
+            });
           });
       }
     } catch (e) {
       if (e instanceof DOMException && e.name === 'QuotaExceededError') {
         this.activeAppend = null;
         this.pending.unshift(next);
+        this.evictionCount += 1;
+        this.diag({ type: 'buffer_evicted', attempt: this.evictionCount });
         this.housekeep(true);
       } else {
         this.handlers.onError?.(e);

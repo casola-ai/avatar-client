@@ -1,4 +1,6 @@
 import { ClockMap } from './clock-map';
+import type { DiagnosticData } from './diagnostics';
+import { type Logger } from './logger';
 /** The uplink sample rate, whichever codec ch1 negotiated (spec §4). */
 export declare const MIC_SAMPLE_RATE = 16000;
 export declare const MIC_FRAME_SAMPLES = 1600;
@@ -32,9 +34,14 @@ export interface MicPipelineOpts {
      *  decoupled/testable. undefined = no video calibration source (poster mode); frames then
      *  report VIDEO_MEDIA_TIME_UNKNOWN. */
     getVideoMediaTimeMs?: (performanceTimeMs: number) => number | null;
+    /** Where the pipeline routes its logs. Defaults to a dev-gated console. */
+    logger?: Logger;
     /** One call per assembled 100 ms 16 kHz frame. `pcm` is a fresh copy the receiver owns.
      *  Muted frames arrive zeroed (capture keeps running so timing stays continuous). */
     onFrame: (pcm: Int16Array, info: MicFrameInfo) => void;
+    /** Bounded mic diagnostics — `mic_context` (a suspended AudioContext at start, which used to be
+     *  swallowed) and `mic_track` (the track ending / muting / a device change). Optional. */
+    onDiagnostic?: (d: DiagnosticData) => void;
 }
 /**
  * Microphone capture: getUserMedia → AudioWorklet → resample to 16 kHz → 1600-sample Int16
@@ -60,6 +67,8 @@ export declare class MicPipeline {
     private inputLatencySeconds;
     private frameStartContextTime;
     private micSeq;
+    private teardownListeners;
+    private log;
     static ensurePermission(): Promise<MediaStream>;
     start(opts: MicPipelineOpts): Promise<void>;
     private onPcm;

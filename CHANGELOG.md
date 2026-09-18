@@ -6,6 +6,36 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-18
+
+### Added
+- **Session diagnostics.** A new `callbacks.onDiagnostic` and the `diagnostic` event deliver a
+  bounded `AvatarDiagnostic` — the operational facts the SDK knew inside and no host could see.
+  The driver emits connect-phase timings (`socket_open` → `mic_ready`), `socket_closed` with the
+  close code (the number `edge_disconnect` used to flatten away), `protocol_violation`, in-band
+  `server_error`, `go_away`, `session_end`, the `negotiated` shape, keepalive `rtt` and
+  `text_failed`; the players and mic pipeline add `playback_rejected`, `media_error`,
+  `buffer_evicted`, `stall`, `mic_context`, `mic_track` and `frame_dropped`. The vocabulary is
+  bounded on purpose: DOMException *names* not messages, close *codes* and wire enums, a reason
+  *length* never its text — no person, no URL. Receivers must ignore an unrecognized `type`; the
+  union grows.
+- **`AvatarSession.stats()`** folds that stream into one snapshot — the connect timeline, the close
+  code, the last keepalive RTT, the negotiated shape and running counters — readable after the
+  session has ended. **`AvatarSession.negotiated`** exposes the codecs in force.
+- **`AvatarSessionOpts.sessionId` / `traceId`** are stamped on every diagnostic so a report joins
+  the mint and the support trace. They never go on the wire.
+- **`AvatarSessionOpts.logger`** (`(level, message, detail?) => void`) routes the SDK's internal
+  logs — the driver, players, mic pipeline and state machine — through one sink. Absent, behavior
+  is unchanged: a dev-gated console.
+- **`AvatarError.closeCode` and `AvatarError.serverCode`** — the raw WebSocket close code behind a
+  kind, and the box's in-band error `code`, which the flattened error message used to drop.
+
+### Fixed
+- **iOS codec probe.** MSE source-buffer setup probed the global `MediaSource.isTypeSupported`, but
+  the hello offer probes the implementation the player actually uses (`ManagedMediaSource` on iOS,
+  which decodes HEVC the global refuses) — so an iPad session could be failed for a codec it can
+  play. Setup now probes the same implementation.
+
 ## [0.7.0] - 2026-09-10
 
 ### Added

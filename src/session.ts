@@ -1,4 +1,11 @@
+import {
+  type AvatarDiagnostic,
+  type AvatarSessionStats,
+  emptyStats,
+  type NegotiatedInfo,
+} from './diagnostics';
 import { AvatarError, classifyMicError, toAvatarError } from './errors';
+import { consoleLogger, type Logger } from './logger';
 import { OpusMicEncoder } from './mic-encoder';
 import { MicPipeline } from './mic-pipeline';
 import { MsePlayer } from './mse-player';
@@ -59,6 +66,10 @@ export interface AvatarSessionEvents {
   audioBlocked: () => void;
   /** The microphone's mute state changed — from the user, or from `suppressMic`. */
   muteChange: (state: MicMuteState) => void;
+  /** A bounded operational fact about the session — see `AvatarDiagnostic`. Fires unguarded by the
+   *  session's `done` flag, so `socket_closed` (which lands in the same tick as `close`) is not
+   *  dropped. */
+  diagnostic: (d: AvatarDiagnostic) => void;
   close: (r: EndReason) => void;
   error: (e: AvatarError) => void;
 }
@@ -115,6 +126,13 @@ export interface AvatarSessionOpts {
    *  bits than h264 at equal quality. The box decides, so an older box silently serves h264.
    *  `'h264'` offers nothing: the opt-out if a platform's hardware decode misbehaves. */
   videoCodec?: 'auto' | 'h264';
+  /** The mint's session id and a support trace id. Stamped on every `AvatarDiagnostic` so a report
+   *  joins the mint and the support trace; never put on the wire. */
+  sessionId?: string;
+  traceId?: string;
+  /** Where the SDK routes its internal logs (driver, players, pipeline, state). Absent = a
+   *  dev-gated console, exactly the pre-logger behavior. */
+  logger?: Logger;
   /** Test seam for the session WebSocket — see V2Driver. */
   createSocket?: (url: string, protocols: string[]) => DriverSocket;
   callbacks?: {
@@ -153,6 +171,10 @@ export interface AvatarSessionOpts {
      *  arrives here as `persona-unavailable`, not as anything the user's mic can fix.
      *  Pre-flight with AvatarSession.preflight() to catch permission problems before a seat. */
     onError?(e: AvatarError): void;
+    /** A bounded operational fact about the session (`AvatarDiagnostic`). Analytics/support hook,
+     *  never required for normal operation. Branch on `d.type` and default-ignore an unrecognized
+     *  one — the union grows. */
+    onDiagnostic?(d: AvatarDiagnostic): void;
   };
 }
 
@@ -168,11 +190,15 @@ export class AvatarSession {
   private _responseLanguage: string | undefined;
   private _userMuted = false;
   private _micSuppressed = false;
+  private _negotiated: NegotiatedInfo | null = null;
+  private readonly _stats = emptyStats();
 
   private readonly listeners = new Map<EventName, Set<(...args: never[]) => void>>();
+  private readonly logger: Logger;
 
   constructor(private readonly opts: AvatarSessionOpts) {
-    this.sm = new StateMachine(opts.dev ?? false);
+    this.logger = opts.logger ?? consoleLogger(opts.dev ?? false);
+    this.sm = new StateMachine(this.logger);
     this.sm.onChange((next, prev) => {
       this.emit('state', next, prev);
     });
@@ -256,6 +282,9 @@ export class AvatarSession {
           // No constructor-callback twin: this event is new, and adding one would grow the
           // callback bag the events API exists to replace.
           break;
+        case 'diagnostic':
+          cb?.onDiagnostic?.(...(args as Parameters<AvatarSessionEvents['diagnostic']>));
+          break;
         case 'close':
           cb?.onClose?.(...(args as Parameters<AvatarSessionEvents['close']>));
           break;
@@ -264,7 +293,7 @@ export class AvatarSession {
           break;
       }
     } catch (err) {
-      if (this.opts.dev) console.warn(`[avatar] callbacks.${event} threw`, err);
+      this.logger('debug', `[avatar] callbacks.${event} threw`, { err });
     }
     const set = this.listeners.get(event);
     if (!set) return;
@@ -273,7 +302,7 @@ export class AvatarSession {
         (handler as (...a: unknown[]) => void)(...args);
       } catch (err) {
         // One bad subscriber must not take down the session or the other subscribers.
-        if (this.opts.dev) console.warn(`[avatar] on('${event}') handler threw`, err);
+        this.logger('debug', `[avatar] on('${event}') handler threw`, { err });
       }
     }
   }
@@ -295,6 +324,83 @@ export class AvatarSession {
    *  negotiate). `undefined` before the accept, and in poster mode, where there is no video. */
   get videoCodec(): VideoCodec | undefined {
     return this._videoCodec;
+  }
+
+  /** What the box negotiated for this session — the codecs in force, whether video plays. `null`
+   *  before the accept. Diagnostics: the fixed shape a session landed in, beside the running
+   *  counters in {@link stats}. */
+  get negotiated(): NegotiatedInfo | null {
+    return this._negotiated;
+  }
+
+  /**
+   * A snapshot of everything the diagnostic stream has said about this session so far: the connect
+   * timeline, the close code, the last keepalive RTT, what was negotiated, and running counters.
+   *
+   * Safe to call after the session has ended — it is accumulated on the session as diagnostics
+   * arrive, not read from the driver, which `teardown()` has already nulled by then.
+   */
+  stats(): AvatarSessionStats {
+    return {
+      connect: { ...this._stats.connect },
+      closeCode: this._stats.closeCode,
+      rttMs: this._stats.rttMs,
+      negotiated: this._negotiated,
+      counters: { ...this._stats.counters },
+    };
+  }
+
+  /** Fold one diagnostic into the accumulated stats and capture the negotiated shape. Runs
+   *  unguarded by `done` so the terminal `socket_closed` is counted. */
+  private ingestDiagnostic(d: AvatarDiagnostic): void {
+    const c = this._stats.counters;
+    switch (d.type) {
+      case 'connect_phase':
+        this._stats.connect[d.phase] = d.ms;
+        break;
+      case 'socket_closed':
+        this._stats.closeCode = d.code;
+        break;
+      case 'rtt':
+        this._stats.rttMs = d.ms;
+        break;
+      case 'negotiated':
+        this._negotiated = {
+          micCodec: d.micCodec,
+          videoCodec: d.videoCodec,
+          hasVideo: d.hasVideo,
+          posterMode: d.posterMode,
+          features: d.features,
+        };
+        break;
+      case 'protocol_violation':
+        c.protocolViolations += 1;
+        break;
+      case 'server_error':
+        c.serverErrors += 1;
+        break;
+      case 'media_error':
+        c.mediaErrors += 1;
+        break;
+      case 'buffer_evicted':
+        c.bufferEvictions += 1;
+        break;
+      case 'playback_rejected':
+        c.playbackRejections += 1;
+        break;
+      case 'stall':
+        c.stalls += 1;
+        break;
+      case 'mic_track':
+        c.micTrackEvents += 1;
+        break;
+      case 'frame_dropped':
+        c.framesDropped += 1;
+        break;
+      case 'text_failed':
+        c.textFailures += 1;
+        break;
+    }
   }
 
   // Returns the live stream so callers can pass it back via opts.permittedStream,
@@ -439,6 +545,9 @@ export class AvatarSession {
       micCodecs,
       videoCodecs,
       dev,
+      logger: this.logger,
+      sessionId: this.opts.sessionId,
+      traceId: this.opts.traceId,
       createSocket: this.opts.createSocket,
       handlers: {
         onAccept: (info) => {
@@ -487,7 +596,14 @@ export class AvatarSession {
           if (!this.done) this.emit('mediaDiscarded', cutoffPtsUs);
         },
         onAudioFrameSent: (info) => {
+          this._stats.counters.micFramesSent += 1;
           if (!this.done) this.emit('audioFrameSent', info);
+        },
+        // Unguarded by `done`: socket_closed is emitted by the driver in the same tick as onEnded,
+        // which sets done — a guard here would drop exactly the close code this exists to carry.
+        onDiagnostic: (d) => {
+          this.ingestDiagnostic(d);
+          this.emit('diagnostic', d);
         },
         onAudioBlocked: () => {
           if (!this.done) this.emit('audioBlocked');
@@ -499,7 +615,7 @@ export class AvatarSession {
           if (terminal) {
             this.internalFail(err);
           } else {
-            if (dev) console.warn('[v2] session error', err);
+            this.logger('debug', '[v2] session error', { err });
             if (!this.done) this.emit('error', err);
           }
         },

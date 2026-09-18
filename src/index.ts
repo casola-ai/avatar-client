@@ -12,10 +12,19 @@ export type {
   SessionControlsOptions,
 } from './controls';
 export { attachSessionControls } from './controls';
+export type {
+  AvatarDiagnostic,
+  AvatarSessionStats,
+  ConnectPhase,
+  MediaErrorSource,
+  NegotiatedInfo,
+  StallAction,
+} from './diagnostics';
 export type { DisclosureController, DisclosureOptions } from './disclosure';
 export { attachDisclosure } from './disclosure';
 export type { AvatarErrorKind, AvatarErrorStage } from './errors';
 export { AvatarError, classifyMicError, isMicError } from './errors';
+export type { Logger, LogLevel } from './logger';
 export type { PlayoutClock } from './playout-clock';
 // Wire identifiers, for advanced integrations (custom ConnectStrategy / diagnostics).
 export type { VideoCodec } from './protocol';

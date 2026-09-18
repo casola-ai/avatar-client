@@ -1,4 +1,6 @@
+import type { AvatarDiagnostic } from '../diagnostics';
 import { AvatarError } from '../errors';
+import { type Logger } from '../logger';
 import { type MicFrameInfo } from '../mic-pipeline';
 import { type VideoCodec, type WebSocketLike } from '../protocol';
 import { type TimedUtterance } from '../utterance-scheduler';
@@ -44,6 +46,10 @@ export interface V2DriverHandlers {
      *  terminal=false: an in-band server error or media hiccup; the session keeps running.
      *  Always an `AvatarError` — the driver classifies before it hands anything up. */
     onError(err: AvatarError, terminal: boolean): void;
+    /** Bounded operational fact about the session (see `AvatarDiagnostic`). Optional: absent means
+     *  the driver's behavior is unchanged. Fires unguarded, so `socket_closed` reaches the host even
+     *  though it lands in the same tick as `onEnded`. */
+    onDiagnostic?(d: AvatarDiagnostic): void;
 }
 export interface V2DriverOpts {
     videoEl: HTMLVideoElement;
@@ -63,6 +69,12 @@ export interface V2DriverOpts {
      *  out and the box serves h264. */
     videoCodecs?: string[];
     dev: boolean;
+    /** Where the driver and its players route internal logs. Defaults to a dev-gated console. */
+    logger?: Logger;
+    /** Stamped on every diagnostic so a report can be joined to the mint and the support trace.
+     *  The driver never puts them on the wire — they ride diagnostics only. */
+    sessionId?: string;
+    traceId?: string;
     handlers: V2DriverHandlers;
     /** Test seam — defaults to `new WebSocket(url, protocols)`. */
     createSocket?: (url: string, protocols: string[]) => DriverSocket;
@@ -90,6 +102,9 @@ export declare class V2Driver {
     private finished;
     private timedUtterances;
     private framedMediaUnits;
+    private connectStartedAt;
+    private firstAudioReported;
+    private readonly log;
     private openTimer;
     private handshakeTimer;
     private mediaTimer;
@@ -100,6 +115,11 @@ export declare class V2Driver {
     private langs;
     private responseLanguage;
     constructor(opts: V2DriverOpts);
+    /** Emit one diagnostic, stamped with the wall clock and the ids the host passed. Never throws
+     *  into the driver: a host `onDiagnostic` that blows up must not take the session down. */
+    private diag;
+    /** ms since the socket was created — the basis for every `connect_phase`. */
+    private phase;
     connect(): void;
     private onServerMessage;
     private onAccept;

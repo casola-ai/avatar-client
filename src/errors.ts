@@ -62,17 +62,32 @@ export class AvatarError extends Error {
   readonly terminal: boolean;
   /** The connect stage a watchdog fired in. Absent unless a timer produced this error. */
   readonly stage?: AvatarErrorStage;
+  /** The WebSocket close code, on an error a socket close produced (the `connect`/`unauthorized`/
+   *  `protocol-mismatch`/`persona-unavailable`/`capacity`/`policy` kinds). The raw number behind
+   *  the kind, for a support line that needs to tell 4004 from 4008. */
+  readonly closeCode?: number;
+  /** The box's in-band error `code`, on a `server` error. The wire code the message carried, which
+   *  the flattened `Error(message ?? code)` used to lose. */
+  readonly serverCode?: string;
 
   constructor(
     kind: AvatarErrorKind,
     message: string,
-    options: { terminal?: boolean; cause?: unknown; stage?: AvatarErrorStage } = {}
+    options: {
+      terminal?: boolean;
+      cause?: unknown;
+      stage?: AvatarErrorStage;
+      closeCode?: number;
+      serverCode?: string;
+    } = {}
   ) {
     super(message);
     this.name = 'AvatarError';
     this.kind = kind;
     this.terminal = options.terminal ?? true;
     if (options.stage !== undefined) this.stage = options.stage;
+    if (options.closeCode !== undefined) this.closeCode = options.closeCode;
+    if (options.serverCode !== undefined) this.serverCode = options.serverCode;
     if (options.cause !== undefined) this.cause = options.cause;
   }
 }
@@ -108,7 +123,13 @@ export function classifyMicError(error: unknown): AvatarErrorKind {
 export function toAvatarError(
   error: unknown,
   kind: AvatarErrorKind,
-  options: { terminal?: boolean; message?: string; stage?: AvatarErrorStage } = {}
+  options: {
+    terminal?: boolean;
+    message?: string;
+    stage?: AvatarErrorStage;
+    closeCode?: number;
+    serverCode?: string;
+  } = {}
 ): AvatarError {
   if (error instanceof AvatarError) return error;
   const message =
@@ -118,5 +139,7 @@ export function toAvatarError(
     terminal: options.terminal,
     cause: error,
     stage: options.stage,
+    closeCode: options.closeCode,
+    serverCode: options.serverCode,
   });
 }

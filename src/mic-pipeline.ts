@@ -1,4 +1,6 @@
 import { ClockMap } from './clock-map';
+import type { DiagnosticData } from './diagnostics';
+import { consoleLogger, type Logger } from './logger';
 
 /** The uplink sample rate, whichever codec ch1 negotiated (spec §4). */
 export const MIC_SAMPLE_RATE = 16000;
@@ -55,9 +57,14 @@ export interface MicPipelineOpts {
    *  decoupled/testable. undefined = no video calibration source (poster mode); frames then
    *  report VIDEO_MEDIA_TIME_UNKNOWN. */
   getVideoMediaTimeMs?: (performanceTimeMs: number) => number | null;
+  /** Where the pipeline routes its logs. Defaults to a dev-gated console. */
+  logger?: Logger;
   /** One call per assembled 100 ms 16 kHz frame. `pcm` is a fresh copy the receiver owns.
    *  Muted frames arrive zeroed (capture keeps running so timing stays continuous). */
   onFrame: (pcm: Int16Array, info: MicFrameInfo) => void;
+  /** Bounded mic diagnostics — `mic_context` (a suspended AudioContext at start, which used to be
+   *  swallowed) and `mic_track` (the track ending / muting / a device change). Optional. */
+  onDiagnostic?: (d: DiagnosticData) => void;
 }
 
 /**
@@ -85,6 +92,8 @@ export class MicPipeline {
   private inputLatencySeconds = 0;
   private frameStartContextTime = 0;
   private micSeq = 0;
+  private teardownListeners: Array<() => void> = [];
+  private log: Logger = consoleLogger(false);
 
   // Returns the live MediaStream so the caller can pass it to start(), avoiding
   // a second getUserMedia call (which causes a second permission prompt on Firefox).
@@ -118,6 +127,7 @@ export class MicPipeline {
   async start(opts: MicPipelineOpts): Promise<void> {
     this.opts = opts;
     const dev = opts.dev ?? false;
+    this.log = opts.logger ?? consoleLogger(dev);
     if (opts.stream) {
       this.stream = opts.stream;
     } else {
@@ -141,18 +151,11 @@ export class MicPipeline {
     const ctx = new AudioContext(nativeRate ? { sampleRate: nativeRate } : {});
     this.ctx = ctx;
 
-    if (dev) {
-      console.log(
-        '[mic] AudioContext state=',
-        ctx.state,
-        'sampleRate=',
-        ctx.sampleRate,
-        'trackRate=',
-        nativeRate,
-        'settings=',
-        settings
-      );
-    }
+    this.log('debug', '[mic] AudioContext', {
+      state: ctx.state,
+      sampleRate: ctx.sampleRate,
+      trackRate: nativeRate,
+    });
 
     if (ctx.state === 'suspended') {
       try {
@@ -160,7 +163,33 @@ export class MicPipeline {
       } catch {
         /* Will retry on next user gesture */
       }
-      if (dev) console.log('[mic] AudioContext state after resume=', ctx.state);
+      this.log('debug', '[mic] AudioContext after resume', { state: ctx.state });
+      // A context still suspended here is a mic that reports ready but sends silence — swallowed
+      // before (charmingly#288, §D.4). `resumed` says whether the resume above recovered it.
+      opts.onDiagnostic?.({
+        type: 'mic_context',
+        state: ctx.state,
+        resumed: (ctx.state as string) !== 'suspended',
+      });
+    }
+
+    // Track loss / mute / a device change all end capture without the pipeline noticing otherwise
+    // (charmingly#288, §D.5). Report them; the capture path is unchanged.
+    if (track) {
+      for (const event of ['ended', 'mute', 'unmute'] as const) {
+        const listener = (): void => opts.onDiagnostic?.({ type: 'mic_track', event });
+        track.addEventListener(event, listener);
+        this.teardownListeners.push(() => track.removeEventListener(event, listener));
+      }
+    }
+    const devices = navigator.mediaDevices;
+    if (devices?.addEventListener) {
+      const onDeviceChange = (): void =>
+        opts.onDiagnostic?.({ type: 'mic_track', event: 'device_change' });
+      devices.addEventListener('devicechange', onDeviceChange);
+      this.teardownListeners.push(() =>
+        devices.removeEventListener('devicechange', onDeviceChange)
+      );
     }
 
     this.inRate = ctx.sampleRate;
@@ -171,7 +200,7 @@ export class MicPipeline {
     this.node = node;
     node.port.onmessage = (e) => {
       const { data, contextTime } = e.data as { data: Float32Array; contextTime: number };
-      this.onPcm(data, contextTime, dev);
+      this.onPcm(data, contextTime);
     };
 
     const sink = ctx.createGain();
@@ -180,26 +209,17 @@ export class MicPipeline {
     source.connect(node).connect(sink).connect(ctx.destination);
   }
 
-  private onPcm(chunk: Float32Array, contextTime: number, dev: boolean): void {
+  private onPcm(chunk: Float32Array, contextTime: number): void {
     if (this.closed) return;
 
-    if (dev) {
-      this.pcmCallCount++;
-      if (this.pcmCallCount <= 5 || this.pcmCallCount % 100 === 0) {
-        let peak = 0;
-        for (let i = 0; i < chunk.length; i++) {
-          const abs = Math.abs(chunk[i] ?? 0);
-          if (abs > peak) peak = abs;
-        }
-        console.log(
-          '[mic] onPcm #',
-          this.pcmCallCount,
-          'len=',
-          chunk.length,
-          'peak=',
-          peak.toFixed(4)
-        );
+    this.pcmCallCount++;
+    if (this.pcmCallCount <= 5 || this.pcmCallCount % 100 === 0) {
+      let peak = 0;
+      for (let i = 0; i < chunk.length; i++) {
+        const abs = Math.abs(chunk[i] ?? 0);
+        if (abs > peak) peak = abs;
       }
+      this.log('debug', '[mic] onPcm', { n: this.pcmCallCount, len: chunk.length, peak });
     }
 
     const ratio = this.inRate / TARGET_RATE;
@@ -262,6 +282,8 @@ export class MicPipeline {
 
   stop(): void {
     this.closed = true;
+    for (const remove of this.teardownListeners) remove();
+    this.teardownListeners = [];
     try {
       this.node?.disconnect();
       this.sink?.disconnect();

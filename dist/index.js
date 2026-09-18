@@ -569,10 +569,19 @@ var AvatarError = class extends Error {
     __publicField(this, "terminal");
     /** The connect stage a watchdog fired in. Absent unless a timer produced this error. */
     __publicField(this, "stage");
+    /** The WebSocket close code, on an error a socket close produced (the `connect`/`unauthorized`/
+     *  `protocol-mismatch`/`persona-unavailable`/`capacity`/`policy` kinds). The raw number behind
+     *  the kind, for a support line that needs to tell 4004 from 4008. */
+    __publicField(this, "closeCode");
+    /** The box's in-band error `code`, on a `server` error. The wire code the message carried, which
+     *  the flattened `Error(message ?? code)` used to lose. */
+    __publicField(this, "serverCode");
     this.name = "AvatarError";
     this.kind = kind;
     this.terminal = options.terminal ?? true;
     if (options.stage !== void 0) this.stage = options.stage;
+    if (options.closeCode !== void 0) this.closeCode = options.closeCode;
+    if (options.serverCode !== void 0) this.serverCode = options.serverCode;
     if (options.cause !== void 0) this.cause = options.cause;
   }
 };
@@ -592,7 +601,9 @@ function toAvatarError(error, kind, options = {}) {
   return new AvatarError(kind, message, {
     terminal: options.terminal,
     cause: error,
-    stage: options.stage
+    stage: options.stage,
+    closeCode: options.closeCode,
+    serverCode: options.serverCode
   });
 }
 
@@ -989,6 +1000,38 @@ function webSocketTransport(ws) {
   };
 }
 
+// src/diagnostics.ts
+function emptyStats() {
+  return {
+    connect: {},
+    closeCode: null,
+    rttMs: null,
+    negotiated: null,
+    counters: {
+      protocolViolations: 0,
+      serverErrors: 0,
+      mediaErrors: 0,
+      bufferEvictions: 0,
+      playbackRejections: 0,
+      stalls: 0,
+      micTrackEvents: 0,
+      framesDropped: 0,
+      textFailures: 0,
+      micFramesSent: 0
+    }
+  };
+}
+
+// src/logger.ts
+function consoleLogger(dev) {
+  return (level, message, detail) => {
+    if (level === "debug" && !dev) return;
+    const sink = level === "warn" ? console.warn : console.log;
+    if (detail === void 0) sink(message);
+    else sink(message, detail);
+  };
+}
+
 // src/clock-map.ts
 var ClockMap = class {
   constructor(cap = 64) {
@@ -1059,6 +1102,8 @@ var MicPipeline = class {
     __publicField(this, "inputLatencySeconds", 0);
     __publicField(this, "frameStartContextTime", 0);
     __publicField(this, "micSeq", 0);
+    __publicField(this, "teardownListeners", []);
+    __publicField(this, "log", consoleLogger(false));
   }
   // Returns the live MediaStream so the caller can pass it to start(), avoiding
   // a second getUserMedia call (which causes a second permission prompt on Firefox).
@@ -1076,6 +1121,7 @@ var MicPipeline = class {
   async start(opts) {
     this.opts = opts;
     const dev = opts.dev ?? false;
+    this.log = opts.logger ?? consoleLogger(dev);
     if (opts.stream) {
       this.stream = opts.stream;
     } else {
@@ -1090,24 +1136,37 @@ var MicPipeline = class {
     this.inputLatencySeconds = settings?.latency ?? 0;
     const ctx = new AudioContext(nativeRate ? { sampleRate: nativeRate } : {});
     this.ctx = ctx;
-    if (dev) {
-      console.log(
-        "[mic] AudioContext state=",
-        ctx.state,
-        "sampleRate=",
-        ctx.sampleRate,
-        "trackRate=",
-        nativeRate,
-        "settings=",
-        settings
-      );
-    }
+    this.log("debug", "[mic] AudioContext", {
+      state: ctx.state,
+      sampleRate: ctx.sampleRate,
+      trackRate: nativeRate
+    });
     if (ctx.state === "suspended") {
       try {
         await ctx.resume();
       } catch {
       }
-      if (dev) console.log("[mic] AudioContext state after resume=", ctx.state);
+      this.log("debug", "[mic] AudioContext after resume", { state: ctx.state });
+      opts.onDiagnostic?.({
+        type: "mic_context",
+        state: ctx.state,
+        resumed: ctx.state !== "suspended"
+      });
+    }
+    if (track) {
+      for (const event of ["ended", "mute", "unmute"]) {
+        const listener = () => opts.onDiagnostic?.({ type: "mic_track", event });
+        track.addEventListener(event, listener);
+        this.teardownListeners.push(() => track.removeEventListener(event, listener));
+      }
+    }
+    const devices = navigator.mediaDevices;
+    if (devices?.addEventListener) {
+      const onDeviceChange = () => opts.onDiagnostic?.({ type: "mic_track", event: "device_change" });
+      devices.addEventListener("devicechange", onDeviceChange);
+      this.teardownListeners.push(
+        () => devices.removeEventListener("devicechange", onDeviceChange)
+      );
     }
     this.inRate = ctx.sampleRate;
     await ctx.audioWorklet.addModule(opts.workletUrl);
@@ -1116,32 +1175,23 @@ var MicPipeline = class {
     this.node = node;
     node.port.onmessage = (e) => {
       const { data, contextTime } = e.data;
-      this.onPcm(data, contextTime, dev);
+      this.onPcm(data, contextTime);
     };
     const sink = ctx.createGain();
     sink.gain.value = 0;
     this.sink = sink;
     source.connect(node).connect(sink).connect(ctx.destination);
   }
-  onPcm(chunk, contextTime, dev) {
+  onPcm(chunk, contextTime) {
     if (this.closed) return;
-    if (dev) {
-      this.pcmCallCount++;
-      if (this.pcmCallCount <= 5 || this.pcmCallCount % 100 === 0) {
-        let peak = 0;
-        for (let i = 0; i < chunk.length; i++) {
-          const abs = Math.abs(chunk[i] ?? 0);
-          if (abs > peak) peak = abs;
-        }
-        console.log(
-          "[mic] onPcm #",
-          this.pcmCallCount,
-          "len=",
-          chunk.length,
-          "peak=",
-          peak.toFixed(4)
-        );
+    this.pcmCallCount++;
+    if (this.pcmCallCount <= 5 || this.pcmCallCount % 100 === 0) {
+      let peak = 0;
+      for (let i = 0; i < chunk.length; i++) {
+        const abs = Math.abs(chunk[i] ?? 0);
+        if (abs > peak) peak = abs;
       }
+      this.log("debug", "[mic] onPcm", { n: this.pcmCallCount, len: chunk.length, peak });
     }
     const ratio = this.inRate / TARGET_RATE;
     const bufContextTime = contextTime - this.resTail.length / this.inRate;
@@ -1191,6 +1241,8 @@ var MicPipeline = class {
   }
   stop() {
     this.closed = true;
+    for (const remove of this.teardownListeners) remove();
+    this.teardownListeners = [];
     try {
       this.node?.disconnect();
       this.sink?.disconnect();
@@ -1299,7 +1351,10 @@ var OpusMicEncoder = class {
     this.partsUs = 0;
     const info = this.pending.shift();
     if (!info) {
-      if (this.opts.dev) console.warn("[mic] opus frame with no pending calibration; dropped");
+      (this.opts.logger ?? consoleLogger(false))(
+        "debug",
+        "[mic] opus frame with no pending calibration; dropped"
+      );
       return;
     }
     this.opts.onPacket(frameOpusPayload(parts), info);
@@ -1337,9 +1392,8 @@ function getMediaSourceCtor() {
   return w.ManagedMediaSource ?? w.MediaSource ?? null;
 }
 var MsePlayer = class {
-  constructor(video, dev = false) {
+  constructor(video, logger) {
     this.video = video;
-    this.dev = dev;
     __publicField(this, "ms", null);
     __publicField(this, "sb", null);
     __publicField(this, "mime", null);
@@ -1362,6 +1416,9 @@ var MsePlayer = class {
     __publicField(this, "rvfcHandle", null);
     __publicField(this, "lastPlayedPtsUs", null);
     __publicField(this, "advanceHandlers", /* @__PURE__ */ new Set());
+    __publicField(this, "evictionCount", 0);
+    __publicField(this, "log");
+    this.log = logger ?? consoleLogger(false);
   }
   static supported() {
     return getMediaSourceCtor() !== null;
@@ -1385,6 +1442,9 @@ var MsePlayer = class {
       }
     }
     return out;
+  }
+  diag(d) {
+    this.handlers.onDiagnostic?.(d);
   }
   fireFirstFrame() {
     if (this.firstFrameFired) return;
@@ -1423,11 +1483,13 @@ var MsePlayer = class {
       if (this.closed || !this.started || !v.paused) return;
       if (this.resumeAttempts >= 5) return;
       this.resumeAttempts += 1;
+      this.diag({ type: "stall", action: "resume", attempt: this.resumeAttempts });
       void v.play().catch(() => {
         if (this.closed) return;
         v.muted = true;
         void v.play().catch(() => {
         });
+        this.diag({ type: "stall", action: "resume_muted", attempt: this.resumeAttempts });
         this.setAudioBlocked();
       });
     };
@@ -1436,7 +1498,15 @@ var MsePlayer = class {
       this.resumeAttempts = 0;
     };
     v.addEventListener("playing", onPlaying);
-    this.watchdogListeners.push(["pause", onPause], ["playing", onPlaying]);
+    const onElementError = () => {
+      this.diag({ type: "media_error", source: "element", name: `code_${v.error?.code ?? 0}` });
+    };
+    v.addEventListener("error", onElementError);
+    this.watchdogListeners.push(
+      ["pause", onPause],
+      ["playing", onPlaying],
+      ["error", onElementError]
+    );
     const onAdvance = () => {
       if (this.video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
         this.lastPlayedPtsUs = Math.max(0, Math.round(this.video.currentTime * 1e6));
@@ -1582,8 +1652,10 @@ var MsePlayer = class {
   }
   trySetup() {
     if (this.sb || !this.sourceOpen || !this.mime || !this.ms) return;
-    if (typeof MediaSource !== "undefined" && !MediaSource.isTypeSupported(this.mime)) {
-      console.warn("[mse] unsupported codec:", this.mime);
+    const Ctor = getMediaSourceCtor();
+    if (Ctor && typeof Ctor.isTypeSupported === "function" && !Ctor.isTypeSupported(this.mime)) {
+      this.log("warn", "[mse] unsupported codec", { mime: this.mime });
+      this.diag({ type: "media_error", source: "codec_unsupported", name: "unsupported" });
       this.handlers.onError?.(new Error(`unsupported codec: ${this.mime}`));
       return;
     }
@@ -1593,6 +1665,9 @@ var MsePlayer = class {
       sb.addEventListener("updateend", () => {
         this.activeAppend = null;
         if (!this.discarding) this.drain();
+      });
+      sb.addEventListener("error", () => {
+        this.diag({ type: "media_error", source: "source_buffer", name: "error" });
       });
       this.sb = sb;
       this.drain();
@@ -1615,39 +1690,40 @@ var MsePlayer = class {
         this.started = true;
         this.video.muted = true;
         this.video.play().then(() => {
-          if (this.dev)
-            console.log(
-              "[mse] play() resolved paused=",
-              this.video.paused,
-              "readyState=",
-              this.video.readyState
-            );
+          this.log("debug", "[mse] play() resolved", {
+            paused: this.video.paused,
+            readyState: this.video.readyState
+          });
           this.video.muted = false;
           if (this.video.paused) {
-            if (this.dev) console.warn("[mse] unmute paused playback \u2014 resuming muted");
+            this.log("debug", "[mse] unmute paused playback \u2014 resuming muted");
             this.video.muted = true;
             void this.video.play().catch(() => {
             });
             this.setAudioBlocked();
           }
         }).catch((err) => {
-          console.warn(
-            "[mse] play() rejected",
-            err?.name,
-            err?.message,
-            "paused=",
-            this.video.paused,
-            "readyState=",
-            this.video.readyState,
-            "muted=",
-            this.video.muted
-          );
+          const name = err?.name ?? "Error";
+          this.log("warn", "[mse] play() rejected", {
+            name,
+            paused: this.video.paused,
+            readyState: this.video.readyState,
+            muted: this.video.muted
+          });
+          this.diag({
+            type: "playback_rejected",
+            name,
+            readyState: this.video.readyState,
+            muted: this.video.muted
+          });
         });
       }
     } catch (e) {
       if (e instanceof DOMException && e.name === "QuotaExceededError") {
         this.activeAppend = null;
         this.pending.unshift(next);
+        this.evictionCount += 1;
+        this.diag({ type: "buffer_evicted", attempt: this.evictionCount });
         this.housekeep(true);
       } else {
         this.handlers.onError?.(e);
@@ -1751,10 +1827,11 @@ var ALLOWED = {
   error: ["selecting", "verifying", "idle"]
 };
 var StateMachine = class {
-  constructor(dev = false) {
-    this.dev = dev;
+  constructor(logger = false) {
     __publicField(this, "current", "idle");
     __publicField(this, "listeners", /* @__PURE__ */ new Set());
+    __publicField(this, "log");
+    this.log = typeof logger === "boolean" ? consoleLogger(logger) : logger;
   }
   get state() {
     return this.current;
@@ -1762,8 +1839,8 @@ var StateMachine = class {
   set(next) {
     const prev = this.current;
     if (prev === next) return;
-    if (this.dev && !ALLOWED[prev].includes(next)) {
-      console.warn(`[avatar] unexpected transition ${prev} \u2192 ${next}`);
+    if (!ALLOWED[prev].includes(next)) {
+      this.log("debug", `[avatar] unexpected transition ${prev} \u2192 ${next}`);
     }
     this.current = next;
     for (const l of this.listeners) l(next, prev);
@@ -1776,7 +1853,11 @@ var StateMachine = class {
 
 // src/media-unit-assembler.ts
 var MediaUnitAssembler = class {
-  constructor() {
+  /** `onDrop` is told why a fragment was discarded — a continuation with no start
+   *  (`no_start`), or one whose header disagrees with the unit in progress (`mismatch`). These
+   *  were dropped silently before (charmingly#288, §D). */
+  constructor(onDrop) {
+    this.onDrop = onDrop;
     __publicField(this, "partial", /* @__PURE__ */ new Map());
   }
   push(frame) {
@@ -1793,10 +1874,12 @@ var MediaUnitAssembler = class {
       };
       this.partial.set(frame.channelId, unit);
     } else if (!unit) {
+      this.onDrop?.("no_start");
       return null;
     }
     if (unit.frameType !== frame.frameType || unit.channelId !== frame.channelId || unit.ptsUs !== frame.ptsUs) {
       this.partial.delete(frame.channelId);
+      this.onDrop?.("mismatch");
       return null;
     }
     const chunk = frame.payload.slice();
@@ -2126,7 +2209,9 @@ var V2Driver = class {
     __publicField(this, "player", null);
     __publicField(this, "clock", null);
     __publicField(this, "scheduler", null);
-    __publicField(this, "unitAssembler", new MediaUnitAssembler());
+    __publicField(this, "unitAssembler", new MediaUnitAssembler(
+      (reason) => this.diag({ type: "frame_dropped", reason })
+    ));
     __publicField(this, "pipeline", null);
     __publicField(this, "encoder", null);
     __publicField(this, "accepted", null);
@@ -2136,6 +2221,9 @@ var V2Driver = class {
     __publicField(this, "finished", false);
     __publicField(this, "timedUtterances", false);
     __publicField(this, "framedMediaUnits", false);
+    __publicField(this, "connectStartedAt", 0);
+    __publicField(this, "firstAudioReported", false);
+    __publicField(this, "log");
     __publicField(this, "openTimer", null);
     __publicField(this, "handshakeTimer", null);
     __publicField(this, "mediaTimer", null);
@@ -2147,10 +2235,31 @@ var V2Driver = class {
     __publicField(this, "responseLanguage");
     this.langs = opts.langs;
     this.responseLanguage = opts.responseLanguage;
+    this.log = opts.logger ?? consoleLogger(opts.dev);
+  }
+  /** Emit one diagnostic, stamped with the wall clock and the ids the host passed. Never throws
+   *  into the driver: a host `onDiagnostic` that blows up must not take the session down. */
+  diag(d) {
+    const sink = this.opts.handlers.onDiagnostic;
+    if (!sink) return;
+    try {
+      sink({
+        at: Date.now(),
+        ...this.opts.sessionId !== void 0 ? { sessionId: this.opts.sessionId } : {},
+        ...this.opts.traceId !== void 0 ? { traceId: this.opts.traceId } : {},
+        ...d
+      });
+    } catch {
+    }
+  }
+  /** ms since the socket was created — the basis for every `connect_phase`. */
+  phase(phase) {
+    this.diag({ type: "connect_phase", phase, ms: Date.now() - this.connectStartedAt });
   }
   connect() {
     const { opts } = this;
     const create = opts.createSocket ?? ((url, protocols) => new WebSocket(url, protocols));
+    this.connectStartedAt = Date.now();
     let socket;
     try {
       socket = create(opts.sessionWsUrl, [SUBPROTOCOL]);
@@ -2172,6 +2281,7 @@ var V2Driver = class {
       if (this.openTimer) clearTimeout(this.openTimer);
       this.openTimer = null;
       if (this.finished) return;
+      this.phase("socket_open");
       if (socket.protocol !== void 0 && socket.protocol !== SUBPROTOCOL) {
         this.fail(new Error(`server did not echo subprotocol ${SUBPROTOCOL}`), "protocol-mismatch");
         return;
@@ -2205,9 +2315,10 @@ var V2Driver = class {
     conn.onMessage((msg) => this.onServerMessage(msg));
     conn.onFrame((frame) => this.onMediaFrame(frame));
     conn.onViolation((v) => {
-      if (opts.dev) console.warn("[v2] protocol violation", v.kind, v.detail);
+      this.log("debug", "[v2] protocol violation", { kind: v.kind, detail: v.detail });
+      this.diag({ type: "protocol_violation", violation: v.kind, state: v.state });
     });
-    conn.onClose((ev) => this.onSocketClose(ev.code));
+    conn.onClose((ev) => this.onSocketClose(ev.code, ev.reason));
   }
   onServerMessage(msg) {
     if (this.finished) return;
@@ -2276,23 +2387,31 @@ var V2Driver = class {
       case "error": {
         const error = new Error(msg.message ?? msg.code);
         const waiter = msg.request_id ? this.textWaiters.get(msg.request_id) : void 0;
+        this.diag({ type: "server_error", code: msg.code, inFlightRequest: Boolean(waiter) });
         if (waiter && msg.request_id) {
           clearTimeout(waiter.timer);
           this.textWaiters.delete(msg.request_id);
           waiter.reject(error);
         } else {
-          this.opts.handlers.onError(toAvatarError(error, "server", { terminal: false }), false);
+          this.opts.handlers.onError(
+            toAvatarError(error, "server", { terminal: false, serverCode: msg.code }),
+            false
+          );
         }
         break;
       }
       case "session_end":
         this.endReason = END_REASONS.includes(msg.reason) ? msg.reason : "generic";
+        this.diag({ type: "session_end", reason: msg.reason, mapped: this.endReason });
         break;
       case "ping":
         this.conn?.send({ type: "pong", t: msg.t });
         break;
       case "pong":
+        this.diag({ type: "rtt", ms: Math.max(0, Date.now() - msg.t) });
+        break;
       case "go_away":
+        this.diag({ type: "go_away", deadlineS: msg.deadline_s ?? null });
         break;
     }
   }
@@ -2302,6 +2421,7 @@ var V2Driver = class {
       clearTimeout(this.handshakeTimer);
       this.handshakeTimer = null;
     }
+    this.phase("accept");
     this.accepted = accept;
     const acceptedFeatures = accept.features ?? [];
     this.timedUtterances = acceptedFeatures.includes(Feature.UTTERANCE_TIMING_V1);
@@ -2311,6 +2431,14 @@ var V2Driver = class {
     const videoCh = channels.find((c) => c.kind === "video");
     this.audioCh = channels.find((c) => c.kind === "audio" && c.dir === "down") ?? null;
     this.micCh = channels.find((c) => c.kind === "audio" && c.dir === "up") ?? null;
+    this.diag({
+      type: "negotiated",
+      micCodec: this.micCh?.codec ?? null,
+      videoCodec: videoCh ? videoCh.video_codec ?? "h264" : null,
+      hasVideo: Boolean(videoCh),
+      posterMode: !videoCh,
+      features: acceptedFeatures
+    });
     if (this.audioCh) {
       this.player = new PcmPlayer(() => handlers.onAudioBlocked());
       this.clock = this.player;
@@ -2319,7 +2447,7 @@ var V2Driver = class {
       this.conn?.send({ type: "ping", t: Date.now() });
     }, KEEPALIVE_PING_MS);
     if (videoCh) {
-      const mse = new MsePlayer(this.opts.videoEl, this.opts.dev);
+      const mse = new MsePlayer(this.opts.videoEl, this.log);
       this.mse = mse;
       this.mediaTimer = setTimeout(() => {
         this.fail(
@@ -2332,10 +2460,12 @@ var V2Driver = class {
         onFirstFrame: () => {
           if (this.mediaTimer) clearTimeout(this.mediaTimer);
           this.mediaTimer = null;
+          this.phase("first_frame");
           handlers.onFirstFrame();
         },
         onError: (err) => handlers.onError(toAvatarError(err, "media", { terminal: false }), false),
-        onAudioBlocked: () => handlers.onAudioBlocked()
+        onAudioBlocked: () => handlers.onAudioBlocked(),
+        onDiagnostic: (d) => this.diag(d)
       });
       mse.setMime(videoCh.mime);
       if (videoCh.fps !== void 0 && videoCh.seg_frames !== void 0) {
@@ -2344,6 +2474,7 @@ var V2Driver = class {
       this.clock = mse;
     } else {
       if (accept.poster?.url) this.opts.videoEl.poster = accept.poster.url;
+      this.phase("first_frame");
       handlers.onFirstFrame();
     }
     if (this.timedUtterances && this.clock) {
@@ -2385,7 +2516,7 @@ var V2Driver = class {
       let encoder;
       try {
         encoder = new OpusMicEncoder({
-          dev: this.opts.dev,
+          logger: this.log,
           onPacket: (packet, info) => this.sendMicFrame(micCh.id, packet, info),
           // A dead encoder is a dead mic: terminal, like a worklet that failed to load.
           onError: (err) => this.fail(err, "mic-failed")
@@ -2402,11 +2533,14 @@ var V2Driver = class {
     pipeline.start({
       workletUrl: this.opts.workletUrl,
       stream: this.opts.permittedStream,
-      dev: this.opts.dev,
+      logger: this.log,
       getVideoMediaTimeMs: this.mse ? (t) => this.mse?.mediaTimeAt(t) ?? null : void 0,
-      onFrame
+      onFrame,
+      onDiagnostic: (d) => this.diag(d)
     }).then(() => {
-      if (!this.finished) this.opts.handlers.onMicReady();
+      if (this.finished) return;
+      this.phase("mic_ready");
+      this.opts.handlers.onMicReady();
     }).catch((err) => {
       this.fail(err, classifyMicError(err));
     });
@@ -2440,6 +2574,10 @@ var V2Driver = class {
   onMediaUnit(unit) {
     if (this.audioCh && unit.channelId === this.audioCh.id) {
       if (unit.payload.byteLength === 0 || unit.payload.byteLength % 2 !== 0) return;
+      if (!this.firstAudioReported) {
+        this.firstAudioReported = true;
+        this.phase("first_audio");
+      }
       const pcm = new Int16Array(
         unit.payload.buffer.slice(
           unit.payload.byteOffset,
@@ -2453,7 +2591,7 @@ var V2Driver = class {
       this.mse.append(unit.payload, unit.ptsUs, unit.frameType === FrameType.MEDIA_INIT);
     }
   }
-  onSocketClose(code) {
+  onSocketClose(code, reason = "") {
     if (this.finished) {
       this.teardown();
       return;
@@ -2462,6 +2600,7 @@ var V2Driver = class {
     const { handlers } = this.opts;
     const accepted = this.accepted !== null;
     const endReason = this.endReason;
+    this.diag({ type: "socket_closed", code, afterAccept: accepted, reasonLength: reason.length });
     this.teardown();
     if (endReason) {
       handlers.onEnded(endReason);
@@ -2472,7 +2611,8 @@ var V2Driver = class {
       handlers.onError(
         new AvatarError(
           known?.kind ?? "connect",
-          known?.message ?? `session socket closed before accept (${code})`
+          known?.message ?? `session socket closed before accept (${code})`,
+          { closeCode: code }
         ),
         true
       );
@@ -2494,6 +2634,7 @@ var V2Driver = class {
     if (value.length > MAX_TEXT_CHARS) throw new Error("text is too long");
     const conn = this.conn;
     if (this.finished || !conn || conn.protocolState !== "active") {
+      this.diag({ type: "text_failed", reason: "transport" });
       throw new Error("text transport is unavailable");
     }
     this.textSequence += 1;
@@ -2501,6 +2642,7 @@ var V2Driver = class {
     const result = new Promise((resolve3, reject) => {
       const timer = setTimeout(() => {
         this.textWaiters.delete(id);
+        this.diag({ type: "text_failed", reason: "timeout" });
         reject(new Error("text response timed out"));
       }, TEXT_TIMEOUT_MS);
       this.textWaiters.set(id, { resolve: resolve3, reject, timer });
@@ -2612,8 +2754,12 @@ var AvatarSession = class {
     __publicField(this, "_responseLanguage");
     __publicField(this, "_userMuted", false);
     __publicField(this, "_micSuppressed", false);
+    __publicField(this, "_negotiated", null);
+    __publicField(this, "_stats", emptyStats());
     __publicField(this, "listeners", /* @__PURE__ */ new Map());
-    this.sm = new StateMachine(opts.dev ?? false);
+    __publicField(this, "logger");
+    this.logger = opts.logger ?? consoleLogger(opts.dev ?? false);
+    this.sm = new StateMachine(this.logger);
     this.sm.onChange((next, prev) => {
       this.emit("state", next, prev);
     });
@@ -2693,6 +2839,9 @@ var AvatarSession = class {
           break;
         case "muteChange":
           break;
+        case "diagnostic":
+          cb?.onDiagnostic?.(...args);
+          break;
         case "close":
           cb?.onClose?.(...args);
           break;
@@ -2701,7 +2850,7 @@ var AvatarSession = class {
           break;
       }
     } catch (err) {
-      if (this.opts.dev) console.warn(`[avatar] callbacks.${event} threw`, err);
+      this.logger("debug", `[avatar] callbacks.${event} threw`, { err });
     }
     const set = this.listeners.get(event);
     if (!set) return;
@@ -2709,7 +2858,7 @@ var AvatarSession = class {
       try {
         handler(...args);
       } catch (err) {
-        if (this.opts.dev) console.warn(`[avatar] on('${event}') handler threw`, err);
+        this.logger("debug", `[avatar] on('${event}') handler threw`, { err });
       }
     }
   }
@@ -2727,6 +2876,80 @@ var AvatarSession = class {
    *  negotiate). `undefined` before the accept, and in poster mode, where there is no video. */
   get videoCodec() {
     return this._videoCodec;
+  }
+  /** What the box negotiated for this session — the codecs in force, whether video plays. `null`
+   *  before the accept. Diagnostics: the fixed shape a session landed in, beside the running
+   *  counters in {@link stats}. */
+  get negotiated() {
+    return this._negotiated;
+  }
+  /**
+   * A snapshot of everything the diagnostic stream has said about this session so far: the connect
+   * timeline, the close code, the last keepalive RTT, what was negotiated, and running counters.
+   *
+   * Safe to call after the session has ended — it is accumulated on the session as diagnostics
+   * arrive, not read from the driver, which `teardown()` has already nulled by then.
+   */
+  stats() {
+    return {
+      connect: { ...this._stats.connect },
+      closeCode: this._stats.closeCode,
+      rttMs: this._stats.rttMs,
+      negotiated: this._negotiated,
+      counters: { ...this._stats.counters }
+    };
+  }
+  /** Fold one diagnostic into the accumulated stats and capture the negotiated shape. Runs
+   *  unguarded by `done` so the terminal `socket_closed` is counted. */
+  ingestDiagnostic(d) {
+    const c = this._stats.counters;
+    switch (d.type) {
+      case "connect_phase":
+        this._stats.connect[d.phase] = d.ms;
+        break;
+      case "socket_closed":
+        this._stats.closeCode = d.code;
+        break;
+      case "rtt":
+        this._stats.rttMs = d.ms;
+        break;
+      case "negotiated":
+        this._negotiated = {
+          micCodec: d.micCodec,
+          videoCodec: d.videoCodec,
+          hasVideo: d.hasVideo,
+          posterMode: d.posterMode,
+          features: d.features
+        };
+        break;
+      case "protocol_violation":
+        c.protocolViolations += 1;
+        break;
+      case "server_error":
+        c.serverErrors += 1;
+        break;
+      case "media_error":
+        c.mediaErrors += 1;
+        break;
+      case "buffer_evicted":
+        c.bufferEvictions += 1;
+        break;
+      case "playback_rejected":
+        c.playbackRejections += 1;
+        break;
+      case "stall":
+        c.stalls += 1;
+        break;
+      case "mic_track":
+        c.micTrackEvents += 1;
+        break;
+      case "frame_dropped":
+        c.framesDropped += 1;
+        break;
+      case "text_failed":
+        c.textFailures += 1;
+        break;
+    }
   }
   // Returns the live stream so callers can pass it back via opts.permittedStream,
   // avoiding a second getUserMedia call (and second permission prompt on Firefox).
@@ -2846,6 +3069,9 @@ var AvatarSession = class {
       micCodecs,
       videoCodecs,
       dev,
+      logger: this.logger,
+      sessionId: this.opts.sessionId,
+      traceId: this.opts.traceId,
       createSocket: this.opts.createSocket,
       handlers: {
         onAccept: (info) => {
@@ -2892,7 +3118,14 @@ var AvatarSession = class {
           if (!this.done) this.emit("mediaDiscarded", cutoffPtsUs);
         },
         onAudioFrameSent: (info) => {
+          this._stats.counters.micFramesSent += 1;
           if (!this.done) this.emit("audioFrameSent", info);
+        },
+        // Unguarded by `done`: socket_closed is emitted by the driver in the same tick as onEnded,
+        // which sets done — a guard here would drop exactly the close code this exists to carry.
+        onDiagnostic: (d) => {
+          this.ingestDiagnostic(d);
+          this.emit("diagnostic", d);
         },
         onAudioBlocked: () => {
           if (!this.done) this.emit("audioBlocked");
@@ -2904,7 +3137,7 @@ var AvatarSession = class {
           if (terminal) {
             this.internalFail(err);
           } else {
-            if (dev) console.warn("[v2] session error", err);
+            this.logger("debug", "[v2] session error", { err });
             if (!this.done) this.emit("error", err);
           }
         }
