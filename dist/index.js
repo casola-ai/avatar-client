@@ -1017,7 +1017,8 @@ function emptyStats() {
       micTrackEvents: 0,
       framesDropped: 0,
       textFailures: 0,
-      micFramesSent: 0
+      micFramesSent: 0,
+      micBackingChanges: 0
     }
   };
 }
@@ -1070,6 +1071,8 @@ var MIC_SAMPLE_RATE = 16e3;
 var TARGET_RATE = MIC_SAMPLE_RATE;
 var MIC_FRAME_SAMPLES = 1600;
 var VIDEO_MEDIA_TIME_UNKNOWN = 4294967295;
+var SILENT_FRAME_MS = 100;
+var SILENT_CATCHUP_MAX = 10;
 function clamp16(x) {
   const v = Math.round(x * 32767);
   return v > 32767 ? 32767 : v < -32768 ? -32768 : v;
@@ -1082,6 +1085,30 @@ function computeFrameTimestamp(frameStartContextTime, inputLatencySeconds, audio
     videoMediaTimeMs: rawVideoMediaTimeMs === null ? VIDEO_MEDIA_TIME_UNKNOWN : Math.round(rawVideoMediaTimeMs),
     captureEpochMs: timeOrigin + performanceTimeMs
   };
+}
+var CAPTURE_CONSTRAINTS = {
+  audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  video: false
+};
+function isThenable(value) {
+  return typeof value?.then === "function";
+}
+function stopTracks(stream) {
+  stream?.getTracks().forEach((t) => {
+    t.stop();
+  });
+}
+function backingReasonFor(err) {
+  switch (classifyMicError(err)) {
+    case "mic-permission":
+      return "permission";
+    case "mic-unavailable":
+      return "unavailable";
+    case "unsupported-browser":
+      return "unsupported";
+    default:
+      return "failed";
+  }
 }
 var MicPipeline = class {
   constructor() {
@@ -1104,6 +1131,15 @@ var MicPipeline = class {
     __publicField(this, "micSeq", 0);
     __publicField(this, "teardownListeners", []);
     __publicField(this, "log", consoleLogger(false));
+    __publicField(this, "_backed", false);
+    __publicField(this, "attaching", null);
+    __publicField(this, "silentTimer", null);
+    __publicField(this, "silentT0", 0);
+    __publicField(this, "silentEmitted", 0);
+  }
+  /** Whether a capture stream backs the channel right now (else the frames are zeros). */
+  get backed() {
+    return this._backed;
   }
   // Returns the live MediaStream so the caller can pass it to start(), avoiding
   // a second getUserMedia call (which causes a second permission prompt on Firefox).
@@ -1113,24 +1149,93 @@ var MicPipeline = class {
       err.name = "NotSupportedError";
       throw err;
     }
-    return navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      video: false
-    });
+    return navigator.mediaDevices.getUserMedia(CAPTURE_CONSTRAINTS);
   }
+  /**
+   * Bring the channel up. Resolves once frames are flowing — which is immediately: the unbacked
+   * cadence starts first, and the stream (given, promised, or requested from `getUserMedia`)
+   * attaches on top of it. A capture that fails to attach is reported through `onBacking`, never
+   * thrown from here; `attach()` is the call that rejects, for a host that asked explicitly.
+   */
   async start(opts) {
     this.opts = opts;
     const dev = opts.dev ?? false;
     this.log = opts.logger ?? consoleLogger(dev);
-    if (opts.stream) {
-      this.stream = opts.stream;
-    } else {
-      this.stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-        video: false
-      });
+    this.startSilent();
+    const source = opts.stream;
+    if (isThenable(source)) {
+      this.setBacking(false, "pending");
+      source.then(
+        (stream) => {
+          if (this.closed) {
+            stopTracks(stream);
+            return;
+          }
+          if (stream) {
+            this.attach(stream).catch(() => {
+            });
+          } else {
+            this.setBacking(false, "declined");
+          }
+        },
+        () => {
+          if (!this.closed) this.setBacking(false, "failed");
+        }
+      );
+      return;
     }
-    const track = this.stream.getAudioTracks()[0];
+    try {
+      await this.attach(source);
+    } catch {
+    }
+  }
+  /**
+   * Back the channel with a capture stream. With no `stream`, asks `getUserMedia` (call it from a
+   * user gesture — iOS refuses otherwise). A stream that is already attached is replaced.
+   * Rejects with the raw error when the capture cannot be brought up; the channel then stays
+   * unbacked and keeps its cadence.
+   */
+  async attach(stream) {
+    if (this.closed) throw new Error("mic pipeline stopped");
+    if (this.attaching) await this.attaching.catch(() => {
+    });
+    const run = this.doAttach(stream);
+    this.attaching = run;
+    try {
+      await run;
+    } finally {
+      if (this.attaching === run) this.attaching = null;
+    }
+  }
+  async doAttach(given) {
+    const opts = this.opts;
+    if (!opts) throw new Error("mic pipeline not started");
+    let stream = given ?? null;
+    try {
+      if (!stream) {
+        if (!navigator.mediaDevices?.getUserMedia) {
+          const err = new Error("mediaDevices unavailable");
+          err.name = "NotSupportedError";
+          throw err;
+        }
+        stream = await navigator.mediaDevices.getUserMedia(CAPTURE_CONSTRAINTS);
+      }
+      if (this.closed) {
+        stopTracks(stream);
+        return;
+      }
+      if (this._backed) this.detachCapture();
+      await this.bringUp(stream, opts);
+    } catch (err) {
+      stopTracks(stream);
+      if (!this.closed) this.setBacking(false, backingReasonFor(err));
+      throw err;
+    }
+  }
+  /** The capture graph: AudioContext at the track's rate → worklet → silent sink. */
+  async bringUp(stream, opts) {
+    this.stream = stream;
+    const track = stream.getAudioTracks()[0];
     const settings = track?.getSettings();
     const nativeRate = settings?.sampleRate;
     this.inputLatencySeconds = settings?.latency ?? 0;
@@ -1155,7 +1260,10 @@ var MicPipeline = class {
     }
     if (track) {
       for (const event of ["ended", "mute", "unmute"]) {
-        const listener = () => opts.onDiagnostic?.({ type: "mic_track", event });
+        const listener = () => {
+          opts.onDiagnostic?.({ type: "mic_track", event });
+          if (event === "ended") this.onTrackEnded();
+        };
         track.addEventListener(event, listener);
         this.teardownListeners.push(() => track.removeEventListener(event, listener));
       }
@@ -1170,7 +1278,8 @@ var MicPipeline = class {
     }
     this.inRate = ctx.sampleRate;
     await ctx.audioWorklet.addModule(opts.workletUrl);
-    const source = ctx.createMediaStreamSource(this.stream);
+    if (this.closed || this.stream !== stream) return;
+    const source = ctx.createMediaStreamSource(stream);
     const node = new AudioWorkletNode(ctx, "mic-fwd");
     this.node = node;
     node.port.onmessage = (e) => {
@@ -1181,6 +1290,80 @@ var MicPipeline = class {
     sink.gain.value = 0;
     this.sink = sink;
     source.connect(node).connect(sink).connect(ctx.destination);
+    this._backed = true;
+    this.setBacking(true, "attached");
+  }
+  onTrackEnded() {
+    if (this.closed || !this._backed) return;
+    this.detachCapture();
+    this.setBacking(false, "track_ended");
+    this.startSilent();
+  }
+  /** Tear the capture graph down and forget it. The cadence and `micSeq` are untouched: the
+   *  channel goes on, the frames just stop being the microphone. */
+  detachCapture() {
+    for (const remove of this.teardownListeners) remove();
+    this.teardownListeners = [];
+    try {
+      this.node?.disconnect();
+      this.sink?.disconnect();
+    } catch {
+    }
+    this.node = null;
+    this.sink = null;
+    stopTracks(this.stream);
+    this.stream = null;
+    void this.ctx?.close().catch(() => {
+    });
+    this.ctx = null;
+    this.resTail = new Float32Array(0);
+    this.resPos = 0;
+    this.frameLen = 0;
+    this.audioClockMap = new ClockMap();
+    this._backed = false;
+  }
+  setBacking(backed, reason) {
+    this.log("debug", "[mic] backing", { backed, reason });
+    this.opts?.onBacking?.(backed, reason);
+  }
+  // ---------------------------------------------------------------- the unbacked cadence
+  startSilent() {
+    if (this.silentTimer || this.closed) return;
+    this.silentT0 = this.now();
+    this.silentEmitted = 0;
+    this.silentTimer = setInterval(() => this.silentTick(), SILENT_FRAME_MS);
+  }
+  stopSilent() {
+    if (this.silentTimer) clearInterval(this.silentTimer);
+    this.silentTimer = null;
+  }
+  now() {
+    return this.opts?.now?.() ?? performance.now();
+  }
+  silentTick() {
+    if (this.closed || !this.opts) return;
+    const due = Math.floor((this.now() - this.silentT0) / SILENT_FRAME_MS);
+    let owed = due - this.silentEmitted;
+    if (owed > SILENT_CATCHUP_MAX) {
+      this.silentEmitted = due - SILENT_CATCHUP_MAX;
+      owed = SILENT_CATCHUP_MAX;
+    }
+    for (let i = 0; i < owed; i++) {
+      this.silentEmitted += 1;
+      this.emitSilentFrame();
+    }
+  }
+  emitSilentFrame() {
+    const opts = this.opts;
+    if (!opts) return;
+    const performanceTimeMs = performance.now();
+    const rawVideoMediaTimeMs = opts.getVideoMediaTimeMs?.(performanceTimeMs) ?? null;
+    this.micSeq += 1;
+    opts.onFrame(new Int16Array(MIC_FRAME_SAMPLES), {
+      micSeq: this.micSeq,
+      videoMediaTimeMs: rawVideoMediaTimeMs === null ? VIDEO_MEDIA_TIME_UNKNOWN : Math.round(rawVideoMediaTimeMs),
+      captureEpochMs: performance.timeOrigin + performanceTimeMs
+    });
   }
   onPcm(chunk, contextTime) {
     if (this.closed) return;
@@ -1229,6 +1412,7 @@ var MicPipeline = class {
         performance.timeOrigin
       );
       if (result) {
+        this.stopSilent();
         this.micSeq += 1;
         const pcm = this.muted ? new Int16Array(MIC_FRAME_SAMPLES) : this.frame.slice();
         opts.onFrame(pcm, { micSeq: this.micSeq, ...result });
@@ -1239,22 +1423,12 @@ var MicPipeline = class {
   setMuted(m) {
     this.muted = m;
   }
+  /** Idempotent. Ends the cadence and the capture; a stream still promised is stopped when it
+   *  arrives, so a late permission grant never leaves a live microphone behind. */
   stop() {
     this.closed = true;
-    for (const remove of this.teardownListeners) remove();
-    this.teardownListeners = [];
-    try {
-      this.node?.disconnect();
-      this.sink?.disconnect();
-    } catch {
-    }
-    this.stream?.getTracks().forEach((t) => {
-      t.stop();
-    });
-    this.stream = null;
-    void this.ctx?.close().catch(() => {
-    });
-    this.ctx = null;
+    this.stopSilent();
+    this.detachCapture();
   }
 };
 
@@ -2214,6 +2388,8 @@ var V2Driver = class {
     ));
     __publicField(this, "pipeline", null);
     __publicField(this, "encoder", null);
+    __publicField(this, "_micBacked", false);
+    __publicField(this, "micReadyReported", false);
     __publicField(this, "accepted", null);
     __publicField(this, "audioCh", null);
     __publicField(this, "micCh", null);
@@ -2511,22 +2687,14 @@ var V2Driver = class {
     });
   }
   startMic(micCh) {
-    let onFrame = (pcm, info) => this.sendMicFrame(micCh.id, new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength), info);
     if (micCh.codec === "opus") {
-      let encoder;
       try {
-        encoder = new OpusMicEncoder({
-          logger: this.log,
-          onPacket: (packet, info) => this.sendMicFrame(micCh.id, packet, info),
-          // A dead encoder is a dead mic: terminal, like a worklet that failed to load.
-          onError: (err) => this.fail(err, "mic-failed")
-        });
+        this.createEncoder(micCh);
       } catch (err) {
-        this.fail(err, "mic-failed");
-        return;
+        this.log("warn", "[mic] opus encoder unavailable; channel stays unbacked", { err });
+        this.diag({ type: "mic_backing", backed: false, reason: "encoder_failed" });
+        this.opts.handlers.onMicBacking(false, "encoder_failed");
       }
-      this.encoder = encoder;
-      onFrame = (pcm, info) => encoder.encode(pcm, info);
     }
     const pipeline = new MicPipeline();
     this.pipeline = pipeline;
@@ -2535,15 +2703,70 @@ var V2Driver = class {
       stream: this.opts.permittedStream,
       logger: this.log,
       getVideoMediaTimeMs: this.mse ? (t) => this.mse?.mediaTimeAt(t) ?? null : void 0,
-      onFrame,
-      onDiagnostic: (d) => this.diag(d)
-    }).then(() => {
-      if (this.finished) return;
-      this.phase("mic_ready");
-      this.opts.handlers.onMicReady();
+      onFrame: (pcm, info) => this.onMicPcm(micCh, pcm, info),
+      onDiagnostic: (d) => this.diag(d),
+      onBacking: (backed, reason) => this.onMicBacking(backed, reason)
     }).catch((err) => {
-      this.fail(err, classifyMicError(err));
+      this.log("warn", "[mic] pipeline failed to start", { err });
     });
+  }
+  /** One pipeline frame — the microphone or zeros — on its way to the wire. */
+  onMicPcm(micCh, pcm, info) {
+    if (micCh.codec === "opus") {
+      this.encoder?.encode(pcm, info);
+      return;
+    }
+    this.sendMicFrame(micCh.id, new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength), info);
+  }
+  createEncoder(micCh) {
+    this.encoder = new OpusMicEncoder({
+      logger: this.log,
+      onPacket: (packet, info) => this.sendMicFrame(micCh.id, packet, info),
+      // A dead encoder used to end the session. Now it unbacks the channel: the pipeline keeps
+      // running, the wire goes quiet, and enableMic() can rebuild the encoder.
+      onError: (err) => {
+        this.log("warn", "[mic] opus encoder failed", { err });
+        this.encoder?.stop();
+        this.encoder = null;
+        this.onMicBacking(false, "encoder_failed");
+      }
+    });
+  }
+  onMicBacking(backed, reason) {
+    if (this.finished) return;
+    const effective = backed && (this.micCh?.codec !== "opus" || this.encoder !== null);
+    const effectiveReason = backed && !effective ? "encoder_failed" : reason;
+    this._micBacked = effective;
+    this.diag({ type: "mic_backing", backed: effective, reason: effectiveReason });
+    if (effective) {
+      if (!this.micReadyReported) {
+        this.micReadyReported = true;
+        this.phase("mic_ready");
+      }
+      this.opts.handlers.onMicReady();
+    }
+    this.opts.handlers.onMicBacking(effective, effectiveReason);
+  }
+  /** Whether the frames on the wire are the microphone right now (else zeros, or nothing). */
+  get micBacked() {
+    return this._micBacked;
+  }
+  /**
+   * Back the mic channel with a stream: the one given, or one asked of getUserMedia (call from a
+   * user gesture). Rebuilds a dead Opus encoder first. Rejects when the session has no mic channel
+   * (receive-only, or before the accept) or the capture cannot come up; the channel then stays as
+   * it was.
+   */
+  async enableMic(stream) {
+    const pipeline = this.pipeline;
+    const micCh = this.micCh;
+    if (this.finished || !pipeline || !micCh) throw new Error("mic channel unavailable");
+    if (micCh.codec === "opus" && !this.encoder) this.createEncoder(micCh);
+    if (pipeline.backed && !stream) {
+      this.onMicBacking(true, "attached");
+      return;
+    }
+    await pipeline.attach(stream);
   }
   sendMicFrame(channelId, payload, info) {
     const conn = this.conn;
@@ -2750,6 +2973,7 @@ var AvatarSession = class {
     __publicField(this, "_personaKey");
     __publicField(this, "_videoCodec");
     __publicField(this, "permittedStream");
+    __publicField(this, "_micBacked", false);
     __publicField(this, "langs");
     __publicField(this, "_responseLanguage");
     __publicField(this, "_userMuted", false);
@@ -2838,6 +3062,7 @@ var AvatarSession = class {
           cb?.onAudioBlocked?.();
           break;
         case "muteChange":
+        case "micBacking":
           break;
         case "diagnostic":
           cb?.onDiagnostic?.(...args);
@@ -2942,6 +3167,9 @@ var AvatarSession = class {
         break;
       case "mic_track":
         c.micTrackEvents += 1;
+        break;
+      case "mic_backing":
+        c.micBackingChanges += 1;
         break;
       case "frame_dropped":
         c.framesDropped += 1;
@@ -3093,6 +3321,10 @@ var AvatarSession = class {
           if (this.micMuted) this.driver?.setMuted(true);
           this.emit("micReady");
         },
+        onMicBacking: (backed, reason) => {
+          this._micBacked = backed;
+          if (!this.done) this.emit("micBacking", { backed, reason });
+        },
         onPartial: (text) => {
           if (!this.done) this.emit("partial", text);
         },
@@ -3151,6 +3383,25 @@ var AvatarSession = class {
     this.teardown();
     this.sm.set("idle");
     this.emit("close", "generic");
+  }
+  /** Whether the frames on the mic channel are the microphone right now. `false` before the
+   *  accept, in a receive-only session, while a promised stream is pending, after a refusal, and
+   *  after the track ended — the wire then carries zeroed frames, or nothing at all. */
+  get micBacked() {
+    return this._micBacked;
+  }
+  /**
+   * Back the mic channel with a microphone, now: the `stream` given, or one asked of getUserMedia
+   * (call this from a click or tap — iOS refuses a prompt outside a gesture). The wire switches
+   * from zeroed frames to the microphone without a reconnect; `micReady` and `micBacking` fire.
+   * Rejects with the raw getUserMedia/worklet error when the capture cannot come up, and when
+   * the session has no mic channel (receive-only, not yet accepted, or ended). The channel is
+   * unchanged either way.
+   */
+  enableMic(stream) {
+    const driver = this.driver;
+    if (this.done || !driver) return Promise.reject(new Error("session is not running"));
+    return driver.enableMic(stream);
   }
   /** The user's choice — what a mute button sets. Survives `suppressMic`. */
   setMuted(muted) {
@@ -3269,10 +3520,23 @@ var AvatarSession = class {
     this.opts.connect.close();
     this.driver?.stop();
     this.driver = null;
-    this.permittedStream?.getTracks().forEach((t) => {
-      t.stop();
-    });
+    const retained = this.permittedStream;
     this.permittedStream = null;
+    if (retained && "then" in retained) {
+      retained.then(
+        (stream) => {
+          stream?.getTracks().forEach((t) => {
+            t.stop();
+          });
+        },
+        () => {
+        }
+      );
+    } else {
+      retained?.getTracks().forEach((t) => {
+        t.stop();
+      });
+    }
   }
 };
 

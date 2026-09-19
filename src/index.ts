@@ -36,6 +36,8 @@ export type {
   ConnectStrategy,
   EdgeTarget,
   EndReason,
+  MicBackingReason,
+  MicBackingState,
   MicFrameSentInfo,
   MicMuteState,
   PreflightResult,

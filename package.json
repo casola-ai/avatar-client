@@ -1,6 +1,6 @@
 {
   "name": "@casola/avatar-client",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Browser SDK for Casola live avatar sessions over avatar protocol v2 (one multiplexed WebSocket).",
   "license": "MIT",
   "type": "module",

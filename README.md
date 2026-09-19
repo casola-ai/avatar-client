@@ -79,6 +79,8 @@ new AvatarSession(opts: AvatarSessionOpts)
 | `.leave()` | End the session and fire `onClose('generic')`. |
 | `.destroy()` | Tear down without callbacks (use in component cleanup). |
 | `.setMuted(muted)` | Mute or unmute the mic mid-session (muted frames are sent as silence, keeping timing continuous). |
+| `.enableMic(stream?)` | Back the mic channel with a microphone now — the `stream` given, or one asked of getUserMedia (call from a tap or click). The wire switches from zeroed frames to the microphone without a reconnect; rejects with the raw error when the capture cannot come up, and when the session has no mic channel. |
+| `.micBacked` | Whether the frames on the mic channel are a microphone right now. `false` while a promised `permittedStream` is pending, after a refusal, after the track ended, in a receive-only session — the channel then carries zeroed frames. |
 | `.setLangs(langs)` | Re-pin the ASR recognition language(s) mid-session; `[]` = auto-detect. |
 | `.setResponseLanguage(lang)` | Preferred reply language (BCP-47; `''` returns the choice to the model). |
 | `.setRuntimeInstruction(text)` | Replace hidden system-level guidance for subsequent turns without generating a reply or transcript entry; an empty string clears it. |
@@ -231,8 +233,30 @@ with `ui.setLive(true)` / `ui.setLive(null)`.
 
 Subscribe after construction; the returned function unsubscribes. The constructor `callbacks` still
 work and fire first. Events: `state`, `partial`, `turn`, `firstFrame`, `micReady`, `speechStart`,
-`speechEnd`, `audioFrameSent`, `audioBlocked`, `muteChange`, `diagnostic`, `close`, `error`. A
-throwing handler is caught, so one bad subscriber cannot break the session.
+`speechEnd`, `audioFrameSent`, `audioBlocked`, `muteChange`, `micBacking`, `diagnostic`, `close`,
+`error`. A throwing handler is caught, so one bad subscriber cannot break the session.
+
+### The microphone can arrive late
+
+The mic channel is declared in the hello and stays up for the whole session; what changes is
+whether a microphone is behind it. Unbacked, the session sends the same zeroed 100 ms frames mute
+sends, so the box hears silence rather than a stalled clock, and `micBacked` is `false`.
+
+- Pass `permittedStream` as a **Promise** when the permission prompt is still open at `start()`
+  (a visitor who has not answered the browser's sheet yet). The session runs unbacked and attaches
+  the stream when it resolves; resolve `null` to say "no stream, and do not prompt again".
+- A refusal, a worklet failure, a track that ends (device unplugged, OS revoked, iOS backgrounded)
+  or an Opus encoder that dies no longer end the session. The channel drops to zeros and
+  `micBacking` says why (`permission`, `unavailable`, `unsupported`, `failed`, `track_ended`,
+  `encoder_failed`).
+- `enableMic(stream?)` backs the channel later — from a "Turn on microphone" button, say. It
+  rebuilds a dead encoder on the way. `micReady` fires on every attach.
+
+```typescript
+const session = new AvatarSession({ permittedStream: stillWaitingForTheSheet, videoEl, connect });
+session.on('micBacking', ({ backed, reason }) => setMicIndicator(backed, reason));
+retryButton.onclick = () => session.enableMic().catch(showMicError);
+```
 
 ### `AvatarSession.preflight(options?)`
 
@@ -254,7 +278,7 @@ and a `terminal` flag. Branch on `kind` instead of sniffing `DOMException` names
 
 | kind | meaning |
 |---|---|
-| `mic-permission`, `mic-unavailable`, `mic-failed` | the microphone — the only kinds "check your mic" is correct for (`isMicError`) |
+| `mic-permission`, `mic-unavailable`, `mic-failed` | the microphone — the only kinds "check your mic" is correct for (`isMicError`). Since 0.9.0 the session does not end on these by itself: the mic channel runs unbacked and `micBacking` reports why (`preflight()` and `enableMic()` still reject with them) |
 | `unsupported-browser` | this browser cannot do what the session needs |
 | `connect`, `handshake` | the socket was refused or closed before accept, or the box never completed the handshake |
 | `timeout` | a connect watchdog fired: the socket never opened (30 s), or the box accepted and never sent a first video frame (20 s). `stage` says which (`'open'`, `'first-media'`; a slow `prewarm` is a non-terminal `'prewarm'`) |
@@ -291,6 +315,7 @@ pass `sessionId` / `traceId` in the options, those too; none of it goes on the w
 | `stall` | the pause watchdog resumed playback (`resume` / `resume_muted`) |
 | `mic_context` | the mic AudioContext was suspended at start, and whether `resume()` recovered it |
 | `mic_track` | the mic track ended, muted/unmuted, or the device set changed |
+| `mic_backing` | the mic channel gained (`backed: true`) or lost its capture stream, with a bounded `reason` — the fact that tells a live microphone from zeroed frames |
 | `frame_dropped` | the unit assembler discarded a fragment |
 
 ```typescript
@@ -354,8 +379,10 @@ Theme with custom properties on the container rather than overriding rules — `
   langs?: string[];           // ASR language pin; [] / omitted = auto-detect
   responseLanguage?: string;  // preferred reply language (BCP-47)
   workletUrl?: string;        // default '/mic-worklet.js'
-  mic?: boolean;              // default true; false = receive-only (no getUserMedia, text via sendText)
-  permittedStream?: MediaStream; // from ensureMicPermission(), avoids a second prompt
+  mic?: boolean;              // default true; false = receive-only (no mic channel at all, text via sendText)
+  permittedStream?: MediaStream | Promise<MediaStream | null>;
+                              // from ensureMicPermission(), avoids a second prompt; a Promise = a
+                              // prompt still open (unbacked until it resolves; null = do not prompt)
   micCodec?: 'auto' | 'pcm16'; // default 'auto': Opus when WebCodecs + the box allow it, else pcm16
   videoCodec?: 'auto' | 'h264'; // default 'auto': offer every codec this browser decodes (AV1 /
                               // HEVC / H.264) and let the box pick; 'h264' offers none

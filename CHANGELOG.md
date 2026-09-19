@@ -6,6 +6,35 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-19
+
+### Added
+- **The microphone can arrive late.** The mic channel is declared in the hello and stays up for
+  the whole session; whether a microphone is behind it can change. Unbacked, the session sends the
+  same zeroed 100 ms frames mute sends — the box hears silence, not a stalled clock (its endpointer
+  keeps time by counting frames, casola-ai/avatar#628). `permittedStream` may now be a **Promise**:
+  a permission prompt the host is still waiting on. The session runs unbacked and attaches the
+  stream when it resolves; `null` means "do not prompt again".
+- **`session.enableMic(stream?)`** backs the channel later — the stream given, or one asked of
+  getUserMedia (call from a gesture) — without a reconnect, rebuilding a dead Opus encoder on the
+  way. Rejects with the raw error when the capture cannot come up, or when there is no mic channel.
+- **`session.micBacked`**, the **`micBacking`** event and the **`mic_backing`** diagnostic (counted
+  in `stats().counters.micBackingChanges`) say whether the frames on the wire are a microphone or
+  zeros, with a bounded `MicBackingReason`: `attached`, `pending`, `declined`, `permission`,
+  `unavailable`, `unsupported`, `failed`, `track_ended`, `encoder_failed`.
+- `MicPipeline.attach()` / `.backed` for hosts driving the pipeline directly.
+
+### Changed
+- **Mic failures no longer end the session.** A refused `getUserMedia`, a worklet that fails to
+  load, a track that ends (device unplugged, OS revoked, iOS backgrounded) or an Opus encoder that
+  dies used to be terminal (`mic-permission` / `mic-unavailable` / `mic-failed`, or a silent
+  channel). They now drop the channel to zeroed frames and report through `micBacking`; the
+  session goes on, and `enableMic()` can recover it. Hosts that showed an end-of-call error on
+  those kinds should listen to `micBacking` instead. `preflight()` and `enableMic()` still reject
+  with the classified error.
+- `micReady` fires on every attach, not only the first; the `mic_ready` connect phase is still
+  reported once. A stream a promised `permittedStream` delivers after `leave()` is stopped.
+
 ## [0.8.0] - 2026-09-18
 
 ### Added

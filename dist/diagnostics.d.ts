@@ -15,11 +15,12 @@
  * Receivers MUST treat an unrecognized `type` as ignorable: this union grows, and a host that
  * switches on it needs a default that drops the unknown rather than throwing.
  */
+import type { MicBackingReason } from './mic-pipeline';
 import type { VideoCodec } from './protocol';
 import type { EndReason } from './v2/driver';
 /** The connect-phase milestones on the way to a live session, each timed from the socket's
  *  creation (`ms`). Absent phases did not happen this session (poster mode has no `first_frame`;
- *  a receive-only session has no `mic_ready`). */
+ *  a receive-only session, or one whose microphone never attached, has no `mic_ready`). */
 export type ConnectPhase = 'socket_open' | 'accept' | 'first_frame' | 'first_audio' | 'mic_ready';
 /** Where a media-pipeline error came from. `codec_unsupported`: the declared mime failed
  *  `isTypeSupported`; `source_buffer`/`element`: the MSE SourceBuffer or the video element fired
@@ -124,6 +125,13 @@ export type DiagnosticData = {
 } | {
     type: 'mic_track';
     event: 'ended' | 'mute' | 'unmute' | 'device_change';
+}
+/** The mic channel gained or lost its capture stream. Unbacked, the wire carries zeroed frames
+ *  (see `MicBackingReason`); this is the fact that separates a live microphone from silence. */
+ | {
+    type: 'mic_backing';
+    backed: boolean;
+    reason: MicBackingReason;
 } | {
     type: 'frame_dropped';
     reason: 'no_start' | 'mismatch';
@@ -152,8 +160,12 @@ export interface AvatarSessionStats {
         micTrackEvents: number;
         framesDropped: number;
         textFailures: number;
-        /** Outgoing mic frames — the count the 10 Hz `onAudioFrameSent` callback used to be read as. */
+        /** Outgoing mic frames — the count the 10 Hz `onAudioFrameSent` callback used to be read as.
+         *  Counts zeroed frames too: read `micBackingChanges` and the `mic_backing` diagnostics to
+         *  know whether a microphone was behind them. */
         micFramesSent: number;
+        /** Times the mic channel gained or lost its stream. */
+        micBackingChanges: number;
     };
 }
 /** A fresh zeroed stats snapshot. */

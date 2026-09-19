@@ -1,6 +1,8 @@
 import { type AvatarDiagnostic, type AvatarSessionStats, type NegotiatedInfo } from './diagnostics';
 import { AvatarError } from './errors';
 import { type Logger } from './logger';
+import { type MicBackingReason } from './mic-pipeline';
+export type { MicBackingReason } from './mic-pipeline';
 import type { VideoCodec } from './protocol';
 import type { WidgetState } from './state';
 import type { TimedUtterance } from './utterance-scheduler';
@@ -26,6 +28,13 @@ export interface MicMuteState {
     userMuted: boolean;
     suppressed: boolean;
     effective: boolean;
+}
+/** Whether the mic channel is backed by a capture stream, and why not when it is not. Unbacked,
+ *  the session still sends zeroed frames on the mic cadence — the box hears silence, never a
+ *  stalled clock — and `enableMic()` can back it later. */
+export interface MicBackingState {
+    backed: boolean;
+    reason: MicBackingReason;
 }
 /** Calibration for one outgoing mic frame — see `callbacks.onAudioFrameSent`. */
 export interface MicFrameSentInfo {
@@ -54,6 +63,9 @@ export interface AvatarSessionEvents {
     audioBlocked: () => void;
     /** The microphone's mute state changed — from the user, or from `suppressMic`. */
     muteChange: (state: MicMuteState) => void;
+    /** The mic channel gained or lost its capture stream — a late permission grant attaching, a
+     *  track that ended, an `enableMic()` that failed. Read `micBacked` for the current value. */
+    micBacking: (state: MicBackingState) => void;
     /** A bounded operational fact about the session — see `AvatarDiagnostic`. Fires unguarded by the
      *  session's `done` flag, so `socket_closed` (which lands in the same tick as `close`) is not
      *  dropped. */
@@ -93,12 +105,19 @@ export interface AvatarSessionOpts {
     workletUrl?: string;
     prewarm?: () => Promise<void> | void;
     dev?: boolean;
-    /** Mic uplink. Default true. Set false for a RECEIVE-ONLY session: the hello omits `mic`, no
-     *  microphone is opened (no getUserMedia prompt, no worklet needed), and user input arrives
-     *  through sendText() over the same session socket. */
+    /** Mic uplink. Default true: the hello declares the mic channel, and the channel stays up for
+     *  the whole session whether or not a microphone is behind it (see `permittedStream`,
+     *  `enableMic`, `micBacked`). Set false for a RECEIVE-ONLY session: the hello omits `mic`, no
+     *  microphone is ever opened, and user input arrives through sendText() over the same socket. */
     mic?: boolean;
-    /** Pre-fetched MediaStream from ensureMicPermission() — avoids a second getUserMedia call. */
-    permittedStream?: MediaStream;
+    /** Where the microphone comes from. A `MediaStream` from `ensureMicPermission()` attaches at
+     *  the accept (and avoids a second getUserMedia prompt). A `Promise` is a stream the host is
+     *  still waiting for — a permission prompt the visitor has not answered — and the session runs
+     *  with zeroed mic frames until it resolves, then attaches it; a `null` resolution means the
+     *  host chose not to prompt again (`enableMic()` still can). Omitted: the session asks
+     *  getUserMedia itself at the accept. A refusal no longer ends the session either way: the
+     *  channel stays unbacked and reports why (`micBacking`). */
+    permittedStream?: MediaStream | Promise<MediaStream | null>;
     /** Mic uplink codec. Default `'auto'`: Opus (32 kbit/s, one packet per 100 ms frame) whenever
      *  this browser's WebCodecs `AudioEncoder` supports it and the box accepts it, else raw pcm16 —
      *  the box's accept decides, so an older box silently gets pcm16. `'pcm16'` never offers Opus:
@@ -123,7 +142,8 @@ export interface AvatarSessionOpts {
         onPartial?(text: string): void;
         onTurn?(t: Turn): void;
         onFirstFrame?(): void;
-        /** Fired when the microphone pipeline is capturing and the session is ready for speech. */
+        /** Fired when the microphone pipeline is capturing and the session is ready for speech —
+         *  on the first attach and on every later one (`enableMic`, a late `permittedStream`). */
         onMicReady?(): void;
         /** The box marked the start of an assistant utterance (speech_id groups its turn/audio). */
         onSpeechStart?(speechId: string): void;
@@ -169,6 +189,7 @@ export declare class AvatarSession {
     private _personaKey;
     private _videoCodec;
     private permittedStream;
+    private _micBacked;
     private langs;
     private _responseLanguage;
     private _userMuted;
@@ -246,6 +267,19 @@ export declare class AvatarSession {
     start(): Promise<void>;
     private openSession;
     leave(): void;
+    /** Whether the frames on the mic channel are the microphone right now. `false` before the
+     *  accept, in a receive-only session, while a promised stream is pending, after a refusal, and
+     *  after the track ended — the wire then carries zeroed frames, or nothing at all. */
+    get micBacked(): boolean;
+    /**
+     * Back the mic channel with a microphone, now: the `stream` given, or one asked of getUserMedia
+     * (call this from a click or tap — iOS refuses a prompt outside a gesture). The wire switches
+     * from zeroed frames to the microphone without a reconnect; `micReady` and `micBacking` fire.
+     * Rejects with the raw getUserMedia/worklet error when the capture cannot come up, and when
+     * the session has no mic channel (receive-only, not yet accepted, or ended). The channel is
+     * unchanged either way.
+     */
+    enableMic(stream?: MediaStream): Promise<void>;
     /** The user's choice — what a mute button sets. Survives `suppressMic`. */
     setMuted(muted: boolean): void;
     /**

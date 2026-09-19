@@ -12,7 +12,7 @@ export type { Logger, LogLevel } from './logger';
 export type { PlayoutClock } from './playout-clock';
 export type { VideoCodec } from './protocol';
 export { CloseCode, SUBPROTOCOL, VIDEO_CODECS } from './protocol';
-export type { AvatarSessionEvents, AvatarSessionOpts, ConnectHandlers, ConnectStrategy, EdgeTarget, EndReason, MicFrameSentInfo, MicMuteState, PreflightResult, Turn, } from './session';
+export type { AvatarSessionEvents, AvatarSessionOpts, ConnectHandlers, ConnectStrategy, EdgeTarget, EndReason, MicBackingReason, MicBackingState, MicFrameSentInfo, MicMuteState, PreflightResult, Turn, } from './session';
 export { AvatarSession } from './session';
 export type { SessionUIController, SessionUIOptions, SessionUIPart } from './session-ui';
 export { attachSessionUI } from './session-ui';

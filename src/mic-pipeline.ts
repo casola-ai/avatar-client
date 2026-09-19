@@ -1,5 +1,6 @@
 import { ClockMap } from './clock-map';
 import type { DiagnosticData } from './diagnostics';
+import { classifyMicError } from './errors';
 import { consoleLogger, type Logger } from './logger';
 
 /** The uplink sample rate, whichever codec ch1 negotiated (spec §4). */
@@ -11,6 +12,37 @@ export const MIC_FRAME_SAMPLES = 1600; // 100 ms at 16 kHz
  *  `videoMediaTimeMs` field (its shape predates v2 and is unchanged). On the v2 wire an unknown
  *  value is sent as `pts_us = 0` instead — the sentinel never leaves the process. */
 export const VIDEO_MEDIA_TIME_UNKNOWN = 0xffffffff;
+
+/** The cadence of the unbacked channel: one zeroed frame per 100 ms, the same shape mute sends. */
+const SILENT_FRAME_MS = 100;
+/** A throttled timer (a background tab) fires late and owes several frames at once. This bounds
+ *  the burst; anything older is dropped rather than flooding the uplink with silence. */
+const SILENT_CATCHUP_MAX = 10;
+
+/**
+ * Why the mic channel is, or is not, backed by a capture stream.
+ *
+ * - `attached` — a stream is capturing; the frames on the wire are the microphone.
+ * - `pending` — the host promised a stream (`stream` was a Promise) and it has not resolved yet.
+ * - `declined` — the host's promise resolved `null`: no stream, and no prompt of our own.
+ * - `permission` / `unavailable` / `unsupported` / `failed` — `getUserMedia` or the worklet refused,
+ *   classified like `classifyMicError`.
+ * - `track_ended` — the capture track ended (device unplugged, OS revoked the mic, iOS backgrounded).
+ * - `encoder_failed` — the driver's Opus encoder died; the pipeline itself never reports this.
+ *
+ * Whenever the channel is unbacked it keeps sending zeroed frames on the 100 ms cadence, so the
+ * box sees one continuous uplink and reads the gap as silence, never as a stalled clock.
+ */
+export type MicBackingReason =
+  | 'attached'
+  | 'pending'
+  | 'declined'
+  | 'permission'
+  | 'unavailable'
+  | 'unsupported'
+  | 'failed'
+  | 'track_ended'
+  | 'encoder_failed';
 
 /** Per-frame capture calibration, produced once per flushed 100 ms frame. */
 export interface MicFrameInfo {
@@ -50,8 +82,12 @@ export function computeFrameTimestamp(
 
 export interface MicPipelineOpts {
   workletUrl: string;
-  /** Pre-fetched MediaStream from ensurePermission() — avoids a second getUserMedia call. */
-  stream?: MediaStream;
+  /** Where the capture stream comes from. A `MediaStream` (pre-fetched via `ensurePermission()`,
+   *  which avoids a second getUserMedia prompt) attaches at once. A Promise is a stream the host
+   *  is still waiting for — typically a permission prompt the visitor has not answered yet: the
+   *  channel runs unbacked (zeroed frames) until it resolves, and a `null` resolution means the
+   *  host chose not to prompt again. `undefined` asks `getUserMedia` here, as before. */
+  stream?: MediaStream | Promise<MediaStream | null>;
   dev?: boolean;
   /** Typically MsePlayer.mediaTimeAt — kept as a plain function so the pipeline stays
    *  decoupled/testable. undefined = no video calibration source (poster mode); frames then
@@ -65,6 +101,42 @@ export interface MicPipelineOpts {
   /** Bounded mic diagnostics — `mic_context` (a suspended AudioContext at start, which used to be
    *  swallowed) and `mic_track` (the track ending / muting / a device change). Optional. */
   onDiagnostic?: (d: DiagnosticData) => void;
+  /** The channel gained or lost its capture stream. `true` means the frames are the microphone
+   *  from now on; `false` means they are zeros, and `reason` says why. Optional. */
+  onBacking?: (backed: boolean, reason: MicBackingReason) => void;
+  /** Clock for the unbacked cadence, in ms. Test seam; defaults to `performance.now`. */
+  now?: () => number;
+}
+
+/** The constraints every capture uses, pre-fetched or not. See `ensurePermission` for why each
+ *  of the three is ON. */
+const CAPTURE_CONSTRAINTS: MediaStreamConstraints = {
+  audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  video: false,
+};
+
+function isThenable(value: unknown): value is Promise<MediaStream | null> {
+  return typeof (value as { then?: unknown } | null)?.then === 'function';
+}
+
+function stopTracks(stream: MediaStream | null | undefined): void {
+  stream?.getTracks().forEach((t) => {
+    t.stop();
+  });
+}
+
+/** The backing reason for a capture failure, classified like the error kinds hosts already know. */
+function backingReasonFor(err: unknown): MicBackingReason {
+  switch (classifyMicError(err)) {
+    case 'mic-permission':
+      return 'permission';
+    case 'mic-unavailable':
+      return 'unavailable';
+    case 'unsupported-browser':
+      return 'unsupported';
+    default:
+      return 'failed';
+  }
 }
 
 /**
@@ -72,6 +144,14 @@ export interface MicPipelineOpts {
  * frames with capture-instant calibration. Wire-agnostic — the v2 driver turns the emitted
  * frames into channel-1 media frames. Extracted from the v1 MicCapture (which also owned the
  * /mic_stream socket); the audio path is unchanged.
+ *
+ * The channel outlives its stream. From `start()` until `stop()` frames go out on the 100 ms
+ * cadence no matter what: zeros while no stream backs the channel (a prompt still open, a refusal,
+ * a track that ended), the microphone once one does. The box's endpointer keeps time by counting
+ * frames (casola-ai/avatar#628), so a gap would read as a frozen clock, not as silence — and the
+ * same zeroed frames are what mute has always sent. `attach()` brings a stream in later; a track
+ * that ends drops back to zeros instead of going quiet. `onBacking` says which of the two the
+ * wire is carrying.
  */
 export class MicPipeline {
   private ctx: AudioContext | null = null;
@@ -88,12 +168,23 @@ export class MicPipeline {
   private closed = false;
   private muted = false;
   private pcmCallCount = 0;
-  private readonly audioClockMap = new ClockMap();
+  private audioClockMap = new ClockMap();
   private inputLatencySeconds = 0;
   private frameStartContextTime = 0;
   private micSeq = 0;
   private teardownListeners: Array<() => void> = [];
   private log: Logger = consoleLogger(false);
+
+  private _backed = false;
+  private attaching: Promise<void> | null = null;
+  private silentTimer: ReturnType<typeof setInterval> | null = null;
+  private silentT0 = 0;
+  private silentEmitted = 0;
+
+  /** Whether a capture stream backs the channel right now (else the frames are zeros). */
+  get backed(): boolean {
+    return this._backed;
+  }
 
   // Returns the live MediaStream so the caller can pass it to start(), avoiding
   // a second getUserMedia call (which causes a second permission prompt on Firefox).
@@ -118,29 +209,101 @@ export class MicPipeline {
     // AGC matters because nothing else in the chain normalizes level: the worklet, the resampler
     // and the box are all unity gain, so without it the box compares a RAW hardware capture level
     // against its absolute VAD bars and a quiet mic is simply never heard (#687).
-    return navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      video: false,
-    });
+    return navigator.mediaDevices.getUserMedia(CAPTURE_CONSTRAINTS);
   }
 
+  /**
+   * Bring the channel up. Resolves once frames are flowing — which is immediately: the unbacked
+   * cadence starts first, and the stream (given, promised, or requested from `getUserMedia`)
+   * attaches on top of it. A capture that fails to attach is reported through `onBacking`, never
+   * thrown from here; `attach()` is the call that rejects, for a host that asked explicitly.
+   */
   async start(opts: MicPipelineOpts): Promise<void> {
     this.opts = opts;
     const dev = opts.dev ?? false;
     this.log = opts.logger ?? consoleLogger(dev);
-    if (opts.stream) {
-      this.stream = opts.stream;
-    } else {
-      this.stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-        video: false,
-      });
+    this.startSilent();
+    const source = opts.stream;
+    if (isThenable(source)) {
+      this.setBacking(false, 'pending');
+      source.then(
+        (stream) => {
+          if (this.closed) {
+            stopTracks(stream);
+            return;
+          }
+          if (stream) {
+            this.attach(stream).catch(() => {
+              /* reported through onBacking */
+            });
+          } else {
+            this.setBacking(false, 'declined');
+          }
+        },
+        () => {
+          if (!this.closed) this.setBacking(false, 'failed');
+        }
+      );
+      return;
     }
+    try {
+      await this.attach(source);
+    } catch {
+      /* reported through onBacking */
+    }
+  }
 
+  /**
+   * Back the channel with a capture stream. With no `stream`, asks `getUserMedia` (call it from a
+   * user gesture — iOS refuses otherwise). A stream that is already attached is replaced.
+   * Rejects with the raw error when the capture cannot be brought up; the channel then stays
+   * unbacked and keeps its cadence.
+   */
+  async attach(stream?: MediaStream): Promise<void> {
+    if (this.closed) throw new Error('mic pipeline stopped');
+    if (this.attaching) await this.attaching.catch(() => {});
+    const run = this.doAttach(stream);
+    this.attaching = run;
+    try {
+      await run;
+    } finally {
+      if (this.attaching === run) this.attaching = null;
+    }
+  }
+
+  private async doAttach(given?: MediaStream): Promise<void> {
+    const opts = this.opts;
+    if (!opts) throw new Error('mic pipeline not started');
+    let stream = given ?? null;
+    try {
+      if (!stream) {
+        if (!navigator.mediaDevices?.getUserMedia) {
+          const err = new Error('mediaDevices unavailable');
+          err.name = 'NotSupportedError';
+          throw err;
+        }
+        stream = await navigator.mediaDevices.getUserMedia(CAPTURE_CONSTRAINTS);
+      }
+      if (this.closed) {
+        stopTracks(stream);
+        return;
+      }
+      if (this._backed) this.detachCapture();
+      await this.bringUp(stream, opts);
+    } catch (err) {
+      stopTracks(stream);
+      if (!this.closed) this.setBacking(false, backingReasonFor(err));
+      throw err;
+    }
+  }
+
+  /** The capture graph: AudioContext at the track's rate → worklet → silent sink. */
+  private async bringUp(stream: MediaStream, opts: MicPipelineOpts): Promise<void> {
+    this.stream = stream;
     // Match AudioContext sample rate to the capture track's native rate so
     // createMediaStreamSource doesn't receive a mismatched stream (Firefox does
     // not resample — it emits silence; Chrome resamples transparently).
-    const track = this.stream.getAudioTracks()[0];
+    const track = stream.getAudioTracks()[0];
     const settings = track?.getSettings();
     const nativeRate = settings?.sampleRate;
     // Not in lib.dom's MediaTrackSettings — inconsistently reported (Chrome sometimes; often
@@ -174,10 +337,13 @@ export class MicPipeline {
     }
 
     // Track loss / mute / a device change all end capture without the pipeline noticing otherwise
-    // (charmingly#288, §D.5). Report them; the capture path is unchanged.
+    // (charmingly#288, §D.5). Report them; an ended track also drops the channel back to zeros.
     if (track) {
       for (const event of ['ended', 'mute', 'unmute'] as const) {
-        const listener = (): void => opts.onDiagnostic?.({ type: 'mic_track', event });
+        const listener = (): void => {
+          opts.onDiagnostic?.({ type: 'mic_track', event });
+          if (event === 'ended') this.onTrackEnded();
+        };
         track.addEventListener(event, listener);
         this.teardownListeners.push(() => track.removeEventListener(event, listener));
       }
@@ -194,8 +360,9 @@ export class MicPipeline {
 
     this.inRate = ctx.sampleRate;
     await ctx.audioWorklet.addModule(opts.workletUrl);
+    if (this.closed || this.stream !== stream) return; // stopped or replaced while loading
 
-    const source = ctx.createMediaStreamSource(this.stream);
+    const source = ctx.createMediaStreamSource(stream);
     const node = new AudioWorkletNode(ctx, 'mic-fwd');
     this.node = node;
     node.port.onmessage = (e) => {
@@ -207,6 +374,92 @@ export class MicPipeline {
     sink.gain.value = 0;
     this.sink = sink;
     source.connect(node).connect(sink).connect(ctx.destination);
+    this._backed = true;
+    this.setBacking(true, 'attached');
+  }
+
+  private onTrackEnded(): void {
+    if (this.closed || !this._backed) return;
+    this.detachCapture();
+    this.setBacking(false, 'track_ended');
+    this.startSilent();
+  }
+
+  /** Tear the capture graph down and forget it. The cadence and `micSeq` are untouched: the
+   *  channel goes on, the frames just stop being the microphone. */
+  private detachCapture(): void {
+    for (const remove of this.teardownListeners) remove();
+    this.teardownListeners = [];
+    try {
+      this.node?.disconnect();
+      this.sink?.disconnect();
+    } catch {
+      /* */
+    }
+    this.node = null;
+    this.sink = null;
+    stopTracks(this.stream);
+    this.stream = null;
+    void this.ctx?.close().catch(() => {});
+    this.ctx = null;
+    this.resTail = new Float32Array(0);
+    this.resPos = 0;
+    this.frameLen = 0;
+    this.audioClockMap = new ClockMap();
+    this._backed = false;
+  }
+
+  private setBacking(backed: boolean, reason: MicBackingReason): void {
+    this.log('debug', '[mic] backing', { backed, reason });
+    this.opts?.onBacking?.(backed, reason);
+  }
+
+  // ---------------------------------------------------------------- the unbacked cadence
+
+  private startSilent(): void {
+    if (this.silentTimer || this.closed) return;
+    this.silentT0 = this.now();
+    this.silentEmitted = 0;
+    this.silentTimer = setInterval(() => this.silentTick(), SILENT_FRAME_MS);
+  }
+
+  private stopSilent(): void {
+    if (this.silentTimer) clearInterval(this.silentTimer);
+    this.silentTimer = null;
+  }
+
+  private now(): number {
+    return this.opts?.now?.() ?? performance.now();
+  }
+
+  private silentTick(): void {
+    if (this.closed || !this.opts) return;
+    const due = Math.floor((this.now() - this.silentT0) / SILENT_FRAME_MS);
+    let owed = due - this.silentEmitted;
+    if (owed > SILENT_CATCHUP_MAX) {
+      // Woken late: send a bounded burst, drop the rest. The wire's seq stays contiguous — a
+      // dropped window is time the box never sees, which is the shape it gets today.
+      this.silentEmitted = due - SILENT_CATCHUP_MAX;
+      owed = SILENT_CATCHUP_MAX;
+    }
+    for (let i = 0; i < owed; i++) {
+      this.silentEmitted += 1;
+      this.emitSilentFrame();
+    }
+  }
+
+  private emitSilentFrame(): void {
+    const opts = this.opts;
+    if (!opts) return;
+    const performanceTimeMs = performance.now();
+    const rawVideoMediaTimeMs = opts.getVideoMediaTimeMs?.(performanceTimeMs) ?? null;
+    this.micSeq += 1;
+    opts.onFrame(new Int16Array(MIC_FRAME_SAMPLES), {
+      micSeq: this.micSeq,
+      videoMediaTimeMs:
+        rawVideoMediaTimeMs === null ? VIDEO_MEDIA_TIME_UNKNOWN : Math.round(rawVideoMediaTimeMs),
+      captureEpochMs: performance.timeOrigin + performanceTimeMs,
+    });
   }
 
   private onPcm(chunk: Float32Array, contextTime: number): void {
@@ -268,6 +521,8 @@ export class MicPipeline {
       // A frame with no capture calibration must not go out and desync the receiver — same rule
       // as the v1 wire (can only happen before the first clock sample, i.e. never in practice).
       if (result) {
+        // The first real frame retires the unbacked cadence — no overlap, no gap beyond one frame.
+        this.stopSilent();
         this.micSeq += 1;
         const pcm = this.muted ? new Int16Array(MIC_FRAME_SAMPLES) : this.frame.slice();
         opts.onFrame(pcm, { micSeq: this.micSeq, ...result });
@@ -280,21 +535,11 @@ export class MicPipeline {
     this.muted = m;
   }
 
+  /** Idempotent. Ends the cadence and the capture; a stream still promised is stopped when it
+   *  arrives, so a late permission grant never leaves a live microphone behind. */
   stop(): void {
     this.closed = true;
-    for (const remove of this.teardownListeners) remove();
-    this.teardownListeners = [];
-    try {
-      this.node?.disconnect();
-      this.sink?.disconnect();
-    } catch {
-      /* */
-    }
-    this.stream?.getTracks().forEach((t) => {
-      t.stop();
-    });
-    this.stream = null;
-    void this.ctx?.close().catch(() => {});
-    this.ctx = null;
+    this.stopSilent();
+    this.detachCapture();
   }
 }

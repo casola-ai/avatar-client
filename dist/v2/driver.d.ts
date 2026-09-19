@@ -1,7 +1,7 @@
 import type { AvatarDiagnostic } from '../diagnostics';
 import { AvatarError } from '../errors';
 import { type Logger } from '../logger';
-import { type MicFrameInfo } from '../mic-pipeline';
+import { type MicBackingReason, type MicFrameInfo } from '../mic-pipeline';
 import { type VideoCodec, type WebSocketLike } from '../protocol';
 import { type TimedUtterance } from '../utterance-scheduler';
 export type EndReason = 'cap' | 'edge_disconnect' | 'kicked' | 'expired' | 'dropped' | 'generic';
@@ -29,7 +29,10 @@ export interface V2DriverHandlers {
         videoCodec: VideoCodec | null;
     }): void;
     onFirstFrame(): void;
+    /** The mic pipeline is capturing — on the first attach and on every later one. */
     onMicReady(): void;
+    /** The mic channel gained or lost its capture stream (zeroed frames while it has none). */
+    onMicBacking(backed: boolean, reason: MicBackingReason): void;
     onPartial(text: string): void;
     onTurn(turn: Turn): void;
     onSpeechStart(speechId: string): void;
@@ -58,7 +61,9 @@ export interface V2DriverOpts {
     langs: string[];
     responseLanguage?: string;
     workletUrl: string;
-    permittedStream?: MediaStream;
+    /** The capture stream, a Promise of one still being waited for (`null` = do not prompt), or
+     *  `undefined` to ask getUserMedia at accept. See `MicPipelineOpts.stream`. */
+    permittedStream?: MediaStream | Promise<MediaStream | null>;
     /** Uplink codec preference list for `hello.mic.codecs`, e.g. `['opus', 'pcm16']`. Empty or
      *  omitted = the field is left out and the box answers pcm16. The accept's ch1 descriptor
      *  says what was chosen; the driver encodes accordingly. */
@@ -95,6 +100,8 @@ export declare class V2Driver {
     private readonly unitAssembler;
     private pipeline;
     private encoder;
+    private _micBacked;
+    private micReadyReported;
     private accepted;
     private audioCh;
     private micCh;
@@ -124,6 +131,19 @@ export declare class V2Driver {
     private onServerMessage;
     private onAccept;
     private startMic;
+    /** One pipeline frame — the microphone or zeros — on its way to the wire. */
+    private onMicPcm;
+    private createEncoder;
+    private onMicBacking;
+    /** Whether the frames on the wire are the microphone right now (else zeros, or nothing). */
+    get micBacked(): boolean;
+    /**
+     * Back the mic channel with a stream: the one given, or one asked of getUserMedia (call from a
+     * user gesture). Rebuilds a dead Opus encoder first. Rejects when the session has no mic channel
+     * (receive-only, or before the accept) or the capture cannot come up; the channel then stays as
+     * it was.
+     */
+    enableMic(stream?: MediaStream): Promise<void>;
     private sendMicFrame;
     private onMediaFrame;
     private onMediaUnit;

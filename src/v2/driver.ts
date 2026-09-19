@@ -1,16 +1,11 @@
 import type { AvatarDiagnostic, ConnectPhase, DiagnosticData } from '../diagnostics';
-import {
-  AvatarError,
-  type AvatarErrorKind,
-  type AvatarErrorStage,
-  classifyMicError,
-  toAvatarError,
-} from '../errors';
+import { AvatarError, type AvatarErrorKind, type AvatarErrorStage, toAvatarError } from '../errors';
 import { consoleLogger, type Logger } from '../logger';
 import { type MediaUnit, MediaUnitAssembler } from '../media-unit-assembler';
 import { OpusMicEncoder } from '../mic-encoder';
 import {
   MIC_SAMPLE_RATE,
+  type MicBackingReason,
   type MicFrameInfo,
   MicPipeline,
   VIDEO_MEDIA_TIME_UNKNOWN,
@@ -74,7 +69,10 @@ export interface V2DriverHandlers {
     videoCodec: VideoCodec | null;
   }): void;
   onFirstFrame(): void;
+  /** The mic pipeline is capturing — on the first attach and on every later one. */
   onMicReady(): void;
+  /** The mic channel gained or lost its capture stream (zeroed frames while it has none). */
+  onMicBacking(backed: boolean, reason: MicBackingReason): void;
   onPartial(text: string): void;
   onTurn(turn: Turn): void;
   onSpeechStart(speechId: string): void;
@@ -104,7 +102,9 @@ export interface V2DriverOpts {
   langs: string[];
   responseLanguage?: string;
   workletUrl: string;
-  permittedStream?: MediaStream;
+  /** The capture stream, a Promise of one still being waited for (`null` = do not prompt), or
+   *  `undefined` to ask getUserMedia at accept. See `MicPipelineOpts.stream`. */
+  permittedStream?: MediaStream | Promise<MediaStream | null>;
   /** Uplink codec preference list for `hello.mic.codecs`, e.g. `['opus', 'pcm16']`. Empty or
    *  omitted = the field is left out and the box answers pcm16. The accept's ch1 descriptor
    *  says what was chosen; the driver encodes accordingly. */
@@ -176,6 +176,8 @@ export class V2Driver {
   );
   private pipeline: MicPipeline | null = null;
   private encoder: OpusMicEncoder | null = null;
+  private _micBacked = false;
+  private micReadyReported = false;
 
   private accepted: AcceptMessage | null = null;
   private audioCh: AudioChannelDescriptor | null = null;
@@ -524,23 +526,14 @@ export class V2Driver {
   private startMic(micCh: AudioChannelDescriptor): void {
     // The box chose the uplink codec from our hello.mic.codecs; its ch1 descriptor is the answer.
     // pcm16: the pipeline's Int16 frames go out as-is. opus: one WebCodecs packet per frame.
-    let onFrame = (pcm: Int16Array, info: MicFrameInfo): void =>
-      this.sendMicFrame(micCh.id, new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength), info);
     if (micCh.codec === 'opus') {
-      let encoder: OpusMicEncoder;
       try {
-        encoder = new OpusMicEncoder({
-          logger: this.log,
-          onPacket: (packet, info) => this.sendMicFrame(micCh.id, packet, info),
-          // A dead encoder is a dead mic: terminal, like a worklet that failed to load.
-          onError: (err) => this.fail(err, 'mic-failed'),
-        });
+        this.createEncoder(micCh);
       } catch (err) {
-        this.fail(err, 'mic-failed');
-        return;
+        this.log('warn', '[mic] opus encoder unavailable; channel stays unbacked', { err });
+        this.diag({ type: 'mic_backing', backed: false, reason: 'encoder_failed' });
+        this.opts.handlers.onMicBacking(false, 'encoder_failed');
       }
-      this.encoder = encoder;
-      onFrame = (pcm, info) => encoder.encode(pcm, info);
     }
     const pipeline = new MicPipeline();
     this.pipeline = pipeline;
@@ -550,19 +543,81 @@ export class V2Driver {
         stream: this.opts.permittedStream,
         logger: this.log,
         getVideoMediaTimeMs: this.mse ? (t) => this.mse?.mediaTimeAt(t) ?? null : undefined,
-        onFrame,
+        onFrame: (pcm, info) => this.onMicPcm(micCh, pcm, info),
         onDiagnostic: (d) => this.diag(d),
-      })
-      .then(() => {
-        if (this.finished) return;
-        this.phase('mic_ready');
-        this.opts.handlers.onMicReady();
+        onBacking: (backed, reason) => this.onMicBacking(backed, reason),
       })
       .catch((err: unknown) => {
-        // getUserMedia denial / worklet load failure — terminal, matching the v1 contract.
-        // Classified here so the host can tell "you denied the mic" from "the worklet died".
-        this.fail(err, classifyMicError(err));
+        // start() reports capture failures through onBacking; only an internal fault lands here.
+        this.log('warn', '[mic] pipeline failed to start', { err });
       });
+  }
+
+  /** One pipeline frame — the microphone or zeros — on its way to the wire. */
+  private onMicPcm(micCh: AudioChannelDescriptor, pcm: Int16Array, info: MicFrameInfo): void {
+    if (micCh.codec === 'opus') {
+      // No encoder (it died, or never came up): nothing can go out until enableMic() rebuilds it.
+      this.encoder?.encode(pcm, info);
+      return;
+    }
+    this.sendMicFrame(micCh.id, new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength), info);
+  }
+
+  private createEncoder(micCh: AudioChannelDescriptor): void {
+    this.encoder = new OpusMicEncoder({
+      logger: this.log,
+      onPacket: (packet, info) => this.sendMicFrame(micCh.id, packet, info),
+      // A dead encoder used to end the session. Now it unbacks the channel: the pipeline keeps
+      // running, the wire goes quiet, and enableMic() can rebuild the encoder.
+      onError: (err) => {
+        this.log('warn', '[mic] opus encoder failed', { err });
+        this.encoder?.stop();
+        this.encoder = null;
+        this.onMicBacking(false, 'encoder_failed');
+      },
+    });
+  }
+
+  private onMicBacking(backed: boolean, reason: MicBackingReason): void {
+    if (this.finished) return;
+    // Backed means frames that reach the wire are the microphone: a live stream AND, on opus,
+    // a live encoder. The pipeline only knows about the stream.
+    const effective = backed && (this.micCh?.codec !== 'opus' || this.encoder !== null);
+    const effectiveReason: MicBackingReason = backed && !effective ? 'encoder_failed' : reason;
+    this._micBacked = effective;
+    this.diag({ type: 'mic_backing', backed: effective, reason: effectiveReason });
+    if (effective) {
+      if (!this.micReadyReported) {
+        this.micReadyReported = true;
+        this.phase('mic_ready');
+      }
+      this.opts.handlers.onMicReady();
+    }
+    this.opts.handlers.onMicBacking(effective, effectiveReason);
+  }
+
+  /** Whether the frames on the wire are the microphone right now (else zeros, or nothing). */
+  get micBacked(): boolean {
+    return this._micBacked;
+  }
+
+  /**
+   * Back the mic channel with a stream: the one given, or one asked of getUserMedia (call from a
+   * user gesture). Rebuilds a dead Opus encoder first. Rejects when the session has no mic channel
+   * (receive-only, or before the accept) or the capture cannot come up; the channel then stays as
+   * it was.
+   */
+  async enableMic(stream?: MediaStream): Promise<void> {
+    const pipeline = this.pipeline;
+    const micCh = this.micCh;
+    if (this.finished || !pipeline || !micCh) throw new Error('mic channel unavailable');
+    if (micCh.codec === 'opus' && !this.encoder) this.createEncoder(micCh);
+    if (pipeline.backed && !stream) {
+      // The stream was fine all along; only the encoder needed rebuilding.
+      this.onMicBacking(true, 'attached');
+      return;
+    }
+    await pipeline.attach(stream);
   }
 
   private sendMicFrame(channelId: number, payload: Uint8Array, info: MicFrameInfo): void {
