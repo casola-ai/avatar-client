@@ -29,6 +29,17 @@ export interface MicFrameInfo {
     videoMediaTimeMs: number;
     captureEpochMs: number;
 }
+/** The microphone's loudness over one `MIC_LEVEL_INTERVAL_S` window, linear full-scale 0..1
+ *  (`20 * log10(rms)` is dBFS). `rms` is what a level meter wants; `peak` is what a "nothing is
+ *  reaching the mic at all" test wants. Both are measured on the raw capture samples, before the
+ *  16 kHz resample, and are zeros while muted. */
+export interface MicLevel {
+    rms: number;
+    peak: number;
+}
+/** How much input each `onLevel` call covers: 50 ms, ~20 Hz — smooth for a meter, cheap for a
+ *  DOM write. Measured in samples at the capture rate, so the cadence is rate-independent. */
+export declare const MIC_LEVEL_INTERVAL_S = 0.05;
 /** The capture-instant calibration step, extracted as a pure function so it's directly
  *  unit-testable without a real AudioContext/DOM: given a frame's (latency-compensated) capture
  *  instant on the AudioContext clock and the audio-clock calibration built up so far, look up the
@@ -64,6 +75,13 @@ export interface MicPipelineOpts {
     /** The channel gained or lost its capture stream. `true` means the frames are the microphone
      *  from now on; `false` means they are zeros, and `reason` says why. Optional. */
     onBacking?: (backed: boolean, reason: MicBackingReason) => void;
+    /** The input loudness, once per `MIC_LEVEL_INTERVAL_S` of captured audio (~20 Hz) while a
+     *  stream backs the channel. Zeros while muted — capture keeps running under mute, and a host
+     *  meter must not show a live signal the wire is not carrying. Nothing while unbacked, and
+     *  nothing while the AudioContext is not rendering (a suspended context, a backgrounded iOS
+     *  tab): silence from the meter's point of view is "no news", not "no sound". Optional, and
+     *  the measurement is skipped entirely when absent. */
+    onLevel?: (level: MicLevel) => void;
     /** Clock for the unbacked cadence, in ms. Test seam; defaults to `performance.now`. */
     now?: () => number;
 }
@@ -95,6 +113,9 @@ export declare class MicPipeline {
     private closed;
     private muted;
     private pcmCallCount;
+    private levelSumSq;
+    private levelPeak;
+    private levelSamples;
     private audioClockMap;
     private inputLatencySeconds;
     private frameStartContextTime;
@@ -138,6 +159,10 @@ export declare class MicPipeline {
     private emitSilentFrame;
     private onPcm;
     private flushFrame;
+    /** One `onLevel` call for the window accumulated so far. Mute zeroes the report rather than
+     *  skipping it, so a consumer that only ever sees events cannot be left holding a stale live
+     *  value across a mute. */
+    private flushLevel;
     setMuted(m: boolean): void;
     /** Idempotent. Ends the cadence and the capture; a stream still promised is stopped when it
      *  arrives, so a late permission grant never leaves a live microphone behind. */

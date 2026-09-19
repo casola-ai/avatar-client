@@ -233,8 +233,9 @@ with `ui.setLive(true)` / `ui.setLive(null)`.
 
 Subscribe after construction; the returned function unsubscribes. The constructor `callbacks` still
 work and fire first. Events: `state`, `partial`, `turn`, `firstFrame`, `micReady`, `speechStart`,
-`speechEnd`, `audioFrameSent`, `audioBlocked`, `muteChange`, `micBacking`, `diagnostic`, `close`,
-`error`. A throwing handler is caught, so one bad subscriber cannot break the session.
+`speechEnd`, `audioFrameSent`, `audioBlocked`, `muteChange`, `micBacking`, `micLevel`,
+`diagnostic`, `close`, `error`. A throwing handler is caught, so one bad subscriber cannot break
+the session.
 
 ### The microphone can arrive late
 
@@ -256,6 +257,20 @@ sends, so the box hears silence rather than a stalled clock, and `micBacked` is 
 const session = new AvatarSession({ permittedStream: stillWaitingForTheSheet, videoEl, connect });
 session.on('micBacking', ({ backed, reason }) => setMicIndicator(backed, reason));
 retryButton.onclick = () => session.enableMic().catch(showMicError);
+```
+
+### Microphone level
+
+`micLevel` reports the input loudness about 20 times a second while a stream backs the channel:
+`{ rms, peak }`, linear full-scale 0..1, measured on the raw capture samples (`20 * log10(rms)`
+is dBFS). It is what a "the mic hears you" meter wants, and — via `peak` — what noticing an
+attached microphone that hears nothing at all wants (a headset muted on its own switch, the wrong
+input device). Zeros while muted; no events while unbacked or while the capture context is not
+rendering, so treat "no events" as no news rather than as silence. The measurement is skipped
+entirely when nobody subscribes.
+
+```typescript
+session.on('micLevel', ({ rms }) => meter.style.setProperty('--level', String(Math.min(1, rms * 4))));
 ```
 
 ### `AvatarSession.preflight(options?)`

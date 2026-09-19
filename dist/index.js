@@ -1073,6 +1073,7 @@ var MIC_FRAME_SAMPLES = 1600;
 var VIDEO_MEDIA_TIME_UNKNOWN = 4294967295;
 var SILENT_FRAME_MS = 100;
 var SILENT_CATCHUP_MAX = 10;
+var MIC_LEVEL_INTERVAL_S = 0.05;
 function clamp16(x) {
   const v = Math.round(x * 32767);
   return v > 32767 ? 32767 : v < -32768 ? -32768 : v;
@@ -1125,6 +1126,9 @@ var MicPipeline = class {
     __publicField(this, "closed", false);
     __publicField(this, "muted", false);
     __publicField(this, "pcmCallCount", 0);
+    __publicField(this, "levelSumSq", 0);
+    __publicField(this, "levelPeak", 0);
+    __publicField(this, "levelSamples", 0);
     __publicField(this, "audioClockMap", new ClockMap());
     __publicField(this, "inputLatencySeconds", 0);
     __publicField(this, "frameStartContextTime", 0);
@@ -1320,6 +1324,9 @@ var MicPipeline = class {
     this.resPos = 0;
     this.frameLen = 0;
     this.audioClockMap = new ClockMap();
+    this.levelSumSq = 0;
+    this.levelPeak = 0;
+    this.levelSamples = 0;
     this._backed = false;
   }
   setBacking(backed, reason) {
@@ -1368,13 +1375,26 @@ var MicPipeline = class {
   onPcm(chunk, contextTime) {
     if (this.closed) return;
     this.pcmCallCount++;
-    if (this.pcmCallCount <= 5 || this.pcmCallCount % 100 === 0) {
+    const wantLevel = this.opts?.onLevel !== void 0;
+    const wantLog = this.pcmCallCount <= 5 || this.pcmCallCount % 100 === 0;
+    if (wantLevel || wantLog) {
       let peak = 0;
+      let sumSq = 0;
       for (let i = 0; i < chunk.length; i++) {
-        const abs = Math.abs(chunk[i] ?? 0);
+        const v = chunk[i] ?? 0;
+        const abs = v < 0 ? -v : v;
         if (abs > peak) peak = abs;
+        sumSq += v * v;
       }
-      this.log("debug", "[mic] onPcm", { n: this.pcmCallCount, len: chunk.length, peak });
+      if (wantLog) {
+        this.log("debug", "[mic] onPcm", { n: this.pcmCallCount, len: chunk.length, peak });
+      }
+      if (wantLevel) {
+        this.levelSumSq += sumSq;
+        if (peak > this.levelPeak) this.levelPeak = peak;
+        this.levelSamples += chunk.length;
+        if (this.levelSamples >= this.inRate * MIC_LEVEL_INTERVAL_S) this.flushLevel();
+      }
     }
     const ratio = this.inRate / TARGET_RATE;
     const bufContextTime = contextTime - this.resTail.length / this.inRate;
@@ -1419,6 +1439,20 @@ var MicPipeline = class {
       }
     }
     this.frameLen = 0;
+  }
+  /** One `onLevel` call for the window accumulated so far. Mute zeroes the report rather than
+   *  skipping it, so a consumer that only ever sees events cannot be left holding a stale live
+   *  value across a mute. */
+  flushLevel() {
+    const n = this.levelSamples;
+    const level = this.muted ? { rms: 0, peak: 0 } : {
+      rms: Math.min(1, Math.sqrt(this.levelSumSq / n)),
+      peak: Math.min(1, this.levelPeak)
+    };
+    this.levelSumSq = 0;
+    this.levelPeak = 0;
+    this.levelSamples = 0;
+    this.opts?.onLevel?.(level);
   }
   setMuted(m) {
     this.muted = m;
@@ -2705,7 +2739,13 @@ var V2Driver = class {
       getVideoMediaTimeMs: this.mse ? (t) => this.mse?.mediaTimeAt(t) ?? null : void 0,
       onFrame: (pcm, info) => this.onMicPcm(micCh, pcm, info),
       onDiagnostic: (d) => this.diag(d),
-      onBacking: (backed, reason) => this.onMicBacking(backed, reason)
+      onBacking: (backed, reason) => this.onMicBacking(backed, reason),
+      // Only wired when the host listens: an absent `onLevel` is what turns the measurement off.
+      ...this.opts.handlers.onMicLevel ? {
+        onLevel: (level) => {
+          if (!this.finished) this.opts.handlers.onMicLevel?.(level);
+        }
+      } : {}
     }).catch((err) => {
       this.log("warn", "[mic] pipeline failed to start", { err });
     });
@@ -3063,6 +3103,7 @@ var AvatarSession = class {
           break;
         case "muteChange":
         case "micBacking":
+        case "micLevel":
           break;
         case "diagnostic":
           cb?.onDiagnostic?.(...args);
@@ -3324,6 +3365,9 @@ var AvatarSession = class {
         onMicBacking: (backed, reason) => {
           this._micBacked = backed;
           if (!this.done) this.emit("micBacking", { backed, reason });
+        },
+        onMicLevel: (level) => {
+          if (!this.done) this.emit("micLevel", level);
         },
         onPartial: (text) => {
           if (!this.done) this.emit("partial", text);

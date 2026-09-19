@@ -1,7 +1,7 @@
 import type { AvatarDiagnostic } from '../diagnostics';
 import { AvatarError } from '../errors';
 import { type Logger } from '../logger';
-import { type MicBackingReason, type MicFrameInfo } from '../mic-pipeline';
+import { type MicBackingReason, type MicFrameInfo, type MicLevel } from '../mic-pipeline';
 import { type VideoCodec, type WebSocketLike } from '../protocol';
 import { type TimedUtterance } from '../utterance-scheduler';
 export type EndReason = 'cap' | 'edge_disconnect' | 'kicked' | 'expired' | 'dropped' | 'generic';
@@ -33,6 +33,9 @@ export interface V2DriverHandlers {
     onMicReady(): void;
     /** The mic channel gained or lost its capture stream (zeroed frames while it has none). */
     onMicBacking(backed: boolean, reason: MicBackingReason): void;
+    /** The input loudness, ~20 Hz while a stream backs the channel (see `MicPipelineOpts.onLevel`).
+     *  Optional: absent, the pipeline skips the measurement. */
+    onMicLevel?(level: MicLevel): void;
     onPartial(text: string): void;
     onTurn(turn: Turn): void;
     onSpeechStart(speechId: string): void;

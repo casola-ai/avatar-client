@@ -6,6 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-20
+
+### Added
+- **`micLevel` event** — the microphone's loudness about 20 times a second while a stream backs
+  the channel: `{ rms, peak }`, linear full-scale 0..1 on the raw capture samples. For a level
+  meter, and for noticing a microphone that is attached but hears nothing. Zeros while muted; no
+  events while unbacked or while the capture context is not rendering. on()-only, and the
+  measurement is skipped when nobody subscribes. `MicPipelineOpts.onLevel` for hosts driving the
+  pipeline directly; `MicLevel` and `MIC_LEVEL_INTERVAL_S` exported.
+
 ## [0.9.0] - 2026-09-19
 
 ### Added

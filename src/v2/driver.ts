@@ -7,6 +7,7 @@ import {
   MIC_SAMPLE_RATE,
   type MicBackingReason,
   type MicFrameInfo,
+  type MicLevel,
   MicPipeline,
   VIDEO_MEDIA_TIME_UNKNOWN,
 } from '../mic-pipeline';
@@ -73,6 +74,9 @@ export interface V2DriverHandlers {
   onMicReady(): void;
   /** The mic channel gained or lost its capture stream (zeroed frames while it has none). */
   onMicBacking(backed: boolean, reason: MicBackingReason): void;
+  /** The input loudness, ~20 Hz while a stream backs the channel (see `MicPipelineOpts.onLevel`).
+   *  Optional: absent, the pipeline skips the measurement. */
+  onMicLevel?(level: MicLevel): void;
   onPartial(text: string): void;
   onTurn(turn: Turn): void;
   onSpeechStart(speechId: string): void;
@@ -546,6 +550,14 @@ export class V2Driver {
         onFrame: (pcm, info) => this.onMicPcm(micCh, pcm, info),
         onDiagnostic: (d) => this.diag(d),
         onBacking: (backed, reason) => this.onMicBacking(backed, reason),
+        // Only wired when the host listens: an absent `onLevel` is what turns the measurement off.
+        ...(this.opts.handlers.onMicLevel
+          ? {
+              onLevel: (level: MicLevel) => {
+                if (!this.finished) this.opts.handlers.onMicLevel?.(level);
+              },
+            }
+          : {}),
       })
       .catch((err: unknown) => {
         // start() reports capture failures through onBacking; only an internal fault lands here.

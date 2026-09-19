@@ -1,8 +1,8 @@
 import { type AvatarDiagnostic, type AvatarSessionStats, type NegotiatedInfo } from './diagnostics';
 import { AvatarError } from './errors';
 import { type Logger } from './logger';
-import { type MicBackingReason } from './mic-pipeline';
-export type { MicBackingReason } from './mic-pipeline';
+import { type MicBackingReason, type MicLevel } from './mic-pipeline';
+export type { MicBackingReason, MicLevel } from './mic-pipeline';
 import type { VideoCodec } from './protocol';
 import type { WidgetState } from './state';
 import type { TimedUtterance } from './utterance-scheduler';
@@ -66,6 +66,11 @@ export interface AvatarSessionEvents {
     /** The mic channel gained or lost its capture stream — a late permission grant attaching, a
      *  track that ended, an `enableMic()` that failed. Read `micBacked` for the current value. */
     micBacking: (state: MicBackingState) => void;
+    /** The microphone's loudness, ~20 times a second while a stream backs the channel — for a level
+     *  meter, or for noticing a microphone that is attached but hears nothing. Zeros while muted;
+     *  silent (no events) while unbacked or while the capture context is not rendering. on()-only:
+     *  there is no constructor callback for it. See `MicLevel`. */
+    micLevel: (level: MicLevel) => void;
     /** A bounded operational fact about the session — see `AvatarDiagnostic`. Fires unguarded by the
      *  session's `done` flag, so `socket_closed` (which lands in the same tick as `close`) is not
      *  dropped. */

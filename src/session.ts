@@ -7,9 +7,9 @@ import {
 import { AvatarError, classifyMicError, toAvatarError } from './errors';
 import { consoleLogger, type Logger } from './logger';
 import { OpusMicEncoder } from './mic-encoder';
-import { type MicBackingReason, MicPipeline } from './mic-pipeline';
+import { type MicBackingReason, type MicLevel, MicPipeline } from './mic-pipeline';
 
-export type { MicBackingReason } from './mic-pipeline';
+export type { MicBackingReason, MicLevel } from './mic-pipeline';
 
 import { MsePlayer } from './mse-player';
 import type { VideoCodec } from './protocol';
@@ -80,6 +80,11 @@ export interface AvatarSessionEvents {
   /** The mic channel gained or lost its capture stream — a late permission grant attaching, a
    *  track that ended, an `enableMic()` that failed. Read `micBacked` for the current value. */
   micBacking: (state: MicBackingState) => void;
+  /** The microphone's loudness, ~20 times a second while a stream backs the channel — for a level
+   *  meter, or for noticing a microphone that is attached but hears nothing. Zeros while muted;
+   *  silent (no events) while unbacked or while the capture context is not rendering. on()-only:
+   *  there is no constructor callback for it. See `MicLevel`. */
+  micLevel: (level: MicLevel) => void;
   /** A bounded operational fact about the session — see `AvatarDiagnostic`. Fires unguarded by the
    *  session's `done` flag, so `socket_closed` (which lands in the same tick as `close`) is not
    *  dropped. */
@@ -303,6 +308,7 @@ export class AvatarSession {
           break;
         case 'muteChange':
         case 'micBacking':
+        case 'micLevel':
           // No constructor-callback twin: these events are new, and adding one would grow the
           // callback bag the events API exists to replace.
           break;
@@ -601,6 +607,9 @@ export class AvatarSession {
         onMicBacking: (backed, reason) => {
           this._micBacked = backed;
           if (!this.done) this.emit('micBacking', { backed, reason });
+        },
+        onMicLevel: (level) => {
+          if (!this.done) this.emit('micLevel', level);
         },
         onPartial: (text) => {
           if (!this.done) this.emit('partial', text);

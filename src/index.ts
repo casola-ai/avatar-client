@@ -39,6 +39,7 @@ export type {
   MicBackingReason,
   MicBackingState,
   MicFrameSentInfo,
+  MicLevel,
   MicMuteState,
   PreflightResult,
   Turn,

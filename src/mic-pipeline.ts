@@ -51,6 +51,19 @@ export interface MicFrameInfo {
   captureEpochMs: number;
 }
 
+/** The microphone's loudness over one `MIC_LEVEL_INTERVAL_S` window, linear full-scale 0..1
+ *  (`20 * log10(rms)` is dBFS). `rms` is what a level meter wants; `peak` is what a "nothing is
+ *  reaching the mic at all" test wants. Both are measured on the raw capture samples, before the
+ *  16 kHz resample, and are zeros while muted. */
+export interface MicLevel {
+  rms: number;
+  peak: number;
+}
+
+/** How much input each `onLevel` call covers: 50 ms, ~20 Hz — smooth for a meter, cheap for a
+ *  DOM write. Measured in samples at the capture rate, so the cadence is rate-independent. */
+export const MIC_LEVEL_INTERVAL_S = 0.05;
+
 function clamp16(x: number): number {
   const v = Math.round(x * 32767);
   return v > 32767 ? 32767 : v < -32768 ? -32768 : v;
@@ -104,6 +117,13 @@ export interface MicPipelineOpts {
   /** The channel gained or lost its capture stream. `true` means the frames are the microphone
    *  from now on; `false` means they are zeros, and `reason` says why. Optional. */
   onBacking?: (backed: boolean, reason: MicBackingReason) => void;
+  /** The input loudness, once per `MIC_LEVEL_INTERVAL_S` of captured audio (~20 Hz) while a
+   *  stream backs the channel. Zeros while muted — capture keeps running under mute, and a host
+   *  meter must not show a live signal the wire is not carrying. Nothing while unbacked, and
+   *  nothing while the AudioContext is not rendering (a suspended context, a backgrounded iOS
+   *  tab): silence from the meter's point of view is "no news", not "no sound". Optional, and
+   *  the measurement is skipped entirely when absent. */
+  onLevel?: (level: MicLevel) => void;
   /** Clock for the unbacked cadence, in ms. Test seam; defaults to `performance.now`. */
   now?: () => number;
 }
@@ -168,6 +188,9 @@ export class MicPipeline {
   private closed = false;
   private muted = false;
   private pcmCallCount = 0;
+  private levelSumSq = 0;
+  private levelPeak = 0;
+  private levelSamples = 0;
   private audioClockMap = new ClockMap();
   private inputLatencySeconds = 0;
   private frameStartContextTime = 0;
@@ -406,6 +429,9 @@ export class MicPipeline {
     this.resPos = 0;
     this.frameLen = 0;
     this.audioClockMap = new ClockMap();
+    this.levelSumSq = 0;
+    this.levelPeak = 0;
+    this.levelSamples = 0;
     this._backed = false;
   }
 
@@ -466,13 +492,28 @@ export class MicPipeline {
     if (this.closed) return;
 
     this.pcmCallCount++;
-    if (this.pcmCallCount <= 5 || this.pcmCallCount % 100 === 0) {
+    // One pass serves both the level meter and the (sparse) debug log; neither runs when nobody
+    // asked — `onLevel` absent and the log gate closed cost nothing per quantum.
+    const wantLevel = this.opts?.onLevel !== undefined;
+    const wantLog = this.pcmCallCount <= 5 || this.pcmCallCount % 100 === 0;
+    if (wantLevel || wantLog) {
       let peak = 0;
+      let sumSq = 0;
       for (let i = 0; i < chunk.length; i++) {
-        const abs = Math.abs(chunk[i] ?? 0);
+        const v = chunk[i] ?? 0;
+        const abs = v < 0 ? -v : v;
         if (abs > peak) peak = abs;
+        sumSq += v * v;
       }
-      this.log('debug', '[mic] onPcm', { n: this.pcmCallCount, len: chunk.length, peak });
+      if (wantLog) {
+        this.log('debug', '[mic] onPcm', { n: this.pcmCallCount, len: chunk.length, peak });
+      }
+      if (wantLevel) {
+        this.levelSumSq += sumSq;
+        if (peak > this.levelPeak) this.levelPeak = peak;
+        this.levelSamples += chunk.length;
+        if (this.levelSamples >= this.inRate * MIC_LEVEL_INTERVAL_S) this.flushLevel();
+      }
     }
 
     const ratio = this.inRate / TARGET_RATE;
@@ -529,6 +570,23 @@ export class MicPipeline {
       }
     }
     this.frameLen = 0;
+  }
+
+  /** One `onLevel` call for the window accumulated so far. Mute zeroes the report rather than
+   *  skipping it, so a consumer that only ever sees events cannot be left holding a stale live
+   *  value across a mute. */
+  private flushLevel(): void {
+    const n = this.levelSamples;
+    const level: MicLevel = this.muted
+      ? { rms: 0, peak: 0 }
+      : {
+          rms: Math.min(1, Math.sqrt(this.levelSumSq / n)),
+          peak: Math.min(1, this.levelPeak),
+        };
+    this.levelSumSq = 0;
+    this.levelPeak = 0;
+    this.levelSamples = 0;
+    this.opts?.onLevel?.(level);
   }
 
   setMuted(m: boolean): void {
