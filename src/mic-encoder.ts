@@ -16,9 +16,11 @@ const FRAME_DURATION_US = Math.round((MIC_FRAME_SAMPLES / MIC_SAMPLE_RATE) * 1_0
 export const OPUS_PACKET_US = 20_000;
 
 /** The exact configuration probed with `isConfigSupported` and later `configure`d — one function
- *  so the probe can never answer for a different config than the one used. DTX stays OFF: the
- *  box reads uplink liveness from the frame cadence, so a silent user must still emit a packet
- *  every 100 ms (spec §4). */
+ *  so the probe can never answer for a different config than the one used. Native DTX stays OFF
+ *  and is not the mechanism for a quiet uplink: Chromium's encoder drops a DTX-suppressed frame
+ *  without emitting a chunk and without advancing its timestamp tracker, so a sender could never
+ *  say which 100 ms window a packet belongs to. Silence is gated per whole window instead
+ *  (`mic-dtx.ts`), and a gated window leaves through `skip()` so it stays in capture order. */
 export function opusMicEncoderConfig(): AudioEncoderConfig {
   return {
     codec: 'opus',
@@ -44,8 +46,13 @@ export function frameOpusPayload(packets: readonly Uint8Array[]): Uint8Array {
   return out;
 }
 
+/** The payload of a window the sender left out under `mic_dtx_v1`: no bytes at all. */
+export const EMPTY_MIC_PAYLOAD = new Uint8Array(0);
+
 export interface OpusMicEncoderOpts {
-  /** One call per encoded mic frame, in capture order. `packet` is a fresh copy the receiver owns. */
+  /** One call per wire frame, in capture order: the encoded packets of a window fed to
+   *  `encode()`, or `EMPTY_MIC_PAYLOAD` for one handed to `skip()`. `packet` is a fresh copy the
+   *  receiver owns. */
   onPacket: (packet: Uint8Array, info: MicFrameInfo) => void;
   /** The encoder died. Fires at most once; the encoder accepts nothing afterwards. */
   onError: (err: unknown) => void;
@@ -68,7 +75,10 @@ export interface OpusMicEncoderOpts {
  */
 export class OpusMicEncoder {
   private encoder: AudioEncoder | null = null;
-  private readonly pending: MicFrameInfo[] = [];
+  /** Windows whose wire frame has not left yet, in capture order: the ones inside the encoder and,
+   *  behind any of those, the ones `skip()` is holding so an empty frame cannot overtake packets
+   *  still surfacing. */
+  private readonly pending: Array<{ info: MicFrameInfo; empty: boolean }> = [];
   /** Packets of the wire frame being assembled, and the duration they cover so far. */
   private parts: Uint8Array[] = [];
   private partsUs = 0;
@@ -116,7 +126,7 @@ export class OpusMicEncoder {
       // `ArrayBufferLike` that TypedArray typings carry (AudioData copies the bytes anyway).
       data: pcm as Int16Array<ArrayBuffer>,
     });
-    this.pending.push(info);
+    this.pending.push({ info, empty: false });
     try {
       encoder.encode(data);
     } catch (err) {
@@ -125,6 +135,18 @@ export class OpusMicEncoder {
     } finally {
       data.close();
     }
+  }
+
+  /** A window that goes out EMPTY (`mic_dtx_v1`): nothing to encode, but its frame must leave in
+   *  capture order — behind the packets of any window still inside the encoder, whose output
+   *  surfaces asynchronously. With nothing in flight it leaves at once. */
+  skip(info: MicFrameInfo): void {
+    if (!this.encoder || this.closed) return;
+    if (this.pending.length === 0) {
+      this.opts.onPacket(EMPTY_MIC_PAYLOAD, info);
+      return;
+    }
+    this.pending.push({ info, empty: true });
   }
 
   private onChunk(chunk: EncodedAudioChunk): void {
@@ -138,15 +160,20 @@ export class OpusMicEncoder {
     const parts = this.parts;
     this.parts = [];
     this.partsUs = 0;
-    const info = this.pending.shift();
-    if (!info) {
+    const head = this.pending.shift();
+    if (!head || head.empty) {
       (this.opts.logger ?? consoleLogger(false))(
         'debug',
         '[mic] opus frame with no pending calibration; dropped'
       );
       return;
     }
-    this.opts.onPacket(frameOpusPayload(parts), info);
+    this.opts.onPacket(frameOpusPayload(parts), head.info);
+    // The window's packets are out: the empty frames that were queued behind them may follow.
+    while (this.pending[0]?.empty) {
+      const next = this.pending.shift();
+      if (next) this.opts.onPacket(EMPTY_MIC_PAYLOAD, next.info);
+    }
   }
 
   private fail(err: unknown): void {

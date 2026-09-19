@@ -128,6 +128,13 @@ export interface AvatarSessionOpts {
      *  the box's accept decides, so an older box silently gets pcm16. `'pcm16'` never offers Opus:
      *  the opt-out if an encoder misbehaves somewhere. */
     micCodec?: 'auto' | 'pcm16';
+    /** A quiet microphone costs almost nothing on the wire. Default true: the hello offers
+     *  `mic_dtx_v1`, and where the box grants it a silent 100 ms window (a muted or unbacked
+     *  channel, the pauses between sentences) goes out as an EMPTY frame — same cadence, same
+     *  `seq`, no audio bytes; the box expands it to silence. `negotiated.micDtx` says whether it
+     *  is in force and `stats().counters.micFramesEmpty` how often it fired. `false` never offers
+     *  it (the opt-out if a box's endpointing were ever suspected of hearing the difference). */
+    micDtx?: boolean;
     /** Downlink video codec. Default `'auto'`: the hello offers every codec this browser can decode
      *  (AV1 / HEVC / H.264) and the box picks the cheapest of those to ship — av1 is ~20–40 % fewer
      *  bits than h264 at equal quality. The box decides, so an older box silently serves h264.

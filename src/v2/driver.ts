@@ -2,7 +2,8 @@ import type { AvatarDiagnostic, ConnectPhase, DiagnosticData } from '../diagnost
 import { AvatarError, type AvatarErrorKind, type AvatarErrorStage, toAvatarError } from '../errors';
 import { consoleLogger, type Logger } from '../logger';
 import { type MediaUnit, MediaUnitAssembler } from '../media-unit-assembler';
-import { OpusMicEncoder } from '../mic-encoder';
+import { MicSilenceGate } from '../mic-dtx';
+import { EMPTY_MIC_PAYLOAD, OpusMicEncoder } from '../mic-encoder';
 import {
   MIC_SAMPLE_RATE,
   type MicBackingReason,
@@ -85,7 +86,9 @@ export interface V2DriverHandlers {
   onUtteranceText(utterance: TimedUtterance): void;
   onUtteranceEnd(utterance: TimedUtterance): void;
   onMediaDiscarded(cutoffPtsUs: number): void;
-  onAudioFrameSent(info: MicFrameInfo): void;
+  /** One outgoing mic frame. `empty` = it carried no audio bytes: a silent window under a
+   *  `mic_dtx_v1` grant, expanded to zeros by the box. */
+  onAudioFrameSent(info: MicFrameInfo, empty: boolean): void;
   onAudioBlocked(): void;
   /** The session is over after a successful handshake — server end or transport loss. */
   onEnded(reason: EndReason): void;
@@ -118,6 +121,10 @@ export interface V2DriverOpts {
    *  in its own order. Empty/omitted, or a session that offers no video at all, leaves the field
    *  out and the box serves h264. */
   videoCodecs?: string[];
+  /** Offer `mic_dtx_v1` (default true, with `mic`): where the box grants it, a silent 100 ms
+   *  window goes out as an empty frame instead of ~300 B of encoded silence — the cadence and
+   *  `seq` unchanged. `false` never offers it; every window then carries its audio. */
+  micDtx?: boolean;
   dev: boolean;
   /** Where the driver and its players route internal logs. Defaults to a dev-gated console. */
   logger?: Logger;
@@ -180,6 +187,9 @@ export class V2Driver {
   );
   private pipeline: MicPipeline | null = null;
   private encoder: OpusMicEncoder | null = null;
+  /** `mic_dtx_v1` in force for this session, and the gate that decides which windows go empty. */
+  private micDtx = false;
+  private readonly gate = new MicSilenceGate();
   private _micBacked = false;
   private micReadyReported = false;
 
@@ -296,7 +306,11 @@ export class V2Driver {
         ...(this.responseLanguage !== undefined
           ? { response_language: this.responseLanguage }
           : {}),
-        features: [Feature.UTTERANCE_TIMING_V1, Feature.MEDIA_UNIT_FLAGS_V1],
+        features: [
+          Feature.UTTERANCE_TIMING_V1,
+          Feature.MEDIA_UNIT_FLAGS_V1,
+          ...(opts.mic && opts.micDtx !== false ? [Feature.MIC_DTX_V1] : []),
+        ],
         resume: null,
       });
       this.handshakeTimer = setTimeout(() => {
@@ -428,6 +442,7 @@ export class V2Driver {
     const acceptedFeatures = accept.features ?? [];
     this.timedUtterances = acceptedFeatures.includes(Feature.UTTERANCE_TIMING_V1);
     this.framedMediaUnits = acceptedFeatures.includes(Feature.MEDIA_UNIT_FLAGS_V1);
+    this.micDtx = acceptedFeatures.includes(Feature.MIC_DTX_V1);
     const { handlers } = this.opts;
 
     const channels = accept.channels;
@@ -446,6 +461,7 @@ export class V2Driver {
       hasVideo: Boolean(videoCh),
       posterMode: !videoCh,
       features: acceptedFeatures,
+      micDtx: this.micDtx,
     });
 
     if (this.audioCh) {
@@ -567,12 +583,21 @@ export class V2Driver {
 
   /** One pipeline frame — the microphone or zeros — on its way to the wire. */
   private onMicPcm(micCh: AudioChannelDescriptor, pcm: Int16Array, info: MicFrameInfo): void {
+    // A silent window under a `mic_dtx_v1` grant leaves as an empty frame: same seq, same pts,
+    // no audio bytes. The gate runs whatever the codec; only the wire frame differs.
+    const empty = this.micDtx && this.gate.empty(pcm);
     if (micCh.codec === 'opus') {
       // No encoder (it died, or never came up): nothing can go out until enableMic() rebuilds it.
-      this.encoder?.encode(pcm, info);
+      // An empty frame goes through the encoder too, so it cannot overtake packets in flight.
+      if (empty) this.encoder?.skip(info);
+      else this.encoder?.encode(pcm, info);
       return;
     }
-    this.sendMicFrame(micCh.id, new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength), info);
+    this.sendMicFrame(
+      micCh.id,
+      empty ? EMPTY_MIC_PAYLOAD : new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength),
+      info
+    );
   }
 
   private createEncoder(micCh: AudioChannelDescriptor): void {
@@ -647,7 +672,7 @@ export class V2Driver {
       ptsUs,
       payload,
     });
-    this.opts.handlers.onAudioFrameSent(info);
+    this.opts.handlers.onAudioFrameSent(info, payload.byteLength === 0);
   }
 
   private onMediaFrame(frame: MediaFrame): void {

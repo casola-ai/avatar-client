@@ -8,6 +8,10 @@ import type { AcceptMessage, HelloMessage } from './messages';
 export const Feature = {
   UTTERANCE_TIMING_V1: 'utterance_timing_v1',
   MEDIA_UNIT_FLAGS_V1: 'media_unit_flags_v1',
+  /** The mic uplink may be thin (spec §4): a sender MAY send an EMPTY payload for a 100 ms
+   *  window whose audio is silence, whichever codec ch1 negotiated, and an `opus` frame MAY carry
+   *  one to five packets. The cadence is kept — the receiver expands both to silence. */
+  MIC_DTX_V1: 'mic_dtx_v1',
 } as const;
 
 /**

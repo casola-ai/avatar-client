@@ -945,7 +945,11 @@ var HANDSHAKE_TIMEOUT_MS = 5e3;
 // src/protocol/negotiation.ts
 var Feature = {
   UTTERANCE_TIMING_V1: "utterance_timing_v1",
-  MEDIA_UNIT_FLAGS_V1: "media_unit_flags_v1"
+  MEDIA_UNIT_FLAGS_V1: "media_unit_flags_v1",
+  /** The mic uplink may be thin (spec §4): a sender MAY send an EMPTY payload for a 100 ms
+   *  window whose audio is silence, whichever codec ch1 negotiated, and an `opus` frame MAY carry
+   *  one to five packets. The cadence is kept — the receiver expands both to silence. */
+  MIC_DTX_V1: "mic_dtx_v1"
 };
 
 // src/protocol/transports/websocket.ts
@@ -1018,6 +1022,7 @@ function emptyStats() {
       framesDropped: 0,
       textFailures: 0,
       micFramesSent: 0,
+      micFramesEmpty: 0,
       micBackingChanges: 0
     }
   };
@@ -1491,10 +1496,14 @@ function frameOpusPayload(packets) {
   }
   return out;
 }
+var EMPTY_MIC_PAYLOAD = new Uint8Array(0);
 var OpusMicEncoder = class {
   constructor(opts) {
     this.opts = opts;
     __publicField(this, "encoder", null);
+    /** Windows whose wire frame has not left yet, in capture order: the ones inside the encoder and,
+     *  behind any of those, the ones `skip()` is holding so an empty frame cannot overtake packets
+     *  still surfacing. */
     __publicField(this, "pending", []);
     /** Packets of the wire frame being assembled, and the duration they cover so far. */
     __publicField(this, "parts", []);
@@ -1537,7 +1546,7 @@ var OpusMicEncoder = class {
       // `ArrayBufferLike` that TypedArray typings carry (AudioData copies the bytes anyway).
       data: pcm
     });
-    this.pending.push(info);
+    this.pending.push({ info, empty: false });
     try {
       encoder.encode(data);
     } catch (err) {
@@ -1546,6 +1555,17 @@ var OpusMicEncoder = class {
     } finally {
       data.close();
     }
+  }
+  /** A window that goes out EMPTY (`mic_dtx_v1`): nothing to encode, but its frame must leave in
+   *  capture order — behind the packets of any window still inside the encoder, whose output
+   *  surfaces asynchronously. With nothing in flight it leaves at once. */
+  skip(info) {
+    if (!this.encoder || this.closed) return;
+    if (this.pending.length === 0) {
+      this.opts.onPacket(EMPTY_MIC_PAYLOAD, info);
+      return;
+    }
+    this.pending.push({ info, empty: true });
   }
   onChunk(chunk) {
     if (this.closed) return;
@@ -1557,15 +1577,19 @@ var OpusMicEncoder = class {
     const parts = this.parts;
     this.parts = [];
     this.partsUs = 0;
-    const info = this.pending.shift();
-    if (!info) {
+    const head = this.pending.shift();
+    if (!head || head.empty) {
       (this.opts.logger ?? consoleLogger(false))(
         "debug",
         "[mic] opus frame with no pending calibration; dropped"
       );
       return;
     }
-    this.opts.onPacket(frameOpusPayload(parts), info);
+    this.opts.onPacket(frameOpusPayload(parts), head.info);
+    while (this.pending[0]?.empty) {
+      const next = this.pending.shift();
+      if (next) this.opts.onPacket(EMPTY_MIC_PAYLOAD, next.info);
+    }
   }
   fail(err) {
     if (this.closed) return;
@@ -2116,6 +2140,30 @@ var MediaUnitAssembler = class {
   }
 };
 
+// src/mic-dtx.ts
+var MIC_DTX_RMS = 15e-4;
+var MIC_DTX_HANGOVER_WINDOWS = 3;
+var MicSilenceGate = class {
+  constructor() {
+    __publicField(this, "quiet", 0);
+  }
+  /** Whether this window goes out empty. Call once per window, in order. */
+  empty(pcm) {
+    let sumSq = 0;
+    for (let i = 0; i < pcm.length; i++) {
+      const v = pcm[i] ?? 0;
+      sumSq += v * v;
+    }
+    const rms = pcm.length ? Math.sqrt(sumSq / pcm.length) / 32768 : 0;
+    if (rms > MIC_DTX_RMS) {
+      this.quiet = 0;
+      return false;
+    }
+    this.quiet += 1;
+    return this.quiet > MIC_DTX_HANGOVER_WINDOWS;
+  }
+};
+
 // src/pcm-player.ts
 var PcmPlayer = class {
   constructor(onBlocked) {
@@ -2422,6 +2470,9 @@ var V2Driver = class {
     ));
     __publicField(this, "pipeline", null);
     __publicField(this, "encoder", null);
+    /** `mic_dtx_v1` in force for this session, and the gate that decides which windows go empty. */
+    __publicField(this, "micDtx", false);
+    __publicField(this, "gate", new MicSilenceGate());
     __publicField(this, "_micBacked", false);
     __publicField(this, "micReadyReported", false);
     __publicField(this, "accepted", null);
@@ -2515,7 +2566,11 @@ var V2Driver = class {
         } : {},
         ...this.langs.length ? { langs: this.langs } : {},
         ...this.responseLanguage !== void 0 ? { response_language: this.responseLanguage } : {},
-        features: [Feature.UTTERANCE_TIMING_V1, Feature.MEDIA_UNIT_FLAGS_V1],
+        features: [
+          Feature.UTTERANCE_TIMING_V1,
+          Feature.MEDIA_UNIT_FLAGS_V1,
+          ...opts.mic && opts.micDtx !== false ? [Feature.MIC_DTX_V1] : []
+        ],
         resume: null
       });
       this.handshakeTimer = setTimeout(() => {
@@ -2636,6 +2691,7 @@ var V2Driver = class {
     const acceptedFeatures = accept.features ?? [];
     this.timedUtterances = acceptedFeatures.includes(Feature.UTTERANCE_TIMING_V1);
     this.framedMediaUnits = acceptedFeatures.includes(Feature.MEDIA_UNIT_FLAGS_V1);
+    this.micDtx = acceptedFeatures.includes(Feature.MIC_DTX_V1);
     const { handlers } = this.opts;
     const channels = accept.channels;
     const videoCh = channels.find((c) => c.kind === "video");
@@ -2647,7 +2703,8 @@ var V2Driver = class {
       videoCodec: videoCh ? videoCh.video_codec ?? "h264" : null,
       hasVideo: Boolean(videoCh),
       posterMode: !videoCh,
-      features: acceptedFeatures
+      features: acceptedFeatures,
+      micDtx: this.micDtx
     });
     if (this.audioCh) {
       this.player = new PcmPlayer(() => handlers.onAudioBlocked());
@@ -2752,11 +2809,17 @@ var V2Driver = class {
   }
   /** One pipeline frame — the microphone or zeros — on its way to the wire. */
   onMicPcm(micCh, pcm, info) {
+    const empty = this.micDtx && this.gate.empty(pcm);
     if (micCh.codec === "opus") {
-      this.encoder?.encode(pcm, info);
+      if (empty) this.encoder?.skip(info);
+      else this.encoder?.encode(pcm, info);
       return;
     }
-    this.sendMicFrame(micCh.id, new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength), info);
+    this.sendMicFrame(
+      micCh.id,
+      empty ? EMPTY_MIC_PAYLOAD : new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength),
+      info
+    );
   }
   createEncoder(micCh) {
     this.encoder = new OpusMicEncoder({
@@ -2820,7 +2883,7 @@ var V2Driver = class {
       ptsUs,
       payload
     });
-    this.opts.handlers.onAudioFrameSent(info);
+    this.opts.handlers.onAudioFrameSent(info, payload.byteLength === 0);
   }
   onMediaFrame(frame) {
     if (this.finished) return;
@@ -3185,7 +3248,8 @@ var AvatarSession = class {
           videoCodec: d.videoCodec,
           hasVideo: d.hasVideo,
           posterMode: d.posterMode,
-          features: d.features
+          features: d.features,
+          micDtx: d.micDtx
         };
         break;
       case "protocol_violation":
@@ -3337,6 +3401,7 @@ var AvatarSession = class {
       permittedStream: streamForMic ?? void 0,
       micCodecs,
       videoCodecs,
+      micDtx: this.opts.micDtx,
       dev,
       logger: this.logger,
       sessionId: this.opts.sessionId,
@@ -3393,8 +3458,9 @@ var AvatarSession = class {
         onMediaDiscarded: (cutoffPtsUs) => {
           if (!this.done) this.emit("mediaDiscarded", cutoffPtsUs);
         },
-        onAudioFrameSent: (info) => {
+        onAudioFrameSent: (info, empty) => {
           this._stats.counters.micFramesSent += 1;
+          if (empty) this._stats.counters.micFramesEmpty += 1;
           if (!this.done) this.emit("audioFrameSent", info);
         },
         // Unguarded by `done`: socket_closed is emitted by the driver in the same tick as onEnded,

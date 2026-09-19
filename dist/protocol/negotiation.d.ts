@@ -3,6 +3,10 @@ import type { AcceptMessage, HelloMessage } from './messages';
 export declare const Feature: {
     readonly UTTERANCE_TIMING_V1: "utterance_timing_v1";
     readonly MEDIA_UNIT_FLAGS_V1: "media_unit_flags_v1";
+    /** The mic uplink may be thin (spec §4): a sender MAY send an EMPTY payload for a 100 ms
+     *  window whose audio is silence, whichever codec ch1 negotiated, and an `opus` frame MAY carry
+     *  one to five packets. The cadence is kept — the receiver expands both to silence. */
+    readonly MIC_DTX_V1: "mic_dtx_v1";
 };
 /**
  * hello → accept negotiation, server side. Pure: the caller supplies what the session can offer

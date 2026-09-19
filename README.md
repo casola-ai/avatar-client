@@ -259,6 +259,17 @@ session.on('micBacking', ({ backed, reason }) => setMicIndicator(backed, reason)
 retryButton.onclick = () => session.enableMic().catch(showMicError);
 ```
 
+### A quiet microphone costs almost nothing
+
+The hello offers `mic_dtx_v1`. Where the box grants it (`negotiated.micDtx`), a silent 100 ms
+window — a muted or unbacked channel, the pauses between sentences — goes out as an **empty**
+frame: same cadence, same `seq`, 16 bytes instead of ~300 of encoded silence, about 25 kbit/s
+down to 1.3 while nobody is talking. The box expands it to silence before anything reads it, so
+its endpointing sees exactly what it would have; the gate's floor sits under every bar the box
+decides on. Native Opus DTX is deliberately not used — a suppressed packet is a missing window,
+and a missing window is what a stalled sender looks like. `stats().counters.micFramesEmpty`
+counts the empties; `micDtx: false` never offers the feature.
+
 ### Microphone level
 
 `micLevel` reports the input loudness about 20 times a second while a stream backs the channel:
@@ -399,6 +410,8 @@ Theme with custom properties on the container rather than overriding rules — `
                               // from ensureMicPermission(), avoids a second prompt; a Promise = a
                               // prompt still open (unbacked until it resolves; null = do not prompt)
   micCodec?: 'auto' | 'pcm16'; // default 'auto': Opus when WebCodecs + the box allow it, else pcm16
+  micDtx?: boolean;           // default true: offer mic_dtx_v1 — silent windows go out as empty
+                              // frames where the box grants it; false never offers it
   videoCodec?: 'auto' | 'h264'; // default 'auto': offer every codec this browser decodes (AV1 /
                               // HEVC / H.264) and let the box pick; 'h264' offers none
   prewarm?: () => Promise<void> | void;

@@ -44,7 +44,9 @@ export interface V2DriverHandlers {
     onUtteranceText(utterance: TimedUtterance): void;
     onUtteranceEnd(utterance: TimedUtterance): void;
     onMediaDiscarded(cutoffPtsUs: number): void;
-    onAudioFrameSent(info: MicFrameInfo): void;
+    /** One outgoing mic frame. `empty` = it carried no audio bytes: a silent window under a
+     *  `mic_dtx_v1` grant, expanded to zeros by the box. */
+    onAudioFrameSent(info: MicFrameInfo, empty: boolean): void;
     onAudioBlocked(): void;
     /** The session is over after a successful handshake — server end or transport loss. */
     onEnded(reason: EndReason): void;
@@ -76,6 +78,10 @@ export interface V2DriverOpts {
      *  in its own order. Empty/omitted, or a session that offers no video at all, leaves the field
      *  out and the box serves h264. */
     videoCodecs?: string[];
+    /** Offer `mic_dtx_v1` (default true, with `mic`): where the box grants it, a silent 100 ms
+     *  window goes out as an empty frame instead of ~300 B of encoded silence — the cadence and
+     *  `seq` unchanged. `false` never offers it; every window then carries its audio. */
+    micDtx?: boolean;
     dev: boolean;
     /** Where the driver and its players route internal logs. Defaults to a dev-gated console. */
     logger?: Logger;
@@ -103,6 +109,9 @@ export declare class V2Driver {
     private readonly unitAssembler;
     private pipeline;
     private encoder;
+    /** `mic_dtx_v1` in force for this session, and the gate that decides which windows go empty. */
+    private micDtx;
+    private readonly gate;
     private _micBacked;
     private micReadyReported;
     private accepted;

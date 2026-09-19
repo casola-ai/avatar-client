@@ -42,6 +42,8 @@ export interface NegotiatedInfo {
   hasVideo: boolean;
   posterMode: boolean;
   features: string[];
+  /** The box granted `mic_dtx_v1`: silent mic windows go out as empty frames (see `micDtx`). */
+  micDtx: boolean;
 }
 
 interface DiagnosticBase {
@@ -121,6 +123,9 @@ export interface AvatarSessionStats {
      *  Counts zeroed frames too: read `micBackingChanges` and the `mic_backing` diagnostics to
      *  know whether a microphone was behind them. */
     micFramesSent: number;
+    /** Of those, the frames sent EMPTY because the window was silence and the box granted
+     *  `mic_dtx_v1` — the uplink's savings, and a muted or unbacked channel's steady state. */
+    micFramesEmpty: number;
     /** Times the mic channel gained or lost its stream. */
     micBackingChanges: number;
   };
@@ -144,6 +149,7 @@ export function emptyStats(): AvatarSessionStats {
       framesDropped: 0,
       textFailures: 0,
       micFramesSent: 0,
+      micFramesEmpty: 0,
       micBackingChanges: 0,
     },
   };

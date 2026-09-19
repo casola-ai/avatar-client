@@ -6,6 +6,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-20
+
+### Added
+- **A quiet microphone costs almost nothing on the wire.** The hello offers the `mic_dtx_v1`
+  feature (protocol spec §4); where the box grants it, a silent 100 ms window — a muted or
+  unbacked channel, the pauses between sentences — goes out as an EMPTY media frame, same
+  cadence and `seq`, 16 bytes instead of ~300 of encoded silence (~25 kbit/s down to ~1.3 while
+  nobody is talking). The box expands it to silence, so its endpointing is unchanged; the gate's
+  floor (0.0015 RMS, after a 300 ms hangover) sits under every bar the box decides on. On an
+  Opus uplink an empty frame is queued behind the packets still inside the encoder, so the wire
+  stays in capture order. `negotiated.micDtx` says whether it is in force,
+  `stats().counters.micFramesEmpty` how often it fired, and `micDtx: false` never offers it.
+  Native Opus DTX stays off: a suppressed packet is a missing window, which is what a stalled
+  sender looks like to the box (casola-ai/avatar#628).
+
 ## [0.10.0] - 2026-09-20
 
 ### Added

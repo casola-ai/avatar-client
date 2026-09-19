@@ -10,15 +10,21 @@ export declare const OPUS_MIC_BITRATE = 32000;
  *  of these, length-prefixed (see `frameOpusPayload`). */
 export declare const OPUS_PACKET_US = 20000;
 /** The exact configuration probed with `isConfigSupported` and later `configure`d — one function
- *  so the probe can never answer for a different config than the one used. DTX stays OFF: the
- *  box reads uplink liveness from the frame cadence, so a silent user must still emit a packet
- *  every 100 ms (spec §4). */
+ *  so the probe can never answer for a different config than the one used. Native DTX stays OFF
+ *  and is not the mechanism for a quiet uplink: Chromium's encoder drops a DTX-suppressed frame
+ *  without emitting a chunk and without advancing its timestamp tracker, so a sender could never
+ *  say which 100 ms window a packet belongs to. Silence is gated per whole window instead
+ *  (`mic-dtx.ts`), and a gated window leaves through `skip()` so it stays in capture order. */
 export declare function opusMicEncoderConfig(): AudioEncoderConfig;
 /** The payload of one `opus` ch1 media frame (spec §4): each packet prefixed by its byte length
  *  as a big-endian u16, packets in capture order, durations summing to the frame's 100 ms. */
 export declare function frameOpusPayload(packets: readonly Uint8Array[]): Uint8Array;
+/** The payload of a window the sender left out under `mic_dtx_v1`: no bytes at all. */
+export declare const EMPTY_MIC_PAYLOAD: Uint8Array<ArrayBuffer>;
 export interface OpusMicEncoderOpts {
-    /** One call per encoded mic frame, in capture order. `packet` is a fresh copy the receiver owns. */
+    /** One call per wire frame, in capture order: the encoded packets of a window fed to
+     *  `encode()`, or `EMPTY_MIC_PAYLOAD` for one handed to `skip()`. `packet` is a fresh copy the
+     *  receiver owns. */
     onPacket: (packet: Uint8Array, info: MicFrameInfo) => void;
     /** The encoder died. Fires at most once; the encoder accepts nothing afterwards. */
     onError: (err: unknown) => void;
@@ -41,6 +47,9 @@ export interface OpusMicEncoderOpts {
 export declare class OpusMicEncoder {
     private readonly opts;
     private encoder;
+    /** Windows whose wire frame has not left yet, in capture order: the ones inside the encoder and,
+     *  behind any of those, the ones `skip()` is holding so an empty frame cannot overtake packets
+     *  still surfacing. */
     private readonly pending;
     /** Packets of the wire frame being assembled, and the duration they cover so far. */
     private parts;
@@ -52,6 +61,10 @@ export declare class OpusMicEncoder {
     constructor(opts: OpusMicEncoderOpts);
     /** Encode one pipeline frame. `info` comes back out of `onPacket` with the packet. */
     encode(pcm: Int16Array, info: MicFrameInfo): void;
+    /** A window that goes out EMPTY (`mic_dtx_v1`): nothing to encode, but its frame must leave in
+     *  capture order — behind the packets of any window still inside the encoder, whose output
+     *  surfaces asynchronously. With nothing in flight it leaves at once. */
+    skip(info: MicFrameInfo): void;
     private onChunk;
     private fail;
     /** Idempotent. Pending output is discarded — nothing may go out after the session stops. */
